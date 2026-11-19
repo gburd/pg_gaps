@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Build and regress against the pgdg packages: a gcc build on a stock
+  # distribution, independent of the Nix flake (which builds with clang).
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17, 18, 19]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install PostgreSQL ${{ matrix.pg }} and server headers
+        run: |
+          # The runner's preinstalled Microsoft apt repo intermittently serves a
+          # broken InRelease and fails apt-get update.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/microsoft*.sources || true
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} gcc make
+
+      - name: Build (warnings are errors)
+        run: make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config COPT=-Werror
+
+      - name: Sources and install scripts are ASCII
+        run: make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config check-ascii
+
+      - name: Install
+        run: sudo make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Regression tests
+        run: |
+          # pg_virtualenv starts a throwaway cluster of this major, exports
+          # the PG* variables for it, runs the command and tears it down.
+          pg_virtualenv -v ${{ matrix.pg }} \
+            make installcheck PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+
+      - name: Show diffs on failure
+        if: failure()
+        run: cat regression.diffs 2>/dev/null || true
+
+  # The flake gate: PG 17, 18 and 19 from nixpkgs, built with clang.
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check -L

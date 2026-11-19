@@ -1,0 +1,42 @@
+# Build output.  Prefer an out-of-tree build under /scratch (CONTRIBUTING.md);
+# these cover an in-tree `make` too.
+*.o
+*.so
+*.bc
+*.dylib
+*.dll
+/src/*.o
+/src/*.bc
+
+# pg_regress / prove output
+/results/
+/output_iso/
+/log/
+/tmp_check/
+regression.diffs
+regression.out
+
+# nix
+result
+result-*
+
+# The workspace sync's in-flight files
+.unison.*
+
+# Expected test output is source.  The user-level gitignore ignores *.out,
+# so re-include it here.
+!/expected/*.out
+
+# Agent tooling.  AGENTS.md is TRACKED (the project's rules); the generated
+# per-machine steering, notes and tool configs stay local.
+.agent/
+.agent-steering-domains.md
+.claude/
+.kiro/
+.pi/
+.mcp.json
+.direnv/
+
+# Papers kept beside the tree for reference.  They are publishers' copyright
+# and are not redistributed; doc/DESIGN.md cites them by URL.
+*.pdf

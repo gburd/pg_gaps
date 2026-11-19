@@ -1,0 +1,438 @@
+# pg_gaps design
+
+This document says what BayesStore is, which parts of it pg_gaps builds,
+and how each part maps onto a PostgreSQL extension.  ROADMAP.md says what
+order they are built in and what is open.  Where the two disagree about
+_status_, ROADMAP.md wins; where they disagree about _design_, this file
+does, and the disagreement is a bug to fix.
+
+## Sources
+
+- [BW08] D. Z. Wang, E. Michelakis, M. Garofalakis, J. M. Hellerstein.
+  "BayesStore: Managing Large, Uncertain Data Repositories with
+  Probabilistic Graphical Models."  PVLDB 1(1), 2008.
+  <https://www.vldb.org/pvldb/vol1/1453896.pdf> (the copy in the repo root,
+  `1453896.pdf`, is that paper; it is gitignored and not redistributed).
+- [W11] D. Z. Wang.  "Extracting and Querying Probabilistic Information in
+  BayesStore."  PhD thesis, UC Berkeley, UCB/EECS-2011-131.
+  <https://www2.eecs.berkeley.edu/Pubs/TechRpts/2011/EECS-2011-131.pdf>.
+  The paper is chapters 3-4 of this; the thesis adds the CRF instance,
+  in-database inference algorithms, query-driven inference, and the rules
+  for choosing an algorithm (chapters 5-7).  Citations below are to the
+  thesis unless marked [BW08].
+- [W10] D. Z. Wang, M. J. Franklin, M. Garofalakis, J. M. Hellerstein.
+  "Querying Probabilistic Information Extraction."  PVLDB 3(1), 2010.
+  The source of the query-driven Viterbi algorithms in thesis chapter 6.
+- [P03] D. Poole.  "First-order Probabilistic Inference."  IJCAI 2003.  The
+  lifted-inference idea BayesStore's "first-order sharing" borrows.
+
+Citations of the form `T2285-2287` are line numbers in the thesis text as
+extracted by `pdftotext -layout EECS-2011-131.pdf` (poppler-utils 26.10,
+6958 lines).  Regenerate the text that way before following one.
+
+BayesStore itself was a modified PostgreSQL (8.2.4 for the paper's
+prototype, 8.4 by the thesis), changing the data model, executor, and
+rewriter; it was never an extension.  Apache MADlib later shipped
+linear-chain CRF training and Viterbi inference in SQL, and was retired to
+the Apache Attic in September 2026.  I found no maintained PostgreSQL
+extension that provides correlated, model-based uncertainty over ordinary
+tables, but that rests on one pg.ddx.io archive search (2026-11-18), not
+a survey.  If it holds, that gap is this project's reason to exist.
+
+## The idea in one paragraph
+
+Most probabilistic databases attach a probability to each tuple or value
+and treat them as independent.  BayesStore instead keeps the data and the
+uncertainty model apart: a table may have _missing_ values in some
+columns, and a separate probabilistic graphical model (PGM) says how those
+values are distributed and how they correlate, with each other and with
+the values that are present.  The model is first-order: one conditional
+probability table (CPT) covers a whole population of rows ("every
+sensor's light reading depends on its temperature reading the same way"),
+so the model stays small however large the table grows.  Queries then run
+over both halves at once, and the answer carries probabilities computed by
+inference over the model, conditioned on the data actually present.
+
+## Data model [W11 3.2, BW08 2.1]
+
+A probabilistic database is `DB = <R, F>`:
+
+- **Incomplete relations `R`.** An ordinary table whose columns split into
+  _deterministic_ attributes `Ad` (never uncertain, though they may be SQL
+  `NULL`; they include every key) and _probabilistic_ attributes `Ap`.  A
+  present value of a probabilistic attribute is _evidence_.  A missing one
+  is a random variable (RV) over the attribute's domain.
+- **A distribution `F`** over all the missing-value RVs, encoded by a PGM.
+  Each complete assignment of the RVs is one possible world.
+
+Two kinds of correlation matter at query time: _horizontal_ (between
+attributes of the same row) and _vertical_ (between different rows).  What
+makes inference cheap is independence between _grounded components_, not
+between rows: a coarse entity set makes several rows share one RV, and a
+one-to-many mapping across relations ties a parent row to many child rows,
+so rows can be correlated without any factor that looks vertical.
+Independence, and everything built on it (per-component inference,
+first-order sharing), is defined on the grounded component.
+
+### First-order Bayesian networks [W11 3.3.2, BW08 2.3]
+
+- **Entity set** `R.E = pi_K'(sigma_cond(K')(R))`: a selection and
+  projection over deterministic attributes.  Its members are _entities_,
+  the granularity of the underlying RVs.  Projecting on a key gives one
+  entity per row (the maximal entity set); a coarser projection makes
+  several rows share one RV.
+- **Stripe** `S<R.Ap, E>`: one RV per entity in `E`, for probabilistic
+  attribute `Ap`.  A stripe is a first-order RV.
+- **Stripe mapping** `f[Sp, Sc]: Ec -> Ep`: a function from child entities
+  to parent entities, defined by a formula over the two entity sets'
+  attributes with `Kp` a subset of `Kc` (a key/foreign-key path), and
+  required to be surjective, so every parent RV has a child.  Each child
+  RV gets exactly one parent RV per parent stripe.  [W11 3.3.2] also
+  requires the two entity sets' selection predicates to be the same
+  (T2285-2287), but its own example violates that: in Fig. 3.5, `phi3`
+  maps sensor 2's temperature (`Sid = 2`) to sensor 1's (`Sid = 1`) at
+  the same room and time (T2474-2478), and the evaluation workload's
+  `phi(Tp2|Tp1)` and `phi(Tp4|Tp3)` (T3268-3269) need the same shape.
+  pg_gaps therefore allows a mapping of equalities on shared attributes
+  plus a constant per side, and requires the equalities together with the
+  parent side's constants to determine the parent's key `Kp` (for `phi3`:
+  `T` and `R` by equality, `Sid = 1` by constant).  The property
+  correctness needs is that the mapping is a total function on the child
+  entities: every child RV has exactly one parent RV.  The thesis also
+  requires surjectivity, but as minimality, so that every parent RV has a
+  child (T2295-2297); a parent with no child in one factor is harmless,
+  and pg_gaps does not require it.
+- **First-order factor** `phi(Sc | Sp1..Spn, f1..fn, CPT)`: one CPT shared
+  by every child RV of the stripe.
+- **FOBN model** = a set of first-order factors.
+
+**Validity.** Stripes in different factors may overlap, so a set of
+factors that each look fine can ground to a cyclic Bayesian network.
+[W11 3.3.2] gives a check on the first-order structure, without
+grounding.  Overlap here means shared _RVs_: the same attribute over
+shared entities.  Two stripes on different attributes of the same rows
+(`Sensor1.L` and `Sensor1.Tp` in `phi2` of Fig. 3.5, T2429-2432) share
+entities but no RVs.  The thesis writes "entity sets" and "share
+entities"; read literally that would reject every horizontal factor,
+including its own `phi2`.  Its precondition is that within each factor
+the child stripe shares no RV with any of its parents (T2423-2424).
+Build the dependency graph: every stripe is a node, directed edges run
+from parent to child within a factor, and undirected edges join a parent
+stripe and a child stripe of _different_ factors when they share RVs
+(T2417-2421).  An acyclic graph proves the model valid.  A cycle of
+alternating edges makes it invalid only if tracing an overlapping RV's
+lineage around the cycle returns to that RV.
+
+Two more conditions are needed for `F` to be a distribution at all, and
+the thesis does not state them (my inference): every RV of a declared
+probabilistic attribute, present or missing, is covered by exactly one
+child stripe, so each has exactly one CPT, and every mapping is total.
+A present value needs its CPT too: under `phi(Tp2|Tp1)`, an observed
+`Tp2` is evidence about a missing `Tp1`, and without the factor that
+evidence would be silently dropped.  Entity sets are queries over the
+data, so all of these depend on the data: they are checked when a model
+is declared and again whenever it is grounded.
+
+**Tuple existence.** A probabilistic boolean attribute `Exist` models
+whether a row is in the relation at all.  A user may declare one on a base
+table (T2078-2081); query processing adds one (see Selection).
+
+## Query semantics [W11 4, BW08 3]
+
+Every operator acts on both halves: it transforms the data _and_ the
+model, so that the result is again an incomplete relation plus a valid
+distribution for it.
+
+### Selection [W11 4.2]
+
+- **Over the model.** A predicate on a deterministic attribute restricts
+  the entity set.  A predicate on a probabilistic attribute makes row
+  existence uncertain: selection adds an `Exist` stripe whose
+  deterministic CPT is `Exist = 1 iff Ap theta c`, and a second factor
+  fixing `Exist = 0` for entities outside the predicate's entity set.
+  Plain conditioning would be wrong, because it cannot produce worlds
+  with different numbers of rows [BW08 3.1.1].
+- **Over the data.** A row must be kept if it can satisfy the predicate
+  _or_ if it is correlated with a row that can, because dropping its
+  evidence would change the posterior of rows that remain.  The base
+  algorithm keeps rows that satisfy the predicate or have the attribute
+  missing, then takes their transitive closure over the tuple correlation
+  graph.  Two optimisations shrink the result without changing the answer:
+  - _evidence-based early stopping_: stop the closure at rows that are
+    conditionally independent given the evidence (Bayes Ball [W11 4.2.2]);
+  - _factor-based filtering_: for a row whose RVs are involved _only_ in
+    horizontal correlations, drop it if its missing value has zero
+    probability of satisfying the predicate under its own horizontal
+    factor's CPT, given the evidence in the same row (T2976-2990).  The
+    restriction matters: a row with vertical correlations can have a
+    nonzero posterior even when its own CPT row says zero.
+
+  The point of both is that inference cost scales with the selection's
+  output, so smaller output is faster answers [W11 4.5].
+
+### Projection [W11 4.3]
+
+Projection without duplicate elimination, on a projection list that
+contains the primary key (T2995-2997).  It keeps an attribute outside the
+list if a factor correlates it with one inside it, and drops factors whose
+attributes are all projected away.  The thesis's Figure 4.5 makes one pass
+over the factors, so its answer depends on their order; pg_gaps computes
+the closure to a fixpoint.  Duplicate elimination is not first-order and
+is out of scope, as it was for BayesStore.
+
+### Join [W11 4.4]
+
+A join on probabilistic attributes is a probabilistic selection over the
+cross product: the result gets an `Exist` factor whose parents are the two
+join attributes and whose CPT is `Exist = 1 iff R1.A theta R2.B`, stripes
+are renamed into the result schema, and the data side keeps the same
+evidence closure as selection.
+
+### Inference [W11 2.2, 4.5.6, 5, 7.5]
+
+Queries ask for one of:
+
+- **Marginal**: the distribution of a missing value (or of `Exist`).
+- **Top-k / MAP**: the most probable completions.
+- **Joint**: the joint distribution of the missing values that satisfy a
+  query (the paper's `INFER joint-distr`, [BW08 4.5]), bounded in size.
+
+The two halves of BayesStore chose algorithms differently.  The FOBN
+half did no choosing: it grounded the selected model to a flat Bayesian
+network and ran variable elimination from Murphy's BNT toolbox, outside
+the database (T3537-3541).  The CRF half has rules (Table 7.1 and
+[W11 7.5.3], T5683-5691, T5786-5814), which choose on three things: model
+shape, correlation strength, and label space size.  Viterbi handles
+linear-chain top-k; sum-product handles chain and tree marginals; only
+MCMC handles cyclic models, because the thesis does not study junction
+trees or loopy belief propagation (T1402-1404).  Gibbs is preferred over
+MCMC-MH unless the cycles come from query constraints, and is chosen
+outright for a large label space with weak correlations.
+
+pg_gaps policy (not BayesStore's) for FOBN models is:
+
+| grounded component | top-k / MAP | marginal |
+|---|---|---|
+| small enough to solve exactly (bounded induced width) | variable elimination | variable elimination |
+| linear chain (CRF) | Viterbi | forward-backward (sum-product) |
+| too large, every sampled variable's CPT strictly positive | Gibbs | Gibbs |
+| too large, zeros in a sampled variable's CPT | `ERROR` (see below) | `ERROR` |
+
+Gibbs sampling cannot cross zero-probability regions: it handles
+constraints that "do not break the distribution into disconnected
+regions" (T5736-5739).  The `Exist` factors that selection and join add
+are deterministic, so `Exist` is never sampled; it is evaluated as a
+function of each sample of its parents.  A model whose own CPTs contain
+zeros can still trap a Gibbs chain.  Until there is an MCMC-MH with moves
+that change several variables at once, such a component is solved exactly
+or refused.
+
+**First-order sharing** [W11 4.5.6, P03]: components that are identical,
+meaning the same factors, the same structure, and the same evidence, have
+the same posterior, so it is computed once per distinct component rather
+than once per row.  The sharing key is the grounded component, not the
+row: two rows with equal evidence share a posterior only if their
+components are equal too.  BayesStore called its measurement a best case.
+Its text says 5-10x (T3551), and its Table 4.11 gives 5-14x
+(T3504-3508).  It also notes that the overhead can outweigh the gain
+(T3555-3557), which is why it wanted an optimizer to choose.
+
+### The CRF instance [W11 3.4, 5, 6]
+
+For information extraction, BayesStore stores text as a token table
+`TokenTbl(strID, pos, token, label^p)` and a linear-chain CRF as a factor
+table `MR(token, score[])` holding `phi[y_t, y_(t-1) | x_t]` as a
+`|Y| x |Y|` array.  Inference is Viterbi (top-1 and incremental top-k),
+forward-backward (marginals), and MCMC for skip-chain models.  The
+query-driven variants push predicates into inference: constrained Viterbi
+for `label = 'x'` selections, early-stopping `SelViterbi` for selections
+over the ML world, rank-join over incremental Viterbi for probabilistic
+joins, a hash filter on join keys before inference for joins over the
+most-likely world, a Viterbi/marginal hybrid for projection [W11 6], and
+per-document hybrid plans that pick Viterbi, sum-product or MCMC by each
+document's grounded shape, including aggregate constraints over a
+document's labels [W11 7.3, 7.6].  An entity table is a pivot of the
+token table's most-likely labels [W11 6.2].
+
+## Mapping onto a PostgreSQL extension
+
+BayesStore changed the server.  An extension cannot add grammar, so there
+is no `INFER` clause and no `SELECT Marginal(...)`.  Everything is a
+function, an operator, or a planner hook.
+
+### Principles
+
+1. **Results are relations, but composing them is not inference.**
+   Inference returns rows (`key, attribute, value, probability`) that SQL
+   can join, filter and aggregate.  Doing so treats the returned values as
+   independent, which is wrong whenever they are correlated: multiplying
+   two marginals from one component is not their joint probability.
+   BayesStore operators return a new relation _and_ a new model: they
+   modify the model first, then filter the data against it (T2617-2622),
+   and a later operator works on the result, as when a second selection
+   intersects the entity sets of the first one's `Exist` factors
+   (T2712-2713, T2762-2765) or a join conjoins both inputs' `Exist`
+   conditions with the join condition (T3127-3129).  pg_gaps does the
+   same inside one call: a call takes the whole query (a model, a
+   relation or a join of two, and a predicate), builds the derived model
+   internally, and only then runs inference.  Chaining calls, where the
+   output of one is the input of another, is out of scope until a
+   derived-model handle is designed (ROADMAP Q8).  The documentation for
+   every function says which of its outputs may be combined in SQL.
+2. **Correctness is checkable.** Every inference path has a brute-force
+   possible-worlds oracle for small inputs, and the exact paths are
+   cross-checked against an independent implementation (pgmpy) in tests.
+   An approximate path (Gibbs, MCMC) reports how many samples it used and
+   is tested against the exact path on models both can handle.
+3. **Discrete, finite domains only**, as in BayesStore.  Continuous
+   attributes are out of scope until there is a concrete need.
+4. **No on-disk format of our own.** The model lives in ordinary catalog
+   tables in schema `gaps`, so it is transactional, dumpable, and
+   replicated with no WAL code.  Grounded models and posteriors are
+   per-query memory, never persisted.  This removes the entire class of
+   storage bugs pg_fts spends most of its rules on, and it is the reason
+   not to add an access method until a measurement demands one.
+5. **Planner honesty.** Set-returning functions declare real costs and
+   row estimates.  A `SupportRequestRows` support function sees only
+   constant arguments, so it improves plans with literal arguments; with
+   parameters (generic plans) the planner falls back to the declared
+   `ROWS`, which must therefore be a sensible default too.
+
+### Model catalog (proposed; Phase 1 settles it)
+
+Catalog rows name user objects the way pg_dump and pg_upgrade preserve
+them.  `regclass` survives pg_upgrade (pg_class OIDs are preserved,
+`pg_upgrade/check.c`), and pg_dump writes it as a name.  It does not
+survive a `DROP`: the stored OID dangles, a later relation can reuse it,
+and pg_dump writes a dangling `regclass` as a bare number that restores
+without complaint.  So each row also stores the relation's qualified name,
+and a `sql_drop` event trigger marks models over dropped relations
+invalid; every use compares the stored name with the OID's current name
+and fails, naming both, if they differ.  Creating an event trigger needs
+superuser, which `CREATE EXTENSION` of an untrusted extension has; if the
+extension is ever made trusted, the name comparison alone has to carry
+this.  Column numbers and type OIDs are
+not stable across dump and restore, so columns are stored by name and
+types by `regtype` with their name, and both are re-resolved and
+re-checked every time a model is used.
+
+```
+gaps.model      (model_id, name, owner regrole, created)
+gaps.model_acl  (model_id, grantee regrole, privilege text) -- 'use' or 'alter'
+gaps.attribute  (model_id, rel regclass, relname text, attname name,
+                 atttype regtype, typname text, domain text[])
+gaps.stripe     (stripe_id, model_id, rel regclass, relname text, attname name,
+                 entity_keys name[])                   -- projection K'
+gaps.stripe_qual (stripe_id, ord, attname name, op text, value text)
+                                                       -- selection on Ad, ANDed
+gaps.factor     (factor_id, model_id, child_stripe, cpt float8[])
+gaps.factor_parent (factor_id, ord, parent_stripe)
+gaps.factor_map (factor_id, ord, child_att name, parent_att name)
+                                                       -- the mapping f: equalities;
+                                                       -- per-side constants via stripe_qual
+```
+
+The CPT is a dense `float8[]` in row-major order over (parents..., child),
+validated before it is stored: right length for the declared domains,
+every conditional distribution non-negative and summing to 1 within a
+tolerance.
+
+An entity-set predicate is a conjunction of `column op constant` terms
+stored as rows, re-parsed and type-checked against the relation each time
+it is used.  It is never stored as SQL text to execute, and never as
+`pg_node_tree`: that type has no input function, so SQL and SPI cannot
+write it, the rows would not restore from a dump, and a node tree written
+by one major version is not guaranteed to read in the next.  Terms may
+reference only deterministic columns and operators whose functions are
+immutable.  That rules out disjunction and negation in entity sets for
+now; BayesStore supported them in selection predicates without giving
+details ([BW08 3.1]), and they are a later addition (ROADMAP).
+
+A missing value is SQL `NULL` in a declared probabilistic column.  `NULL`
+in a deterministic column is ordinary SQL `NULL`, as in [W11 3.2].
+
+### SQL surface (proposed; each phase settles its part)
+
+```sql
+-- declare and build
+SELECT gaps.create_model('sensors');
+SELECT gaps.declare_attribute('sensors', 'sensor1', 'temp', ARRAY['cold','hot']);
+SELECT gaps.add_stripe('sensors', ...);   -- attribute + entity set
+SELECT gaps.add_factor('sensors', child => ..., parents => ..., cpt => ...);
+SELECT gaps.learn_cpts('sensors');        -- MLE from complete rows, smoothed
+SELECT gaps.validate('sensors');          -- CPT shape + first-order acyclicity
+
+-- query
+SELECT * FROM gaps.marginals('sensors', 'sensor1'::regclass);
+SELECT * FROM gaps.impute('sensors', 'sensor1'::regclass);   -- MAP completion
+SELECT * FROM gaps.select_rows('sensors', 'sensor1'::regclass,
+                               $$ light = 'dark' $$);        -- rows + P(exist)
+-- Phase 5 adds the join form: two relations and a join predicate.
+```
+
+### Inference engine
+
+Plain C, with no PostgreSQL headers in the core (factor algebra, variable
+elimination, Gibbs, Viterbi, forward-backward), so it compiles standalone
+for property tests, fuzzing, and sanitizers, as pg_fts does for its codec.
+A thin layer converts between catalog rows and engine structures.  The
+engine works on grounded connected components and, within a query, caches
+posteriors keyed by a canonical form of the whole component (its factors,
+structure and evidence), which is first-order sharing done safely.
+
+Randomized algorithms take a seed and a sample count from the call or
+from GUCs (`gaps.seed`, `gaps.samples`) and are deterministic given them,
+so test output is stable.
+
+### Security
+
+The extension is **not trusted** (`trusted = false`, the default) until a
+review says otherwise.  The rules:
+
+- **User data is read as the caller.**  Every read of a user table goes
+  through SPI while the current user is the caller, so row-level security
+  and column privileges apply exactly as they would to the caller's own
+  `SELECT`.  No function that reads user data is `SECURITY DEFINER`: a
+  definer function's SPI runs as the extension owner, a superuser for an
+  untrusted extension, which bypasses row-level security.
+- **Catalog writes go through definer functions.**  Callers have no
+  direct DML on `gaps.*`, so every row passes the same validation.  The
+  only `SECURITY DEFINER` functions are small writers that touch nothing
+  but the catalog, with `search_path` pinned to `gaps, pg_temp`.  An
+  operation that reads data and writes the catalog, such as
+  `learn_cpts`, is an invoker function that does the read as the caller
+  and passes the result to a definer writer.
+- **Models have owners, enforced by the writers.**  Each writer checks
+  that the caller owns the model or holds the needed privilege in
+  `gaps.model_acl`; that check is the access control.  Row-level security
+  on `gaps.*` restricts what callers can _read_, but does nothing for the
+  writers, which run as the table owner and bypass it.  A side effect:
+  pg_dump by a role that is neither superuser nor the catalog owner fails
+  on the protected tables, because pg_dump runs with `row_security =
+  off`; that is documented, not worked around.
+- **Learning publishes aggregates.**  `learn_cpts` writes statistics of
+  the rows the caller could see into a catalog that other roles with
+  access to the model can read.  A model is no more private than its
+  grants, and the documentation says so.
+- **No SQL is built from strings.**  Identifiers and constants from
+  callers are resolved through the catalogs and passed as parameters.
+- **Inputs at the trust boundary** (CPT arrays, domains, predicates) are
+  validated before use, and grounding is bounded by a GUC
+  (`gaps.max_component_vars`) so a query cannot ask for an exponential
+  factor product.  GUCs live under the `gaps.` prefix, reserved with
+  `MarkGUCPrefixReserved("gaps")`.
+
+## Out of scope
+
+- Grammar changes (no `INFER` clause); everything is functions.
+- Chaining calls so that one call's output relation and model feed the
+  next, until a derived-model handle is designed (ROADMAP Q8).  One call
+  can still express a whole select-project-join query.
+- Continuous distributions.
+- Duplicate-eliminating projection (not first-order; BayesStore deferred
+  it too).
+- Structure learning, and CRF training.  CPT learning from complete data
+  is in scope; learning which factors exist is not.
+- Junction trees and loopy belief propagation (the thesis did not study
+  them either); exact inference is variable elimination with a size bound.
+- A custom access method or any on-disk format, until measured need.
