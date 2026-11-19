@@ -58,13 +58,12 @@ Delivers:
   registered with `pg_extension_config_dump`, and each serial sequence
   registered too, so pg_dump keeps user models.  User objects are named by
   `regclass` plus their name, columns by name, never by attribute number
-  or type OID; a `sql_drop` event trigger invalidates models over dropped
-  relations.
-- `create_model`, `drop_model`, `grant_model`, `declare_attribute`,
-  `add_stripe`, `add_factor`, `validate`.  Catalog writes go through
-  `SECURITY DEFINER` writers with pinned `search_path` that check model
-  ownership or `gaps.model_acl` themselves; callers have no direct DML on
-  `gaps.*`.  Reads of user tables (in `validate`) run as the caller.
+  or type OID, and every use re-checks the names.
+- `create_model`, `drop_model`, `declare_attribute`, `add_stripe`,
+  `add_stripe_qual`, `add_factor`, `map_factor`, `validate`.  Every
+  function runs as its caller (DESIGN.md "Security"); triggers validate
+  every catalog row, and row-level security limits each role to the models
+  its role owns, so direct DML on `gaps.*` meets the same checks.
 - Validation at the trust boundary: domain non-empty and duplicate-free;
   CPT length equals the product of the domain sizes; every conditional
   distribution non-negative and summing to 1 within 1e-9; mapping columns

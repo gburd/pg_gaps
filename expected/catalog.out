@@ -1,0 +1,209 @@
+-- The model catalog: declaring a first-order Bayesian network over a
+-- table, and every rejection the catalog and its triggers make.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_gaps;
+\set VERBOSITY terse
+-- The paper's running example, simplified: per (time, room, sensor) a
+-- temperature and a light reading, either of which may be missing.
+CREATE TABLE sensor (t int, room int, sid int, temp text, light text,
+					 PRIMARY KEY (t, room, sid));
+SELECT gaps.create_model('sensors');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.create_model('sensors');               -- fail: exists
+ERROR:  duplicate key value violates unique constraint "model_name_key"
+SELECT gaps.declare_attribute('sensors', 'sensor', 'temp', ARRAY['cold', 'hot']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('sensors', 'sensor', 'light', ARRAY['dark', 'bright']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT attname, relname, typname, entity_keys, domain FROM gaps.attribute ORDER BY attname;
+ attname |    relname    | typname | entity_keys  |    domain     
+---------+---------------+---------+--------------+---------------
+ light   | public.sensor | text    | {t,room,sid} | {dark,bright}
+ temp    | public.sensor | text    | {t,room,sid} | {cold,hot}
+(2 rows)
+
+-- Attribute rejections.
+SELECT gaps.declare_attribute('nosuch', 'sensor', 'temp', ARRAY['a']);       -- fail: no model
+ERROR:  model "nosuch" does not exist
+SELECT gaps.declare_attribute('sensors', 'sensor', 'nosuch', ARRAY['a']);    -- fail: no column
+ERROR:  column "nosuch" does not exist in relation public.sensor
+SELECT gaps.declare_attribute('sensors', 'sensor', 'sid', ARRAY[]::text[]);  -- fail: empty
+ERROR:  the domain of public.sensor.sid is empty
+SELECT gaps.declare_attribute('sensors', 'sensor', 'sid', ARRAY['1', '1']);  -- fail: duplicate
+ERROR:  the domain of public.sensor.sid has duplicate values
+SELECT gaps.declare_attribute('sensors', 'sensor', 'sid', ARRAY['1', NULL]); -- fail: NULL value
+ERROR:  the domain of public.sensor.sid contains NULL
+SELECT gaps.declare_attribute('sensors', 'sensor', 'sid', ARRAY['1'], ARRAY['sid']::name[]); -- fail: own key
+ERROR:  probabilistic attribute public.sensor.sid cannot be its own entity key
+SELECT gaps.declare_attribute('sensors', 'sensor', 'sid', ARRAY['1'], ARRAY['zz']::name[]);  -- fail: no key col
+ERROR:  entity key column "zz" does not exist in relation public.sensor
+CREATE TABLE nokey (a int, b text);
+SELECT gaps.declare_attribute('sensors', 'nokey', 'b', ARRAY['x']);          -- fail: no primary key
+ERROR:  attribute public.nokey.b has no entity keys
+-- Stripes and their entity-set predicates.
+SELECT gaps.add_stripe('sensors', 'tp', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('sensors', 'l', 'sensor', 'light');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('sensors', 'tp1', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe_qual('sensors', 'tp1', 'sid', '=', '1');
+ add_stripe_qual 
+-----------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('sensors', 'tp2', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe_qual('sensors', 'tp2', 'sid', '=', '2');
+ add_stripe_qual 
+-----------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('sensors', 'x', 'sensor', 'sid');                     -- fail: not declared
+ERROR:  public.sensor.sid is not a probabilistic attribute of model "sensors"
+SELECT gaps.add_stripe_qual('sensors', 'tp1', 'light', '=', 'dark');         -- fail: probabilistic
+ERROR:  stripe predicate column public.sensor.light is probabilistic
+SELECT gaps.add_stripe_qual('sensors', 'tp1', 'sid', 'LIKE', '1');           -- fail: operator
+ERROR:  new row for relation "stripe_qual" violates check constraint "stripe_qual_op_check"
+SELECT gaps.add_stripe_qual('sensors', 'nosuch', 'sid', '=', '1');           -- fail: no stripe
+ERROR:  stripe "nosuch" does not exist in model "sensors"
+-- Factors and CPT validation.  CPT order: parents, then child, child
+-- varying fastest; each run of |child domain| entries sums to 1.
+SELECT gaps.add_factor('sensors', 'prior', 'tp', '{}', ARRAY[0.4, 0.6]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('sensors', 'l_tp', 'l', ARRAY['tp'], ARRAY[0.8, 0.2, 0.3, 0.7]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('sensors', 'bad1', 'tp1', '{}', ARRAY[0.5]);            -- fail: length
+ERROR:  CPT of factor "bad1" has 1 entries, needs 2
+SELECT gaps.add_factor('sensors', 'bad2', 'tp1', '{}', ARRAY[0.5, 0.6]);       -- fail: sum
+ERROR:  row 1 of the CPT of factor "bad2" sums to 1.1, not 1
+SELECT gaps.add_factor('sensors', 'bad3', 'tp1', '{}', ARRAY[1.5, -0.5]);      -- fail: negative
+ERROR:  CPT of factor "bad3" has a NULL, negative, infinite or NaN entry
+SELECT gaps.add_factor('sensors', 'bad4', 'tp1', '{}', ARRAY['NaN', 1]::float8[]); -- fail: NaN
+ERROR:  CPT of factor "bad4" has a NULL, negative, infinite or NaN entry
+SELECT gaps.add_factor('sensors', 'bad5', 'tp1', ARRAY['tp1'], ARRAY[1, 0, 0, 1]); -- fail: self parent
+ERROR:  a stripe cannot be a parent of itself
+SELECT gaps.add_factor('sensors', 'learnme', 'tp2', ARRAY['tp1']);             -- CPT left NULL
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('sensors', 'learnme', 1, 't', 't');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('sensors', 'learnme', 1, 'room', 'room');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('sensors', 'learnme', 1, 'nosuch', 'room');             -- fail: no column
+ERROR:  column "nosuch" does not exist in relation public.sensor
+SELECT gaps.set_cpt('sensors', 'learnme', ARRAY[0.9, 0.1, 0.1]);               -- fail: length
+ERROR:  CPT of factor "learnme" has 3 entries, needs 4
+SELECT gaps.set_cpt('sensors', 'learnme', ARRAY[0.9, 0.1, 0.1, 0.9]);
+ set_cpt 
+---------
+ 
+(1 row)
+
+SELECT name, cpt FROM gaps.factor ORDER BY factor_id;
+  name   |        cpt        
+---------+-------------------
+ prior   | {0.4,0.6}
+ l_tp    | {0.8,0.2,0.3,0.7}
+ learnme | {0.9,0.1,0.1,0.9}
+(3 rows)
+
+-- Row-level security: another role sees no models and cannot add to one.
+CREATE ROLE gaps_other;
+GRANT SELECT ON sensor TO gaps_other;
+SET ROLE gaps_other;
+SELECT count(*) AS visible_models FROM gaps.model;
+ visible_models 
+----------------
+              0
+(1 row)
+
+SELECT gaps.declare_attribute('sensors', 'sensor', 'sid', ARRAY['1']);   -- fail: not visible
+ERROR:  model "sensors" does not exist
+INSERT INTO gaps.factor (model_id, name, child_stripe)
+	SELECT 1, 'sneak', 1;                                                  -- fail: RLS
+ERROR:  new row violates row-level security policy for table "factor"
+RESET ROLE;
+-- Dropping a model removes all of it, and nothing of any other model.
+SELECT gaps.create_model('bystander');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.drop_model('sensors');
+ drop_model 
+------------
+ 
+(1 row)
+
+SELECT name FROM gaps.model;
+   name    
+-----------
+ bystander
+(1 row)
+
+SELECT gaps.drop_model('bystander');
+ drop_model 
+------------
+ 
+(1 row)
+
+SELECT (SELECT count(*) FROM gaps.attribute) + (SELECT count(*) FROM gaps.stripe)
+	+ (SELECT count(*) FROM gaps.factor) AS rows_left;
+ rows_left 
+-----------
+         0
+(1 row)
+
+DROP TABLE sensor, nokey;
+DROP ROLE gaps_other;

@@ -298,55 +298,69 @@ function, an operator, or a planner hook.
    parameters (generic plans) the planner falls back to the declared
    `ROWS`, which must therefore be a sensible default too.
 
-### Model catalog (proposed; Phase 1 settles it)
+### Model catalog
 
-Catalog rows name user objects the way pg_dump and pg_upgrade preserve
-them.  `regclass` survives pg_upgrade (pg_class OIDs are preserved,
-`pg_upgrade/check.c`), and pg_dump writes it as a name.  It does not
-survive a `DROP`: the stored OID dangles, a later relation can reuse it,
-and pg_dump writes a dangling `regclass` as a bare number that restores
-without complaint.  So each row also stores the relation's qualified name,
-and a `sql_drop` event trigger marks models over dropped relations
-invalid; every use compares the stored name with the OID's current name
-and fails, naming both, if they differ.  Creating an event trigger needs
-superuser, which `CREATE EXTENSION` of an untrusted extension has; if the
-extension is ever made trusted, the name comparison alone has to carry
-this.  Column numbers and type OIDs are
-not stable across dump and restore, so columns are stored by name and
-types by `regtype` with their name, and both are re-resolved and
-re-checked every time a model is used.
+The model lives in ordinary tables in schema `gaps`, so it is
+transactional, dumpable (each table and sequence is registered with
+`pg_extension_config_dump`), and replicated with no WAL code of ours.
 
 ```
-gaps.model      (model_id, name, owner regrole, created)
-gaps.model_acl  (model_id, grantee regrole, privilege text) -- 'use' or 'alter'
-gaps.attribute  (model_id, rel regclass, relname text, attname name,
-                 atttype regtype, typname text, domain text[])
-gaps.stripe     (stripe_id, model_id, rel regclass, relname text, attname name,
-                 entity_keys name[])                   -- projection K'
-gaps.stripe_qual (stripe_id, ord, attname name, op text, value text)
-                                                       -- selection on Ad, ANDed
-gaps.factor     (factor_id, model_id, child_stripe, cpt float8[])
-gaps.factor_parent (factor_id, ord, parent_stripe)
-gaps.factor_map (factor_id, ord, child_att name, parent_att name)
-                                                       -- the mapping f: equalities;
-                                                       -- per-side constants via stripe_qual
+gaps.model          (model_id, name, owner regrole)
+gaps.attribute      (attribute_id, model_id, rel regclass, relname, attname,
+                     typname, entity_keys name[], domain text[])
+gaps.stripe         (stripe_id, model_id, name, attribute_id)
+gaps.stripe_qual    (stripe_id, ord, attname, op, value)   -- ANDed, on Ad
+gaps.factor         (factor_id, model_id, name, child_stripe, cpt float8[])
+gaps.factor_parent  (factor_id, ord, parent_stripe)
+gaps.factor_map     (factor_id, ord, child_att, parent_att) -- equalities
 ```
 
-The CPT is a dense `float8[]` in row-major order over (parents..., child),
-validated before it is stored: right length for the declared domains,
-every conditional distribution non-negative and summing to 1 within a
-tolerance.
+**Identity of user objects.** `regclass` survives pg_upgrade (pg_class
+OIDs are preserved, `pg_upgrade/check.c`) and pg_dump writes it as a
+name, but it dangles after a `DROP`, and a later relation can reuse the
+OID.  So each attribute row also stores the relation's qualified name,
+the column's name and its type's name, and every use re-resolves them
+and fails, naming what changed, if the OID's current name differs, the
+column is gone, or its type changed.  Attribute numbers and type OIDs are
+not stored at all.
 
-An entity-set predicate is a conjunction of `column op constant` terms
-stored as rows, re-parsed and type-checked against the relation each time
-it is used.  It is never stored as SQL text to execute, and never as
+**Entities.** A probabilistic attribute's random variables are its
+entities: the distinct values of its `entity_keys` (by default the
+table's primary key, giving one RV per row; a subset of it gives a
+coarser entity set, several rows sharing one RV).  Every stripe over an
+attribute uses that attribute's entity keys, so an RV is identified by
+(attribute, entity key values) and stripes over one attribute that
+overlap share RVs rather than conflicting.  The thesis allows stripes of
+one attribute at different granularities; nothing in it needs that, and
+it would make "which RV is this row" ambiguous.  The rows of one entity
+must agree on an observed value; disagreeing evidence is an error naming
+the entity.
+
+**CPTs** are dense `float8[]` in row-major order over (parents..., child),
+the child varying fastest.  A trigger on `gaps.factor` checks every write:
+the right length for the declared domains, every entry finite and
+non-negative, every conditional distribution summing to 1 within 1e-9.  A
+CPT may be NULL until `learn_cpts` fills it; inference refuses a model
+with a NULL CPT.
+
+**Entity-set predicates** are a conjunction of `column op constant` terms
+stored as rows, with `op` one of `=`, `<>`, `<`, `<=`, `>`, `>=`.  Each use
+builds the query from catalog-resolved, quoted identifiers and passes the
+constants as parameters, cast to the column's type by its input function.
+Predicates are never stored as SQL text to execute, and never as
 `pg_node_tree`: that type has no input function, so SQL and SPI cannot
 write it, the rows would not restore from a dump, and a node tree written
 by one major version is not guaranteed to read in the next.  Terms may
-reference only deterministic columns and operators whose functions are
-immutable.  That rules out disjunction and negation in entity sets for
-now; BayesStore supported them in selection predicates without giving
-details ([BW08 3.1]), and they are a later addition (ROADMAP).
+reference only deterministic columns.  Disjunction and negation are a
+later addition (ROADMAP Phase 4b).
+
+**Mappings.** A factor's mapping to each parent is a set of equalities
+`child_att = parent_att` plus the parent stripe's own predicate (its
+constants).  With no equalities given, a parent stripe on the same
+relation and entity keys as the child maps entity to itself (a horizontal
+factor).  Grounding checks that every child entity maps to exactly one
+parent entity in the parent stripe, and fails naming a child entity that
+maps to none or to several.
 
 A missing value is SQL `NULL` in a declared probabilistic column.  `NULL`
 in a deterministic column is ordinary SQL `NULL`, as in [W11 3.2].
@@ -389,38 +403,33 @@ so test output is stable.
 The extension is **not trusted** (`trusted = false`, the default) until a
 review says otherwise.  The rules:
 
-- **User data is read as the caller.**  Every read of a user table goes
-  through SPI while the current user is the caller, so row-level security
+- **Every function runs as its caller.**  None is `SECURITY DEFINER`.  A
+  definer function cannot tell who called it (`current_user` is the
+  definer inside it), its reads of user tables would run as the
+  extension's superuser owner and bypass row-level security, and its
+  writes would bypass the catalog's own row-level security.
+- **User data is read through SPI as the caller**, so row-level security
   and column privileges apply exactly as they would to the caller's own
-  `SELECT`.  No function that reads user data is `SECURITY DEFINER`: a
-  definer function's SPI runs as the extension owner, a superuser for an
-  untrusted extension, which bypasses row-level security.
-- **Catalog writes go through definer functions.**  Callers have no
-  direct DML on `gaps.*`, so every row passes the same validation.  The
-  only `SECURITY DEFINER` functions are small writers that touch nothing
-  but the catalog, with `search_path` pinned to `gaps, pg_temp`.  An
-  operation that reads data and writes the catalog, such as
-  `learn_cpts`, is an invoker function that does the read as the caller
-  and passes the result to a definer writer.
-- **Models have owners, enforced by the writers.**  Each writer checks
-  that the caller owns the model or holds the needed privilege in
-  `gaps.model_acl`; that check is the access control.  Row-level security
-  on `gaps.*` restricts what callers can _read_, but does nothing for the
-  writers, which run as the table owner and bypass it.  A side effect:
-  pg_dump by a role that is neither superuser nor the catalog owner fails
-  on the protected tables, because pg_dump runs with `row_security =
-  off`; that is documented, not worked around.
+  `SELECT`.
+- **The catalog protects itself.**  Callers may write `gaps.*` directly or
+  through the functions, and both paths meet the same checks: triggers
+  validate every row (CPT shape and sums, operators, attribute types), and
+  row-level security limits each role to the models it owns or is a
+  member of the owner of.  Superusers and the catalog's owner bypass
+  row-level security, as everywhere in PostgreSQL.  A consequence: pg_dump
+  by a role that is neither superuser nor the catalog owner fails on these
+  tables, because pg_dump runs with `row_security = off`.
 - **Learning publishes aggregates.**  `learn_cpts` writes statistics of
-  the rows the caller could see into a catalog that other roles with
-  access to the model can read.  A model is no more private than its
-  grants, and the documentation says so.
-- **No SQL is built from strings.**  Identifiers and constants from
-  callers are resolved through the catalogs and passed as parameters.
-- **Inputs at the trust boundary** (CPT arrays, domains, predicates) are
-  validated before use, and grounding is bounded by a GUC
-  (`gaps.max_component_vars`) so a query cannot ask for an exponential
-  factor product.  GUCs live under the `gaps.` prefix, reserved with
-  `MarkGUCPrefixReserved("gaps")`.
+  the rows the caller could see into the model, which every role that can
+  read the model can read.  A model is no more private than its owner
+  role.
+- **Inputs at the trust boundary** (CPT arrays, domains, predicates, and
+  the arrays the internal inference function takes) are validated before
+  use, and inference is bounded by `gaps.max_factor_cells` (the largest
+  factor) and `gaps.max_total_cells` (everything held at once for one
+  component), so a query cannot ask for an exponential factor product; it
+  gets an `ERROR` naming the size instead.  GUCs live under the `gaps.`
+  prefix, reserved with `MarkGUCPrefixReserved("gaps")`.
 
 ## Out of scope
 

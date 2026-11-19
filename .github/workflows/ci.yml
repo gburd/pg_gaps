@@ -35,6 +35,10 @@ jobs:
       - name: Sources and install scripts are ASCII
         run: make PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config check-ascii
 
+      - name: Inference engine against brute force (plain, ASan+UBSan)
+        if: matrix.pg == 19
+        run: CC=gcc bash test/engine/run.sh 1 20000
+
       - name: Install
         run: sudo make install PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
 

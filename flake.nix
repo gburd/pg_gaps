@@ -51,6 +51,7 @@
             (lib.fileset.fileFilter (f: lib.hasSuffix ".sql" f.name) ./.)
             ./src
             ./expected
+            ./test
           ];
         };
 
@@ -105,6 +106,14 @@
         checks = packages
           // lib.mapAttrs' (n: pg: lib.nameValuePair "installcheck-${n}" (installcheckFor pg)) pgVersions
           // {
+            # The standalone engine against brute force, plain, with ASan and
+            # UBSan, and with every cache key forced to collide.
+            engine = pkgs.runCommand "pg_gaps-engine"
+              { nativeBuildInputs = [ pkgs.clang ]; } ''
+              CC=clang bash ${src}/test/engine/run.sh 1 20000
+              touch $out
+            '';
+
             # The Makefile target is the one implementation of this rule.
             ascii = pkgs.runCommand "pg_gaps-check-ascii"
               { nativeBuildInputs = [ pkgs.gnumake devPg.pg_config ]; } ''

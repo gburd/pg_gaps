@@ -1,0 +1,521 @@
+-- Inference end to end: grounding a model over tables, marginals and MAP
+-- completions, checked against a brute-force possible-worlds computation
+-- written in plain SQL, which shares no code with the extension.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_gaps;
+\set VERBOSITY terse
+-- Two sensors per room and time.  sensor 2's temperature depends on
+-- sensor 1's in the same room and time (a vertical factor, phi3 of the
+-- paper's Fig. 3.5); every light reading depends on its own temperature
+-- (horizontal).
+CREATE TABLE sensor (t int, room int, sid int, temp text, light text,
+					 PRIMARY KEY (t, room, sid));
+INSERT INTO sensor VALUES
+	(1, 1, 1, NULL,  'dark'),
+	(1, 1, 2, NULL,  NULL),
+	(1, 2, 1, 'hot', NULL),
+	(1, 2, 2, NULL,  'bright'),
+	(2, 1, 1, NULL,  NULL),
+	(2, 1, 2, 'cold', 'dark');
+SELECT gaps.create_model('m');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('m', 'sensor', 'temp', ARRAY['cold', 'hot']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('m', 'sensor', 'light', ARRAY['dark', 'bright']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('m', 'tp1', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe_qual('m', 'tp1', 'sid', '=', '1');
+ add_stripe_qual 
+-----------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('m', 'tp2', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe_qual('m', 'tp2', 'sid', '=', '2');
+ add_stripe_qual 
+-----------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('m', 'l', 'sensor', 'light');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('m', 'tp', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('m', 'prior1', 'tp1', '{}', ARRAY[0.3, 0.7]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('m', 'copy', 'tp2', ARRAY['tp1'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('m', 'copy', 1, 't', 't');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('m', 'copy', 1, 'room', 'room');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('m', 'light', 'l', ARRAY['tp'], ARRAY[0.75, 0.25, 0.4, 0.6]);
+ add_factor 
+------------
+ 
+(1 row)
+
+-- The posterior of every missing value.  Probabilities per value; within a
+-- component (a room and time here) the values are correlated.
+SELECT attname, entity, value, round(probability::numeric, 6) AS p, component
+FROM gaps.marginals('m')
+ORDER BY attname, entity::text, value;
+ attname |            entity             | value  |    p     | component 
+---------+-------------------------------+--------+----------+-----------
+ light   | {"t": 1, "sid": 1, "room": 2} | bright | 0.600000 |         4
+ light   | {"t": 1, "sid": 1, "room": 2} | dark   | 0.400000 |         4
+ light   | {"t": 1, "sid": 2, "room": 1} | bright | 0.420842 |         1
+ light   | {"t": 1, "sid": 2, "room": 1} | dark   | 0.579158 |         1
+ light   | {"t": 2, "sid": 1, "room": 1} | bright | 0.369512 |         3
+ light   | {"t": 2, "sid": 1, "room": 1} | dark   | 0.630488 |         3
+ temp    | {"t": 1, "sid": 1, "room": 1} | cold   | 0.445545 |         1
+ temp    | {"t": 1, "sid": 1, "room": 1} | hot    | 0.554455 |         1
+ temp    | {"t": 1, "sid": 2, "room": 1} | cold   | 0.511881 |         1
+ temp    | {"t": 1, "sid": 2, "room": 1} | hot    | 0.488119 |         1
+ temp    | {"t": 1, "sid": 2, "room": 2} | cold   | 0.094340 |         2
+ temp    | {"t": 1, "sid": 2, "room": 2} | hot    | 0.905660 |         2
+ temp    | {"t": 2, "sid": 1, "room": 1} | cold   | 0.658537 |         3
+ temp    | {"t": 2, "sid": 1, "room": 1} | hot    | 0.341463 |         3
+(14 rows)
+
+-- Every distribution sums to 1 and is non-negative (AGENTS.md rule 14).
+SELECT count(*) AS bad_groups FROM (
+	SELECT attname, entity FROM gaps.marginals('m')
+	GROUP BY attname, entity
+	HAVING abs(sum(probability) - 1) > 1e-12 OR min(probability) < 0) x;
+ bad_groups 
+------------
+          0
+(1 row)
+
+-- The oracle.  For room 1 at time 1: missing temp1, temp2, light2;
+-- observed light1 = dark.  Enumerate the 8 worlds, multiply the CPT
+-- entries, normalize, and compare with what the extension returned.
+WITH w AS (
+	SELECT t1, t2, l2,
+		   (CASE t1 WHEN 'cold' THEN 0.3 ELSE 0.7 END)			-- prior1
+		 * (CASE WHEN t1 = 'cold' THEN (CASE t2 WHEN 'cold' THEN 0.9 ELSE 0.1 END)
+				 ELSE (CASE t2 WHEN 'cold' THEN 0.2 ELSE 0.8 END) END)	-- copy
+		 * (CASE t1 WHEN 'cold' THEN 0.75 ELSE 0.4 END)			-- light1 = dark
+		 * (CASE WHEN t2 = 'cold' THEN (CASE l2 WHEN 'dark' THEN 0.75 ELSE 0.25 END)
+				 ELSE (CASE l2 WHEN 'dark' THEN 0.4 ELSE 0.6 END) END) AS p
+	FROM unnest(ARRAY['cold', 'hot']) t1, unnest(ARRAY['cold', 'hot']) t2,
+		 unnest(ARRAY['dark', 'bright']) l2),
+oracle AS (
+	SELECT 'temp' AS attname, 1 AS sid, t1 AS value, sum(p) / (SELECT sum(p) FROM w) AS p
+	FROM w GROUP BY t1
+	UNION ALL
+	SELECT 'temp', 2, t2, sum(p) / (SELECT sum(p) FROM w) FROM w GROUP BY t2
+	UNION ALL
+	SELECT 'light', 2, l2, sum(p) / (SELECT sum(p) FROM w) FROM w GROUP BY l2)
+SELECT o.attname, o.sid, o.value, count(m.*) AS found,
+	   abs(o.p - m.probability) < 1e-12 AS agrees
+FROM oracle o
+	LEFT JOIN gaps.marginals('m') m
+	  ON m.attname = o.attname AND m.value = o.value
+	 AND m.entity = jsonb_build_object('t', 1, 'room', 1, 'sid', o.sid)
+GROUP BY o.attname, o.sid, o.value, o.p, m.probability
+ORDER BY 1, 2, 3;
+ attname | sid | value  | found | agrees 
+---------+-----+--------+-------+--------
+ light   |   2 | bright |     1 | t
+ light   |   2 | dark   |     1 | t
+ temp    |   1 | cold   |     1 | t
+ temp    |   1 | hot    |     1 | t
+ temp    |   2 | cold   |     1 | t
+ temp    |   2 | hot    |     1 | t
+(6 rows)
+
+-- MAP completion: one value per missing variable, jointly most probable
+-- within its component, with that assignment's posterior probability.
+SELECT attname, entity, value, round(probability::numeric, 6) AS p_component
+FROM gaps.impute('m')
+ORDER BY attname, entity::text;
+ attname |            entity             | value  | p_component 
+---------+-------------------------------+--------+-------------
+ light   | {"t": 1, "sid": 1, "room": 2} | bright |    0.600000
+ light   | {"t": 1, "sid": 2, "room": 1} | dark   |    0.300743
+ light   | {"t": 2, "sid": 1, "room": 1} | dark   |    0.493902
+ temp    | {"t": 1, "sid": 1, "room": 1} | cold   |    0.300743
+ temp    | {"t": 1, "sid": 2, "room": 1} | cold   |    0.300743
+ temp    | {"t": 1, "sid": 2, "room": 2} | hot    |    0.905660
+ temp    | {"t": 2, "sid": 1, "room": 1} | cold   |    0.493902
+(7 rows)
+
+-- Coarse entities: readings of one sensor at one time share an RV.
+CREATE TABLE reading (sid int, t int, k int, status text, PRIMARY KEY (sid, t, k));
+INSERT INTO reading VALUES (1, 1, 1, 'up'), (1, 1, 2, NULL), (1, 2, 1, NULL), (1, 2, 2, NULL);
+SELECT gaps.create_model('c');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('c', 'reading', 'status', ARRAY['up', 'down'],
+							  ARRAY['sid', 't']::name[]);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('c', 's', 'reading', 'status');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('c', 'p', 's', '{}', ARRAY[0.9, 0.1]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT entity, value, round(probability::numeric, 12) AS p
+FROM gaps.marginals('c') ORDER BY entity::text, value;
+       entity       | value |       p        
+--------------------+-------+----------------
+ {"t": 2, "sid": 1} | down  | 0.100000000000
+ {"t": 2, "sid": 1} | up    | 0.900000000000
+(2 rows)
+
+UPDATE reading SET status = 'down' WHERE (sid, t, k) = (1, 1, 2);
+SELECT * FROM gaps.marginals('c');                          -- fail: conflicting evidence
+ERROR:  rows of entity {"t": 1, "sid": 1} of public.reading.status disagree: {down,up}
+UPDATE reading SET status = 'sideways' WHERE (sid, t) = (1, 1);
+SELECT * FROM gaps.marginals('c');                          -- fail: value not in domain
+ERROR:  value "sideways" of public.reading.status for entity {"t": 1, "sid": 1} is not in its domain {up,down}
+-- Grounding errors.
+SELECT gaps.create_model('bad');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('bad', 'sensor', 'temp', ARRAY['cold', 'hot']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('bad', 'tp', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT * FROM gaps.marginals('bad');                         -- fail: no CPT covers temp
+ERROR:  public.sensor.temp of entity {"t": 1, "sid": 1, "room": 1} is the child of 0 factors, not exactly one
+SELECT gaps.add_factor('bad', 'p', 'tp', '{}');
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT * FROM gaps.marginals('bad');                         -- fail: NULL CPT
+ERROR:  factor "p" has no CPT
+SELECT gaps.set_cpt('bad', 'p', ARRAY[0.5, 0.5]);
+ set_cpt 
+---------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('bad', 'tp_again', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('bad', 'p2', 'tp_again', '{}', ARRAY[0.5, 0.5]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT * FROM gaps.marginals('bad');                         -- fail: two CPTs for one RV
+ERROR:  public.sensor.temp of entity {"t": 1, "sid": 1, "room": 1} is the child of 2 factors, not exactly one
+SELECT gaps.drop_model('bad');
+ drop_model 
+------------
+ 
+(1 row)
+
+SELECT gaps.create_model('bad');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('bad', 'sensor', 'temp', ARRAY['cold', 'hot']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('bad', 'tp', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('bad', 'tp1', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe_qual('bad', 'tp1', 'sid', '=', '1');
+ add_stripe_qual 
+-----------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('bad', 'p', 'tp', ARRAY['tp1'], ARRAY[0.5, 0.5, 0.5, 0.5]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('bad', 'p', 1, 't', 't');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT * FROM gaps.marginals('bad');                         -- fail: maps to several parents
+ERROR:  factor "p": child entity {"t": 1, "sid": 1, "room": 1} maps to 2 parent entities in parent 1
+SELECT gaps.drop_model('bad');
+ drop_model 
+------------
+ 
+(1 row)
+
+-- A cycle: temp of sensor 1 depends on sensor 2's and the other way round.
+SELECT gaps.create_model('cyc');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('cyc', 'sensor', 'temp', ARRAY['cold', 'hot']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('cyc', 'a', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe_qual('cyc', 'a', 'sid', '=', '1');
+ add_stripe_qual 
+-----------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('cyc', 'b', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe_qual('cyc', 'b', 'sid', '=', '2');
+ add_stripe_qual 
+-----------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('cyc', 'ab', 'a', ARRAY['b'], ARRAY[0.5, 0.5, 0.5, 0.5]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('cyc', 'ab', 1, 't', 't');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('cyc', 'ab', 1, 'room', 'room');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('cyc', 'ba', 'b', ARRAY['a'], ARRAY[0.5, 0.5, 0.5, 0.5]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('cyc', 'ba', 1, 't', 't');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('cyc', 'ba', 1, 'room', 'room');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT * FROM gaps.marginals('cyc');                         -- fail: cycle
+ERROR:  the ground network has a directed cycle through variable 1
+SELECT gaps.drop_model('cyc');
+ drop_model 
+------------
+ 
+(1 row)
+
+-- Evidence the model calls impossible.
+SELECT gaps.create_model('z');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('z', 'sensor', 'temp', ARRAY['cold', 'hot']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('z', 'tp', 'sensor', 'temp');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('z', 'p', 'tp', '{}', ARRAY[1, 0]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT * FROM gaps.marginals('z');                           -- fail: hot has probability 0
+ERROR:  the observed values have probability zero under the model
+SELECT gaps.drop_model('z');
+ drop_model 
+------------
+ 
+(1 row)
+
+-- The size bounds turn an oversized problem into an error, not an
+-- allocation: a CPT larger than the bound is refused before inference, and
+-- a component too large for the cells allowed is refused by the engine.
+SET gaps.max_factor_cells = 2;
+SELECT count(*) FROM gaps.marginals('m');                    -- fail: CPT too big
+ERROR:  a CPT would have more than 2 cells
+RESET gaps.max_factor_cells;
+SET gaps.max_total_cells = 4;
+SELECT count(*) FROM gaps.marginals('m');                    -- fail: component too big
+ERROR:  inference needs a factor larger than gaps.max_factor_cells (1048576) or more than gaps.max_total_cells (4)
+RESET gaps.max_total_cells;
+-- A role that cannot read the table cannot infer over it, even with the
+-- model's owner role.
+CREATE ROLE gaps_reader;
+GRANT gaps_reader TO current_user;
+UPDATE gaps.model SET owner = 'gaps_reader' WHERE name = 'm';
+SET ROLE gaps_reader;
+SELECT count(*) FROM gaps.marginals('m');                    -- fail: no SELECT on sensor
+ERROR:  permission denied for table sensor
+RESET ROLE;
+GRANT SELECT ON sensor TO gaps_reader;
+SET ROLE gaps_reader;
+SELECT count(*) > 0 AS works FROM gaps.marginals('m');
+ works 
+-------
+ t
+(1 row)
+
+RESET ROLE;
+-- Row-level security on the user's table is honored: hide room 2.
+ALTER TABLE sensor ENABLE ROW LEVEL SECURITY;
+CREATE POLICY room1 ON sensor TO gaps_reader USING (room = 1);
+SET ROLE gaps_reader;
+SELECT DISTINCT entity->>'room' AS room FROM gaps.marginals('m');
+ room 
+------
+ 1
+(1 row)
+
+RESET ROLE;
+-- The internal entry point validates its arrays.
+SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,1}', '{}', '{1}', '{0.5,0.5}');
+ var | value | probability | component | map_value | map_probability 
+-----+-------+-------------+-----------+-----------+-----------------
+   1 |     1 |         0.5 |         1 |         1 |             0.5
+   1 |     2 |         0.5 |         1 |         1 |             0.5
+(2 rows)
+
+SELECT * FROM gaps._infer('{2}', '{3}', '{1}', '{1,1}', '{}', '{1}', '{0.5,0.5}');  -- fail
+ERROR:  variable 1 has evidence 3
+SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,1}', '{}', '{1}', '{0.5}');        -- fail
+ERROR:  CPT 1 needs 2 values from its offset
+SELECT * FROM gaps._infer('{2}', '{0}', '{2}', '{1,1}', '{}', '{1}', '{0.5,0.5}');  -- fail
+ERROR:  CPT 1 names child 2
+SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,2}', '{1}', '{1}', '{0.5,0.5,0.5,0.5}');   -- fail
+ERROR:  malformed ground network at variable 1 (code 4)
+DROP TABLE sensor, reading;
+SELECT gaps.drop_model('m');
+ drop_model 
+------------
+ 
+(1 row)
+
+SELECT gaps.drop_model('c');
+ drop_model 
+------------
+ 
+(1 row)
+
+DROP ROLE gaps_reader;
