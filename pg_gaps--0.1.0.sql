@@ -634,6 +634,8 @@ $$;
 -- empty the entity table.  They live until the end of the transaction, so
 -- repeated groundings in one transaction reuse them: locks and catalog
 -- rows grow with the number of key shapes, not with calls or attributes.
+-- The index lets a step that needs one attribute's entities skip the
+-- other attributes of the same shape.
 CREATE FUNCTION gaps._key_tables_reset(a gaps.attribute, ktab text, etab text)
 RETURNS void
 LANGUAGE plpgsql
@@ -650,6 +652,7 @@ BEGIN
 	IF to_regclass('pg_temp.' || etab) IS NULL THEN
 		EXECUTE format('CREATE TEMP TABLE %I (attribute_id int, v int, k pg_temp.%I, ev int) '
 					   'ON COMMIT DROP', etab, ktab);
+		EXECUTE format('CREATE INDEX ON pg_temp.%I (attribute_id, v)', etab);
 	ELSE
 		EXECUTE format('TRUNCATE pg_temp.%I', etab);
 	END IF;
