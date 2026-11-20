@@ -269,6 +269,39 @@ SET ROLE gaps_reader;
 SELECT DISTINCT entity->>'room' AS room FROM gaps.marginals('m');
 RESET ROLE;
 
+-- Grounding fails, rather than drop a row, when its statements see
+-- different rows, as under READ COMMITTED with a concurrent insert.  A
+-- policy evaluated once per statement simulates one: the parent's second
+-- row shows only from the second statement that reads the table on, so
+-- the mapping reaches a parent row the entity step never saw.
+CREATE SEQUENCE public.reads;
+GRANT USAGE ON SEQUENCE public.reads TO gaps_reader;
+CREATE FUNCTION public.later() RETURNS bool LANGUAGE sql VOLATILE
+	SET search_path = public AS $$ SELECT nextval('reads') > 1 $$;
+CREATE TABLE par (id int PRIMARY KEY, x text);
+INSERT INTO par VALUES (1, 'a'), (2, NULL);
+ALTER TABLE par ENABLE ROW LEVEL SECURITY;
+CREATE POLICY later ON par TO gaps_reader USING (id = 1 OR (SELECT public.later()));
+CREATE TABLE ch (id int PRIMARY KEY, g int, pid int, y text);
+INSERT INTO ch VALUES (1, 1, 1, NULL), (2, 1, 2, NULL);
+GRANT SELECT ON par, ch TO gaps_reader;
+SELECT gaps.create_model('snap');
+UPDATE gaps.model SET owner = 'gaps_reader' WHERE name = 'snap';
+SELECT gaps.declare_attribute('snap', 'par', 'x', ARRAY['a', 'b']);
+SELECT gaps.declare_attribute('snap', 'ch', 'y', ARRAY['c', 'd'], ARRAY['g']::name[]);
+SELECT gaps.add_stripe('snap', 'x', 'par', 'x');
+SELECT gaps.add_stripe('snap', 'y', 'ch', 'y');
+SELECT gaps.add_factor('snap', 'px', 'x', '{}', ARRAY[0.5, 0.5]);
+SELECT gaps.add_factor('snap', 'py', 'y', ARRAY['x'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT gaps.map_factor('snap', 'py', 1, 'pid', 'id');
+SET ROLE gaps_reader;
+SELECT * FROM gaps.marginals('snap');                        -- fail: rows changed
+RESET ROLE;
+SELECT gaps.drop_model('snap');
+DROP TABLE par, ch;
+DROP FUNCTION public.later();
+DROP SEQUENCE public.reads;
+
 -- The internal entry point validates its arrays.
 SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,1}', '{}', '{1}', '{0.5,0.5}');
 SELECT * FROM gaps._infer('{2}', '{3}', '{1}', '{1,1}', '{}', '{1}', '{0.5,0.5}');  -- fail

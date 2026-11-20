@@ -377,6 +377,18 @@ a child whose mapped column is NULL maps to no parent: an error naming
 it, not a guess.  A user who wants NULLs to match can map from a column
 that encodes them.
 
+**Snapshots.** Grounding reads the user's tables in several statements
+(one per attribute for entities and evidence, then per factor for the
+instances and per parent for the mapping).  Under READ COMMITTED each
+statement sees its own snapshot, so a concurrent commit can make steps
+disagree.  Grounding detects the disagreement it can see (a row reached
+through a mapping whose entity the entity step did not see) and fails
+with a hint; it does not detect evidence or rows changed between steps
+in ways that leave every row an entity.  For one consistent view, run the
+call in a REPEATABLE READ (or SERIALIZABLE) transaction, where every
+statement shares the transaction's snapshot.  Grounding under one snapshot
+whatever the isolation level needs C (Phase 6).
+
 A missing value is SQL `NULL` in a declared probabilistic column.  `NULL`
 in a deterministic column is ordinary SQL `NULL`, as in [W11 3.2].
 

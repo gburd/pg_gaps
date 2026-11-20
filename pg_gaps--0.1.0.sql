@@ -778,6 +778,12 @@ $$;
 -- child's attribute; wclause and wparams are the child stripe's predicate
 -- over alias c (gaps._stripe_where).  Each child entity must reach
 -- exactly one parent entity; fails naming the first that does not.
+--
+-- Grounding reads the user's tables in several statements, and under READ
+-- COMMITTED each sees its own snapshot.  A parent row that grounding sees
+-- here but whose entity it did not see in gaps._ground_entities can only
+-- come from a concurrent change, and is an error rather than a row left
+-- out (doc/DESIGN.md, "Snapshots").
 CREATE FUNCTION gaps._ground_parent(fid int, parent_ord int, a gaps.attribute,
 									wclause text, wparams text[])
 RETURNS void
@@ -817,10 +823,12 @@ BEGIN
 		-- The default mapping sends an entity to the parent attribute's
 		-- entity with the same key (the same shape, so the same tables).
 		-- With no parent predicate, that is a join of the two attributes'
-		-- entities on the key, and the user's table is not read again.
+		-- entities on the key, and the user's table is not read again; a
+		-- child with no such parent entity can only come from a concurrent
+		-- change, and gets pv NULL, as below.
 		IF wp.clause = '' THEN
 			EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
-						   'SELECT $1, i.v, $2, coalesce(rp.v, 0) FROM pg_gaps_inst i '
+						   'SELECT $1, i.v, $2, rp.v FROM pg_gaps_inst i '
 						   'JOIN pg_temp.%I rc ON rc.attribute_id = $3 AND rc.v = i.v '
 						   'LEFT JOIN pg_temp.%I rp ON rp.attribute_id = $4 AND rp.k = rc.k '
 						   'WHERE i.factor_id = $1 AND i.ord = 0',
@@ -834,18 +842,18 @@ BEGIN
 	END IF;
 
 	-- One pass: each child variable with the distinct parent variables its
-	-- rows reach (the LEFT JOIN keeps a child that reaches none).  Exactly
-	-- one gives its v; anything else is stored as minus the number reached
-	-- and reported below.  Every row of the parent's relation belongs to an
-	-- entity of the parent attribute, so the inner join to the parent's
-	-- entities loses no row.
+	-- rows reach (the outer LEFT JOIN keeps a child that reaches none).
+	-- Exactly one gives its v; anything else is stored as minus the number
+	-- reached, and a reached parent row with no entity as NULL, and is
+	-- reported below.
 	IF on_clause IS NOT NULL THEN
 		EXECUTE format(
 			'INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
-			'SELECT $2, rc.v, $3, CASE WHEN count(DISTINCT rp.v) = 1 THEN min(rp.v) '
-			'ELSE -count(DISTINCT rp.v) END '
+			'SELECT $2, rc.v, $3, CASE '
+			'WHEN count(*) FILTER (WHERE p.ctid IS NOT NULL AND rp.v IS NULL) > 0 THEN NULL '
+			'WHEN count(DISTINCT rp.v) = 1 THEN min(rp.v) ELSE -count(DISTINCT rp.v) END '
 			'FROM %s c JOIN pg_temp.%I rc ON rc.attribute_id = $4 AND rc.k = %s '
-			'LEFT JOIN (%s p JOIN pg_temp.%I rp ON rp.attribute_id = $5 AND rp.k = %s) '
+			'LEFT JOIN (%s p LEFT JOIN pg_temp.%I rp ON rp.attribute_id = $5 AND rp.k = %s) '
 			'ON TRUE%s%s WHERE TRUE%s GROUP BY rc.v',
 			a.rel, ct.etab, gaps._key_row(a, 'c', ct.ktab),
 			pa.rel, pt.etab, gaps._key_row(pa, 'p', pt.ktab),
@@ -855,8 +863,14 @@ BEGIN
 
 	SELECT i.v, i.pv INTO bad
 	FROM pg_gaps_inst i
-	WHERE i.factor_id = fid AND i.ord = parent_ord AND i.pv <= 0
+	WHERE i.factor_id = fid AND i.ord = parent_ord AND (i.pv <= 0 OR i.pv IS NULL)
 	ORDER BY i.v LIMIT 1;
+	IF bad.v IS NOT NULL AND bad.pv IS NULL THEN
+		RAISE EXCEPTION 'factor "%": a parent row of child entity % has no entity in parent %',
+			fname, gaps._entity_name(a.attribute_id, bad.v), parent_ord
+			USING HINT = 'The table changed while grounding read it.  Run in a REPEATABLE READ '
+				'transaction for one snapshot.';
+	END IF;
 	IF bad.v IS NOT NULL THEN
 		RAISE EXCEPTION 'factor "%": child entity % maps to % parent entities in parent %',
 			fname, gaps._entity_name(a.attribute_id, bad.v), -bad.pv, parent_ord
