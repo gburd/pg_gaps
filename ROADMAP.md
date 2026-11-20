@@ -47,14 +47,15 @@ Each has a recommendation.  None blocks Phase 0, which is done.
   because the repository has no remote yet.
 - `AGENTS.md`, this file, `doc/DESIGN.md`, `CONTRIBUTING.md`, `README.md`.
 
-## Status, 2026-11-19
+## Status, 2026-11-20
 
-Phase 1 is done.  Phase 2 is built, with two items still open (below).
-Engine and SQL interface gated on PG 17.12, 18.7 and 19.0 (nixpkgs with
-clang; PGDG on Fedora 44 with gcc 16 and `-Werror`).  Exact inference
-already handles vertical correlations (any component the size bounds
-allow), which was planned for Phase 3; Phase 3 is left with sampling for
-components too large to solve exactly.
+Phases 1, 2 and 3 are built.  Two items are open: canonical stripe
+constants (a catalog change) and the rest of the grounding cost (Phase
+6).  Gated on PG 17.12, 18.7 and 19.0 (nixpkgs with clang; PGDG on Fedora
+44 with gcc 16 and `-Werror`).  Exact inference handles vertical
+correlations (any component the size bounds allow); Gibbs sampling covers
+larger components when `gaps.samples` is set.  Packaged for PGXN, not yet
+published: there is no public repository (Q6).
 
 | phase | item | status |
 |---|---|---|
@@ -70,7 +71,8 @@ components too large to solve exactly.
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
 | 2 | `SupportRequestRows` for the SRFs | done: catalog plus `stanullfrac` estimate, under the `pg_stats` visibility rule; ROWS fallback; no lock waits, none on a standby or under SERIALIZABLE; replans on ANALYZE (`sql/rows.sql`) |
 | 2 | grounding cost | **open**: entity keys are typed composites and temp tables are reused per transaction: `marginals` 2.0-2.6x faster on the hotel workload (10.3 s for 2M variables on EC2), 1.7x on a 900-attribute model, 3 ms slower on a 2-attribute one (`bench/RESULTS_GROUNDING_2026-11-20.md`); keys of the same types share tables whatever their names, so 300 and 2,000 relations keyed by differently named int columns hold main's lock count plus 12 and take 0.70-0.83x its time per call (local), and more than 100 key shapes is an `ERROR`; what remains is sorting integer instance rows (Phase 6) |
-| 3 | Gibbs sampling for components too large for exact | done (branch wip/gibbs): `gaps.samples` (per chain), `gaps.seed`; 4 chains from dispersed starts, refused (`ERROR`) when two chains' estimates differ by more than 0.1.  On models of at most 12 variables (20,000 random strictly positive cases) and the 6 x 6 grid, Rao-Blackwellized marginals are within 0.1 of exact at 4,000 samples (largest error 0.025) with no refusals; the review's multimodal grid and hub models are refused.  The check cannot see chains all stuck in one mode, so a sampled answer can still be wrong without an error (DESIGN.md "Gibbs sampling, as built").  Refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
+| 3 | Gibbs sampling for components too large for exact | done: `gaps.samples` (per chain), `gaps.seed`; 4 chains from dispersed starts, refused (`ERROR`) when two chains' estimates differ by more than 0.1.  On models of at most 12 variables (20,000 random strictly positive cases) and the 6 x 6 grid, Rao-Blackwellized marginals are within 0.1 of exact at 4,000 samples (largest error 0.025) with no refusals; the review's multimodal grid and hub models are refused.  The check cannot see chains all stuck in one mode, so a sampled answer can still be wrong without an error (DESIGN.md "Gibbs sampling, as built").  Refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
+| 8 | PGXN packaging | done: `META.json` (`pgxn_meta` clean), `make dist`, `make check-meta` in the flake and CI, `.github/workflows/release.yml`; the zip builds and passes on PGDG 17, 18, 19 with gcc `-Werror`.  **Not published** (no remote; the workflow has never run) |
 | 3 | full hotel workload with its vertical factors | done: runs exact, components of at most 4 variables (`bench/hotel.sql`, `bench/RESULTS_HOTEL_2026-11-20.md`) |
 
 ## Phase 1: model catalog and validation
