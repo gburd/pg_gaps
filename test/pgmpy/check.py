@@ -138,9 +138,11 @@ def check_model(cur, name, seed):
         cpt_off,
         cpts,
         var_attr,
-        var_entity,
     ) = cur.fetchone()
     n = len(card)
+    # Entity names of this grounding's missing variables (0-based here).
+    cur.execute("SELECT v, entity FROM gaps._missing_names(gaps._model_id(%s))", [name])
+    var_entity = {v - 1: entity for v, entity in cur.fetchall()}
 
     bn = DiscreteBayesianNetwork()
     bn.add_nodes_from(range(n))

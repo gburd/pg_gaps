@@ -69,7 +69,7 @@ components too large to solve exactly.
 | 2 | pgmpy cross-check | done: 2,647 to 2,762 marginals per run agree to 1e-9 (`test/pgmpy`, flake check `pgmpy`) |
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
 | 2 | `SupportRequestRows` for the SRFs | done: catalog plus `stanullfrac` estimate, under the `pg_stats` visibility rule; ROWS fallback; no lock waits, none on a standby or under SERIALIZABLE; replans on ANALYZE (`sql/rows.sql`) |
-| 2 | grounding cost | **open**: about 100x the inference cost (23 s for 2M variables); jsonb entity keys are next (Phase 6) |
+| 2 | grounding cost | **open**: entity keys are typed composites and temp tables are reused per transaction: `marginals` 2.0-2.6x faster on the hotel workload (10.3 s for 2M variables on EC2), 1.7x on a 900-attribute model, 3 ms slower on a 2-attribute one (`bench/RESULTS_GROUNDING_2026-11-20.md`); keys of the same types share tables whatever their names, so 300 and 2,000 relations keyed by differently named int columns hold main's lock count plus 12 and take 0.70-0.83x its time per call (local), and more than 100 key shapes is an `ERROR`; what remains is sorting integer instance rows (Phase 6) |
 | 3 | Gibbs sampling for components too large for exact | done (branch wip/gibbs): `gaps.samples` (per chain), `gaps.seed`; 4 chains from dispersed starts, refused (`ERROR`) when two chains' estimates differ by more than 0.1.  On models of at most 12 variables (20,000 random strictly positive cases) and the 6 x 6 grid, Rao-Blackwellized marginals are within 0.1 of exact at 4,000 samples (largest error 0.025) with no refusals; the review's multimodal grid and hub models are refused.  The check cannot see chains all stuck in one mode, so a sampled answer can still be wrong without an error (DESIGN.md "Gibbs sampling, as built").  Refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
 | 3 | full hotel workload with its vertical factors | done: runs exact, components of at most 4 variables (`bench/hotel.sql`, `bench/RESULTS_HOTEL_2026-11-20.md`) |
 
@@ -234,10 +234,28 @@ with a manual SQL formulation of the same possible-worlds computation.
 ## Phase 6: planner integration and grounding cost
 
 Grounding dominates: about 100 times the inference cost at 2M variables
-(`bench/RESULTS_SHARING_2026-11-19.md`), from building and joining jsonb
-entity keys in every step.  First, entity keys as typed composite or
-integer surrogates, measured against the current form on the hotel
-workload at two scales with A/A runs.  Then costs for every SRF from model
+(`bench/RESULTS_SHARING_2026-11-19.md`).  Entity keys are now typed
+composites joined once per step, with jsonb built only for reported
+variables, and the entity tables are created once per transaction per
+key shape and truncated after: on EC2, `marginals` is 2.0-2.6x faster at
+200,000 and 2M variables and 1.7x on a 900-attribute model, A/A checked,
+and 3 ms (25-30%) slower on a 2-attribute model, from creating the
+tables in each transaction (`bench/RESULTS_GROUNDING_2026-11-20.md`).
+Tables are shared by key shape (types, typmods and collations, not
+column names), so a model over many relations with same-typed keys
+holds one set; a model with more than 100 shapes is refused, since each
+holds about 16 locks until commit (doc/DESIGN.md, "Key shapes").
+No step is dominated by keys any more; a third of what is left is the
+coverage check and array assembly, sorts over integer instance rows.
+Next: fold the coverage check into building the instances, and measure
+assembling the engine's arrays in C over SPI.
+
+Grounding reads the user's tables in many statements, so under READ
+COMMITTED a concurrent commit can make its steps disagree.  It detects
+the case it can see (a mapped parent row with no entity) and recommends
+REPEATABLE READ (doc/DESIGN.md, "Snapshots"); **open**: grounding under
+one snapshot at any isolation level, which needs the reads in C over SPI
+with one registered snapshot, and fits with moving the assembly there.  Then costs for every SRF from model
 statistics (component sizes, distinct evidence signatures), so plans are
 reasonable without hints.  A custom scan only if a measurement shows the
 SRF form costs something real; otherwise this phase closes with that

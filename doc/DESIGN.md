@@ -401,6 +401,34 @@ it would make "which RV is this row" ambiguous.  The rows of one entity
 must agree on an observed value; disagreeing evidence is an error naming
 the entity.
 
+Entity identity follows the key columns' own equality, as `GROUP BY`
+does: each column's equality operator and collation decide which rows
+are one entity (under a nondeterministic collation, `'A'` and `'a'` can
+be one entity, named by either), and rows whose keys are NULL in the same
+columns, and equal elsewhere, are one entity.  Grounding carries a key as
+a composite of the key columns' types, whose record equality has exactly
+these semantics.
+
+**Key shapes.** Grounding keeps the entities of every attribute whose key
+columns have the same types, typmods and collations, in order, in one
+temp table for the transaction, with the key's fields named k1, k2, ...;
+the column names come back from each attribute's `entity_keys` when a
+result or an error names an entity.  So `customer(id int)` and
+`orders(order_id int)` share one table.  Each distinct shape costs a key
+table, an entity table, an index, and their types: about 16 locks, held
+until commit, in the lock table that every backend shares.  That table
+is sized for `max_locks_per_transaction` (default 64) times about
+`max_connections` (default 100) entries, 6,400 with the defaults, and one
+backend that fills it makes the others fail too.  (The table can borrow
+spare shared memory past that size, which is why a single test session
+can sometimes hold more, but nothing guarantees it.)  Grounding therefore
+refuses a model with more than 100 distinct key shapes, an `ERROR`
+naming the count, before it makes any table: at the limit one call holds
+about 1,650 locks, a quarter of the default table, which leaves the rest
+to other sessions.  A real model rarely has more than a handful of key
+types; the limit is a guard against an unbounded failure, not a tuning
+knob, so it is not a GUC.
+
 **CPTs** are dense `float8[]` in row-major order over (parents..., child),
 the child varying fastest.  A trigger on `gaps.factor` checks every write:
 the right length for the declared domains, every entry finite and
@@ -426,6 +454,25 @@ relation and entity keys as the child maps entity to itself (a horizontal
 factor).  Grounding checks that every child entity maps to exactly one
 parent entity in the parent stripe, and fails naming a child entity that
 maps to none or to several.
+
+The default mapping matches keys as entities are identified, so a
+NULL-keyed child finds the parent entity with the same NULL key.  Explicit
+equalities are SQL `=`, so a NULL in a mapped column matches nothing, and
+a child whose mapped column is NULL maps to no parent: an error naming
+it, not a guess.  A user who wants NULLs to match can map from a column
+that encodes them.
+
+**Snapshots.** Grounding reads the user's tables in several statements
+(one per attribute for entities and evidence, then per factor for the
+instances and per parent for the mapping).  Under READ COMMITTED each
+statement sees its own snapshot, so a concurrent commit can make steps
+disagree.  Grounding detects the disagreement it can see (a row reached
+through a mapping whose entity the entity step did not see) and fails
+with a hint; it does not detect evidence or rows changed between steps
+in ways that leave every row an entity.  For one consistent view, run the
+call in a REPEATABLE READ (or SERIALIZABLE) transaction, where every
+statement shares the transaction's snapshot.  Grounding under one snapshot
+whatever the isolation level needs C (Phase 6).
 
 A missing value is SQL `NULL` in a declared probabilistic column.  `NULL`
 in a deterministic column is ordinary SQL `NULL`, as in [W11 3.2].

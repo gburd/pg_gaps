@@ -91,6 +91,126 @@ SELECT gaps.add_stripe('c', 's', 'reading', 'status');
 SELECT gaps.add_factor('c', 'p', 's', '{}', ARRAY[0.9, 0.1]);
 SELECT entity, value, round(probability::numeric, 12) AS p
 FROM gaps.marginals('c') ORDER BY entity::text, value;
+-- A coarse parent mapped one-to-many: room occupancy per (room, t), over
+-- several rows each, is the parent of every sensor's temperature in that
+-- room and time.  Room 1 at time 1 is observed occupied; room 2 at time 1
+-- has one hot reading below it, room 1 at time 2 one cold reading.  The
+-- oracle is Bayes' rule by hand: P(yes | hot) = 0.3 * 0.1 / (0.3 * 0.1 +
+-- 0.7 * 0.8), and so on.
+CREATE TABLE occ (room int, t int, k int, occupied text, PRIMARY KEY (room, t, k));
+INSERT INTO occ VALUES (1, 1, 1, 'yes'), (1, 1, 2, NULL), (2, 1, 1, NULL), (2, 1, 2, NULL),
+	(1, 2, 1, NULL);
+SELECT gaps.create_model('o');
+SELECT gaps.declare_attribute('o', 'occ', 'occupied', ARRAY['yes', 'no'],
+							  ARRAY['room', 't']::name[]);
+SELECT gaps.declare_attribute('o', 'sensor', 'temp', ARRAY['cold', 'hot']);
+SELECT gaps.add_stripe('o', 'occ', 'occ', 'occupied');
+SELECT gaps.add_stripe('o', 'tp', 'sensor', 'temp');
+SELECT gaps.add_factor('o', 'occ', 'occ', '{}', ARRAY[0.3, 0.7]);
+SELECT gaps.add_factor('o', 'tp', 'tp', ARRAY['occ'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT gaps.map_factor('o', 'tp', 1, 't', 't');
+SELECT gaps.map_factor('o', 'tp', 1, 'room', 'room');
+WITH oracle(attname, entity, value, p) AS (VALUES
+	('occupied', '{"room": 2, "t": 1}', 'yes', 0.03 / 0.59),
+	('occupied', '{"room": 1, "t": 2}', 'yes', 0.27 / 0.41),
+	('temp', '{"t": 1, "room": 1, "sid": 1}', 'cold', 0.9),
+	('temp', '{"t": 1, "room": 1, "sid": 2}', 'cold', 0.9),
+	('temp', '{"t": 1, "room": 2, "sid": 2}', 'cold', 0.139 / 0.59),
+	('temp', '{"t": 2, "room": 1, "sid": 1}', 'cold', 0.271 / 0.41))
+SELECT o.attname, o.entity, count(m.*) AS found,
+	   abs(o.p - m.probability) < 1e-12 AS agrees
+FROM oracle o
+	FULL JOIN (SELECT * FROM gaps.marginals('o') WHERE value IN ('yes', 'cold')) m
+	  ON m.attname = o.attname AND m.entity = o.entity::jsonb
+GROUP BY o.attname, o.entity, o.p, m.probability
+ORDER BY 1, 2;
+SELECT gaps.drop_model('o');
+DROP TABLE occ;
+
+-- An entity key may be NULL: rows with a NULL key are one entity, as in
+-- GROUP BY.  Here that entity is observed through one of its two rows.
+CREATE TABLE nk (id int PRIMARY KEY, g int, x text);
+INSERT INTO nk VALUES (1, NULL, NULL), (2, NULL, 'b'), (3, 1, NULL);
+SELECT gaps.create_model('nk');
+SELECT gaps.declare_attribute('nk', 'nk', 'x', ARRAY['a', 'b'], ARRAY['g']::name[]);
+SELECT gaps.add_stripe('nk', 'x', 'nk', 'x');
+SELECT gaps.add_factor('nk', 'p', 'x', '{}', ARRAY[0.25, 0.75]);
+SELECT entity, value, round(probability::numeric, 12) AS p FROM gaps.marginals('nk') ORDER BY value;
+-- A NULL-keyed entity with a parent: y depends on x of the same entity by
+-- the default mapping, which matches keys as entities do, NULLs equal.
+-- The oracle for g NULL (x observed b): P(y = c | b) = 0.2.
+ALTER TABLE nk ADD COLUMN y text;
+SELECT gaps.declare_attribute('nk', 'nk', 'y', ARRAY['c', 'd'], ARRAY['g']::name[]);
+SELECT gaps.add_stripe('nk', 'y', 'nk', 'y');
+SELECT gaps.add_factor('nk', 'py', 'y', ARRAY['x'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT attname, entity, value, round(probability::numeric, 12) AS p
+FROM gaps.marginals('nk') WHERE attname = 'y' ORDER BY entity::text, value;
+-- The same through a parent stripe with a predicate, which joins rows.
+SELECT gaps.add_stripe('nk', 'xq', 'nk', 'x');
+SELECT gaps.add_stripe_qual('nk', 'xq', 'id', '<', '10');
+UPDATE gaps.factor_parent SET parent_stripe = s.stripe_id
+FROM gaps.stripe s WHERE s.name = 'xq'
+	AND factor_id = (SELECT factor_id FROM gaps.factor WHERE name = 'py')
+RETURNING s.name;
+SELECT attname, entity, value, round(probability::numeric, 12) AS p
+FROM gaps.marginals('nk') WHERE attname = 'y' ORDER BY entity::text, value;
+-- An explicit mapping compares with =, so a NULL maps to no parent.
+SELECT gaps.map_factor('nk', 'py', 1, 'g', 'g');
+SELECT * FROM gaps.marginals('nk');                          -- fail: maps to no parent
+SELECT gaps.drop_model('nk');
+DROP TABLE nk;
+
+-- Repeated groundings in one transaction reuse their temp tables, so the
+-- locks the backend holds do not grow with the number of calls.
+BEGIN;
+SELECT count(*) > 0 AS works FROM gaps.marginals('c');
+SELECT count(*) AS locks1 FROM pg_locks WHERE pid = pg_backend_pid() \gset
+DO $$ BEGIN FOR i IN 1 .. 50 LOOP PERFORM count(*) FROM gaps.marginals('c'); END LOOP; END $$;
+SELECT count(*) - :locks1 AS lock_growth FROM pg_locks WHERE pid = pg_backend_pid();
+COMMIT;
+
+-- Keys of the same types share one entity table whatever their columns
+-- are called, and each entity is still named by its own columns.  A
+-- model with more key shapes than the bound is refused, naming the count.
+CREATE TABLE sk1 (a int PRIMARY KEY, x text);
+CREATE TABLE sk2 (b int PRIMARY KEY, y text);
+INSERT INTO sk1 VALUES (1, NULL);
+INSERT INTO sk2 VALUES (2, NULL);
+SELECT gaps.create_model('sk');
+SELECT gaps.declare_attribute('sk', 'sk1', 'x', ARRAY['p', 'q']);
+SELECT gaps.declare_attribute('sk', 'sk2', 'y', ARRAY['p', 'q']);
+SELECT gaps.add_stripe('sk', 'x', 'sk1', 'x');
+SELECT gaps.add_stripe('sk', 'y', 'sk2', 'y');
+SELECT gaps.add_factor('sk', 'px', 'x', '{}', ARRAY[0.25, 0.75]);
+SELECT gaps.add_factor('sk', 'py', 'y', '{}', ARRAY[0.5, 0.5]);
+BEGIN;
+SELECT attname, entity, value, round(probability::numeric, 12) AS p
+FROM gaps.marginals('sk') ORDER BY 1, 3;
+SELECT count(*) AS entity_tables FROM pg_class
+WHERE relnamespace = pg_my_temp_schema() AND relname LIKE 'pg\_gaps\_e%' AND relkind = 'r';
+COMMIT;
+SELECT gaps.drop_model('sk');
+DROP TABLE sk1, sk2;
+SELECT gaps.create_model('many');
+DO $$
+BEGIN
+	FOR i IN 1 .. 101 LOOP
+		EXECUTE format('CREATE TABLE many%s (k numeric(%s) PRIMARY KEY, x text)', i, i);
+		PERFORM gaps.declare_attribute('many', format('many%s', i)::regclass, 'x', ARRAY['a']);
+	END LOOP;
+END $$;
+SELECT * FROM gaps.marginals('many');                        -- fail: 101 shapes
+SELECT gaps.drop_model('many');
+DO $$ BEGIN FOR i IN 1 .. 101 LOOP EXECUTE format('DROP TABLE many%s', i); END LOOP; END $$;
+
+-- Entity keys must not repeat a column.
+CREATE TABLE dk (id int PRIMARY KEY, g int, x text);
+SELECT gaps.create_model('dk');
+SELECT gaps.declare_attribute('dk', 'dk', 'x', ARRAY['a', 'b'],
+							  ARRAY['g', 'g']::name[]);               -- fail: g twice
+SELECT gaps.drop_model('dk');
+DROP TABLE dk;
+
 UPDATE reading SET status = 'down' WHERE (sid, t, k) = (1, 1, 2);
 SELECT * FROM gaps.marginals('c');                          -- fail: conflicting evidence
 UPDATE reading SET status = 'sideways' WHERE (sid, t) = (1, 1);
@@ -277,6 +397,39 @@ CREATE POLICY room1 ON sensor TO gaps_reader USING (room = 1);
 SET ROLE gaps_reader;
 SELECT DISTINCT entity->>'room' AS room FROM gaps.marginals('m');
 RESET ROLE;
+
+-- Grounding fails, rather than drop a row, when its statements see
+-- different rows, as under READ COMMITTED with a concurrent insert.  A
+-- policy evaluated once per statement simulates one: the parent's second
+-- row shows only from the second statement that reads the table on, so
+-- the mapping reaches a parent row the entity step never saw.
+CREATE SEQUENCE public.reads;
+GRANT USAGE ON SEQUENCE public.reads TO gaps_reader;
+CREATE FUNCTION public.later() RETURNS bool LANGUAGE sql VOLATILE
+	SET search_path = public AS $$ SELECT nextval('reads') > 1 $$;
+CREATE TABLE par (id int PRIMARY KEY, x text);
+INSERT INTO par VALUES (1, 'a'), (2, NULL);
+ALTER TABLE par ENABLE ROW LEVEL SECURITY;
+CREATE POLICY later ON par TO gaps_reader USING (id = 1 OR (SELECT public.later()));
+CREATE TABLE ch (id int PRIMARY KEY, g int, pid int, y text);
+INSERT INTO ch VALUES (1, 1, 1, NULL), (2, 1, 2, NULL);
+GRANT SELECT ON par, ch TO gaps_reader;
+SELECT gaps.create_model('snap');
+UPDATE gaps.model SET owner = 'gaps_reader' WHERE name = 'snap';
+SELECT gaps.declare_attribute('snap', 'par', 'x', ARRAY['a', 'b']);
+SELECT gaps.declare_attribute('snap', 'ch', 'y', ARRAY['c', 'd'], ARRAY['g']::name[]);
+SELECT gaps.add_stripe('snap', 'x', 'par', 'x');
+SELECT gaps.add_stripe('snap', 'y', 'ch', 'y');
+SELECT gaps.add_factor('snap', 'px', 'x', '{}', ARRAY[0.5, 0.5]);
+SELECT gaps.add_factor('snap', 'py', 'y', ARRAY['x'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT gaps.map_factor('snap', 'py', 1, 'pid', 'id');
+SET ROLE gaps_reader;
+SELECT * FROM gaps.marginals('snap');                        -- fail: rows changed
+RESET ROLE;
+SELECT gaps.drop_model('snap');
+DROP TABLE par, ch;
+DROP FUNCTION public.later();
+DROP SEQUENCE public.reads;
 
 -- The internal entry point validates its arrays.
 SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,1}', '{}', '{1}', '{0.5,0.5}');
