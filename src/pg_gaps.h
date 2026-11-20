@@ -14,5 +14,7 @@
 extern int	gaps_max_factor_cells;
 extern int	gaps_max_total_cells;
 extern bool gaps_share_components;
+extern int	gaps_samples;
+extern int	gaps_seed;
 
 #endif							/* PG_GAPS_H */

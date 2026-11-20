@@ -69,6 +69,8 @@ components too large to solve exactly.
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
 | 2 | `SupportRequestRows` for the SRFs | **open** |
 | 2 | grounding cost | **open**: about 100x the inference cost (23 s for 2M variables); jsonb entity keys are next (Phase 6) |
+| 3 | Gibbs sampling for components too large for exact | done (branch wip/gibbs): `gaps.samples`, `gaps.seed`; Rao-Blackwellized marginals within 0.1 of exact at 4,000 samples on 2,000 random positive models (max seen 0.055 of 20,000), refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
+| 3 | full hotel workload with its vertical factors | done: runs exact, components of at most 4 variables (`bench/hotel.sql`, `bench/RESULTS_HOTEL_2026-11-20.md`) |
 
 ## Phase 1: model catalog and validation
 
@@ -159,10 +161,16 @@ Delivers:
   components whose CPTs are all strictly positive (DESIGN.md "Inference":
   Gibbs cannot cross zero-probability regions).  A large component with
   zeros is an `ERROR` naming the reason.
-- `gaps.max_component_vars`: refuse (`ERROR`, with the component size in
-  the message) rather than build an exponential factor.
+- `gaps.max_component_vars`: declined.  `gaps.max_factor_cells` and
+  `gaps.max_total_cells` already refuse an exponential factor before it
+  is built, and they measure what costs memory, which a variable count
+  does not.  Sampling holds memory linear in the component (charged to
+  `gaps.max_total_cells`) and takes time proportional to `gaps.samples`
+  times the component's factor scopes, which the caller chooses and can
+  cancel.
 - Output columns say which method answered and, for sampling, how many
-  samples it used.
+  samples it used: `method` ('exact', 'gibbs', or for `impute`
+  'gibbs-marginal-argmax') and `samples` (NULL for exact).
 
 Done when: exact and oracle agree on correlated models, including
 coarse entity sets and one-to-many mappings; Gibbs is within a stated

@@ -163,6 +163,88 @@ SET gaps.max_total_cells = 4;
 SELECT count(*) FROM gaps.marginals('m');                    -- fail: component too big
 RESET gaps.max_total_cells;
 
+-- Gibbs sampling for a component too large to solve exactly: a 6 x 6
+-- grid where each cell depends on the cell above and the cell to its
+-- left.  Its CPTs have at most 8 cells, but exact inference on the grid
+-- needs factors of about 2^7, so gaps.max_factor_cells = 8 stops it.
+CREATE TABLE grid (i int, j int, im1 int, jm1 int, v text, PRIMARY KEY (i, j));
+INSERT INTO grid
+SELECT i, j, i - 1, j - 1,
+	   CASE WHEN (i * 7 + j) % 5 = 0 THEN CASE WHEN (i + j) % 2 = 0 THEN 'a' ELSE 'b' END END
+FROM generate_series(1, 6) i, generate_series(1, 6) j;
+SELECT gaps.create_model('g');
+SELECT gaps.declare_attribute('g', 'grid', 'v', ARRAY['a', 'b']);
+SELECT gaps.add_stripe('g', 'corner', 'grid', 'v');
+SELECT gaps.add_stripe_qual('g', 'corner', 'i', '=', '1');
+SELECT gaps.add_stripe_qual('g', 'corner', 'j', '=', '1');
+SELECT gaps.add_stripe('g', 'top', 'grid', 'v');
+SELECT gaps.add_stripe_qual('g', 'top', 'i', '=', '1');
+SELECT gaps.add_stripe_qual('g', 'top', 'j', '>', '1');
+SELECT gaps.add_stripe('g', 'side', 'grid', 'v');
+SELECT gaps.add_stripe_qual('g', 'side', 'i', '>', '1');
+SELECT gaps.add_stripe_qual('g', 'side', 'j', '=', '1');
+SELECT gaps.add_stripe('g', 'inner', 'grid', 'v');
+SELECT gaps.add_stripe_qual('g', 'inner', 'i', '>', '1');
+SELECT gaps.add_stripe_qual('g', 'inner', 'j', '>', '1');
+SELECT gaps.add_stripe('g', 'any', 'grid', 'v');
+SELECT gaps.add_factor('g', 'p0', 'corner', '{}', ARRAY[0.4, 0.6]);
+SELECT gaps.add_factor('g', 'left', 'top', ARRAY['any'], ARRAY[0.8, 0.2, 0.3, 0.7]);
+SELECT gaps.map_factor('g', 'left', 1, 'i', 'i');
+SELECT gaps.map_factor('g', 'left', 1, 'jm1', 'j');
+SELECT gaps.add_factor('g', 'up', 'side', ARRAY['any'], ARRAY[0.8, 0.2, 0.3, 0.7]);
+SELECT gaps.map_factor('g', 'up', 1, 'im1', 'i');
+SELECT gaps.map_factor('g', 'up', 1, 'j', 'j');
+SELECT gaps.add_factor('g', 'both', 'inner', ARRAY['any', 'any'],
+					   ARRAY[0.9, 0.1, 0.6, 0.4, 0.5, 0.5, 0.2, 0.8]);
+SELECT gaps.map_factor('g', 'both', 1, 'im1', 'i');
+SELECT gaps.map_factor('g', 'both', 1, 'j', 'j');
+SELECT gaps.map_factor('g', 'both', 2, 'i', 'i');
+SELECT gaps.map_factor('g', 'both', 2, 'jm1', 'j');
+CREATE TEMP TABLE grid_exact AS SELECT * FROM gaps.marginals('g');
+SELECT method, samples, count(*) FROM grid_exact GROUP BY 1, 2;
+SET gaps.max_factor_cells = 8;
+SELECT count(*) FROM gaps.marginals('g');                    -- fail: too large, samples 0
+SET gaps.samples = 4000;
+SET gaps.seed = 42;
+CREATE TEMP TABLE grid_gibbs AS SELECT * FROM gaps.marginals('g');
+-- Every missing value is answered by sampling, every distribution sums to
+-- 1 (rule 14), and every probability is within 0.1 of exact (rule 13; the
+-- tolerance is the engine test's, test/engine/test_engine.c GIBBS_TOL).
+SELECT method, samples, count(*) FROM grid_gibbs GROUP BY 1, 2;
+SELECT count(*) AS bad_groups FROM (
+	SELECT entity FROM grid_gibbs GROUP BY entity
+	HAVING abs(sum(probability) - 1) > 1e-12 OR min(probability) < 0) x;
+SELECT count(*) AS compared, count(*) FILTER (WHERE abs(e.probability - s.probability) < 0.1)
+	   AS within_tol, bool_or(e.probability <> s.probability) AS not_exact
+FROM grid_exact e JOIN grid_gibbs s USING (entity, value);
+-- The same seed repeats the answer bit for bit, with sharing on or off.
+SELECT count(*) AS differ FROM grid_gibbs s JOIN gaps.marginals('g') r USING (entity, value)
+WHERE r.probability <> s.probability;
+SET gaps.share_components = off;
+SELECT count(*) AS differ FROM grid_gibbs s JOIN gaps.marginals('g') r USING (entity, value)
+WHERE r.probability <> s.probability;
+RESET gaps.share_components;
+-- impute on a sampled component takes each value's most probable sampled
+-- value and says so; it gives no joint probability.
+SELECT method, samples, count(*), count(probability) AS with_probability
+FROM gaps.impute('g') GROUP BY 1, 2;
+SELECT count(*) AS not_argmax FROM gaps.impute('g') i JOIN grid_gibbs s USING (entity)
+WHERE s.value <> i.value AND s.probability > 0.5;
+-- Sampling is cancellable: a billion samples would run for hours.
+SET gaps.samples = 1000000000;
+SET statement_timeout = '1s';
+SELECT count(*) FROM gaps.marginals('g');                    -- fail: canceled
+RESET statement_timeout;
+SET gaps.samples = 4000;
+-- A zero in a CPT the component uses rules out sampling.
+SELECT gaps.set_cpt('g', 'both', ARRAY[0.9, 0.1, 0.6, 0.4, 0.5, 0.5, 0, 1]);
+SELECT count(*) FROM gaps.marginals('g');                    -- fail: zero, cannot sample
+RESET gaps.samples;
+RESET gaps.seed;
+RESET gaps.max_factor_cells;
+DROP TABLE grid, grid_exact, grid_gibbs;
+SELECT gaps.drop_model('g');
+
 -- A role that cannot read the table cannot infer over it, even with the
 -- model's owner role.
 CREATE ROLE gaps_reader;

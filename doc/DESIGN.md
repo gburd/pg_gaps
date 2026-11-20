@@ -398,6 +398,30 @@ Randomized algorithms take a seed and a sample count from the call or
 from GUCs (`gaps.seed`, `gaps.samples`) and are deterministic given them,
 so test output is stable.
 
+**Gibbs sampling, as built.**  A component is sampled only when exact
+inference would exceed `gaps.max_factor_cells` or `gaps.max_total_cells`
+and `gaps.samples` > 0 (the default, 0, keeps exact-or-error).  The
+chain clamps the evidence, sweeps the missing variables in a fixed
+order, and redraws each from its full conditional (its own CPT row and
+its children's, summed in logs).  After a burn-in of samples / 10 sweeps,
+each of the samples sweeps adds every variable's full conditional to an
+accumulator; the average is the Rao-Blackwellized marginal, which has
+lower variance than counting draws and sums to 1.  The sampler requires
+every reduced factor entry (every CPT entry consistent with the
+evidence) to be positive.  That is sufficient for the chain to reach
+every world, and a component that fails it is an `ERROR`.  The PRNG is
+xoshiro256** seeded from `gaps.seed` and the hash of the component's
+canonical form, so equal components get the same answer with sharing on
+or off, and nothing depends on a component's position in the network.
+Draws also go through `exp()`, which C does not require to be correctly
+rounded, so bit-identical results are promised on one platform, not
+across C libraries.  `impute` on a sampled component returns each
+variable's most probable sampled value (method
+'gibbs-marginal-argmax') with a NULL probability: that is not the joint
+MAP, and sampling gives no estimate of a joint probability.  One chain,
+no convergence diagnostic; the tolerance is set by measurement
+(test/engine, GIBBS_TOL).
+
 ### Security
 
 The extension is **not trusted** (`trusted = false`, the default) until a
