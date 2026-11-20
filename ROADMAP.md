@@ -70,6 +70,8 @@ components too large to solve exactly.
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
 | 2 | `SupportRequestRows` for the SRFs | done: catalog plus `stanullfrac` estimate, under the `pg_stats` visibility rule; ROWS fallback; no lock waits, none on a standby or under SERIALIZABLE; replans on ANALYZE (`sql/rows.sql`) |
 | 2 | grounding cost | **open**: about 100x the inference cost (23 s for 2M variables); jsonb entity keys are next (Phase 6) |
+| 3 | Gibbs sampling for components too large for exact | done (branch wip/gibbs): `gaps.samples` (per chain), `gaps.seed`; 4 chains from dispersed starts, refused (`ERROR`) when two chains' estimates differ by more than 0.1.  On models of at most 12 variables (20,000 random strictly positive cases) and the 6 x 6 grid, Rao-Blackwellized marginals are within 0.1 of exact at 4,000 samples (largest error 0.025) with no refusals; the review's multimodal grid and hub models are refused.  The check cannot see chains all stuck in one mode, so a sampled answer can still be wrong without an error (DESIGN.md "Gibbs sampling, as built").  Refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
+| 3 | full hotel workload with its vertical factors | done: runs exact, components of at most 4 variables (`bench/hotel.sql`, `bench/RESULTS_HOTEL_2026-11-20.md`) |
 
 ## Phase 1: model catalog and validation
 
@@ -161,11 +163,24 @@ Delivers:
   with `gaps.seed` and `gaps.samples`, deterministic given both, only for
   components whose CPTs are all strictly positive (DESIGN.md "Inference":
   Gibbs cannot cross zero-probability regions).  A large component with
-  zeros is an `ERROR` naming the reason.
-- `gaps.max_component_vars`: refuse (`ERROR`, with the component size in
-  the message) rather than build an exponential factor.
+  zeros is an `ERROR` naming the reason.  Four chains run; when they disagree by more than 0.1 on any
+  probability, the answer is an `ERROR`, not a guess.
+- `gaps.max_component_vars`: declined.  `gaps.max_factor_cells` and
+  `gaps.max_total_cells` already refuse an exponential factor before it
+  is built, and they measure what costs memory, which a variable count
+  does not.  Sampling holds memory linear in the component (charged to
+  `gaps.max_total_cells`) and takes time proportional to 4.4 x
+  `gaps.samples` times the component's factor scopes, which the caller chooses and can
+  cancel.
 - Output columns say which method answered and, for sampling, how many
-  samples it used.
+  samples it used: `method` ('exact', 'gibbs', or for `impute`
+  'gibbs-marginal-argmax') and `samples` (NULL for exact).
+
+Open: start two of the four chains from forward samples of the prior
+(evidence respected), which in a prototype caught the ternary-hub case on
+4 of 5 seeds and cut the alternating hub from 6 to 4 of 40 accepted
+wrong answers (DESIGN.md "Gibbs sampling, as built").  It narrows, it
+does not close, the same-mode gap.
 
 Done when: exact and oracle agree on correlated models, including
 coarse entity sets and one-to-many mappings; Gibbs is within a stated

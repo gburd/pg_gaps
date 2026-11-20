@@ -1,7 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * gx.c
- *	  Exact inference over a ground discrete Bayesian network.
+ *	  Inference over a ground discrete Bayesian network: exact, or by Gibbs
+ *	  sampling for a component too large to solve exactly.
  *
  * gx_infer works in four steps:
  *
@@ -21,7 +22,9 @@
  *	4. On a miss, run variable elimination with a min-fill order: once per
  *	   variable for its marginal (sum-product), and once max-product with
  *	   back-pointers for the MAP assignment.  Every factor product is
- *	   checked against env->max_cells before it is allocated.
+ *	   checked against env->max_cells before it is allocated.  When the
+ *	   bounds stop exact inference and env->samples > 0, the component is
+ *	   sampled instead (see "Gibbs sampling" below).
  *
  * The per-variable marginal elimination is O(n) eliminations per component
  * where a junction tree would share work; components are small in the
@@ -66,6 +69,8 @@ typedef struct ctx
 	size_t		peak;
 	size_t		held;			/* cells the current component holds outside
 								 * solve(), charged before solve() starts */
+	double		spread;			/* the last sampled component's chain
+								 * disagreement, see gibbs_pool() */
 } ctx;
 
 static void *
@@ -241,7 +246,7 @@ check_acyclic(ctx *cp, const gx_bn *bn, int *indeg, int *queue, int *kstart,
 int
 gx_check(const gx_env *env, const gx_bn *bn, int *bad_var)
 {
-	ctx			c = {env, bn, GX_OK, 0, 0};
+	ctx			c = {env, bn, GX_OK, 0, 0, 0.0};
 	int		   *owner = NULL;	/* CPT index per variable */
 	int		   *indeg = NULL;	/* unremoved parents per variable */
 	int		   *queue = NULL;
@@ -1440,6 +1445,401 @@ solve(ctx *c, int nloc, const int *card, factor *fs, int nf,
 }
 
 /* ----------------------------------------------------------------
+ * Gibbs sampling, for a component too large to solve exactly
+ * ----------------------------------------------------------------
+ *
+ * The chain runs over the component's missing variables with the evidence
+ * clamped (it is already folded into the reduced factors).  One sweep
+ * visits every variable in local order and redraws it from its full
+ * conditional: the sum, in logs, of every factor that mentions it, which
+ * is its own CPT row and each child's CPT row, the Markov blanket.  After
+ * a burn-in of samples / 10 sweeps, samples sweeps each add every
+ * variable's full conditional (not its drawn value) to an accumulator;
+ * the average is the Rao-Blackwellized estimate of the marginal, which
+ * has lower variance than counting draws and is a proper distribution
+ * after every sweep.
+ *
+ * GX_CHAINS chains run, one after another, from dispersed starts (all
+ * first values, all last values, then uniform draws), and the answer is
+ * their pooled average.  Single-site Gibbs can stay in one mode of a
+ * multimodal posterior for longer than any affordable run (a hub with
+ * many agreeing children, a strongly coupled grid), and then reports a
+ * confident wrong marginal.  So the chains' own estimates are compared:
+ * if any probability differs by more than GX_MIX_SPREAD between two
+ * chains, the component is refused with GX_ENOMIX.  That catches chains
+ * stuck in different modes; it cannot catch chains that are all stuck in
+ * the same one, so agreement is evidence of mixing, not proof.
+ *
+ * Gibbs sampling is correct only when the chain can reach every world of
+ * positive probability (thesis T5736-5739: constraints must not break the
+ * distribution into disconnected regions).  A sufficient condition, and
+ * the one checked, is that every entry of every reduced factor is
+ * positive: then every world has positive probability, and every full
+ * conditional puts mass on every value.  Reduction keeps only the entries
+ * consistent with the evidence, so a zero the evidence rules out does not
+ * count.  A component that fails the check is refused with GX_ENOTPOS,
+ * not sampled.
+ *
+ * Randomness is xoshiro256** seeded through splitmix64, so the draws
+ * depend on the seed alone, not on the C library.  The sampling decisions
+ * also go through exp(), which the C standard does not require to be
+ * correctly rounded, so a draw that lands within an ulp of a boundary
+ * could in principle differ between C libraries; on one platform a run is
+ * bit-reproducible.
+ */
+
+typedef struct xoshiro
+{
+	uint64_t	s[4];
+} xoshiro;
+
+static uint64_t
+splitmix64(uint64_t *x)
+{
+	uint64_t	z = (*x += 0x9e3779b97f4a7c15ULL);
+
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+	return z ^ (z >> 31);
+}
+
+static uint64_t
+rotl(uint64_t x, int k)
+{
+	return (x << k) | (x >> (64 - k));
+}
+
+static uint64_t
+xoshiro_next(xoshiro *r)
+{
+	uint64_t	result = rotl(r->s[1] * 5, 7) * 9;
+	uint64_t	t = r->s[1] << 17;
+
+	r->s[2] ^= r->s[0];
+	r->s[3] ^= r->s[1];
+	r->s[1] ^= r->s[2];
+	r->s[0] ^= r->s[3];
+	r->s[2] ^= t;
+	r->s[3] = rotl(r->s[3], 45);
+	return result;
+}
+
+/* A uniform double in [0, 1), from the top 53 bits. */
+static double
+xoshiro_unit(xoshiro *r)
+{
+	return (double) (xoshiro_next(r) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+/*
+ * The chain's seed for a component: the caller's seed mixed with the hash
+ * of the component's canonical key, so equal components get the same
+ * chain wherever they sit in the network and whether or not they are
+ * shared, and different components get different chains.
+ */
+static uint64_t
+gibbs_seed(uint64_t seed, uint64_t keyhash)
+{
+	uint64_t	x = seed ^ rotl(keyhash, 32);
+
+	return splitmix64(&x);
+}
+
+/*
+ * The state of one chain.  Every array is allocated by gibbs_init and
+ * released by gibbs_free.  The blanket of local variable t is the factor
+ * list bfac[boff[t]..boff[t+1]), and bstride[] holds t's stride in each of
+ * those factors, so moving t by one value moves the factor's index by the
+ * stride.
+ */
+typedef struct gchain
+{
+	ctx		   *c;
+	int			nloc;
+	const int  *card;
+	factor	   *fs;
+	int			nf;
+	int		   *boff;			/* nloc + 1 */
+	int		   *bfac;
+	size_t	   *bstride;
+	int		   *val;			/* the current world */
+	double	   *cond;			/* one full conditional, max card entries */
+	double	   *accs;			/* GX_CHAINS accumulators of total entries */
+	double	   *acc;			/* the running chain's, inside accs */
+	size_t	   *aoff;			/* per variable, into acc */
+	size_t		total;			/* entries per accumulator */
+	xoshiro		rng;
+	size_t		work;			/* since the last interrupt */
+} gchain;
+
+static void
+gibbs_free(gchain *g)
+{
+	ctx		   *c = g->c;
+
+	xfree(c, g->boff);
+	xfree(c, g->bfac);
+	xfree(c, g->bstride);
+	xfree(c, g->val);
+	xfree(c, g->cond);
+	xfree(c, g->accs);
+	xfree(c, g->aoff);
+}
+
+/*
+ * Check positivity, then build the blanket lists with a counting sort over
+ * the factors' variables, and one accumulator per chain.  Everything here
+ * is linear in the factors' scopes, and is charged against
+ * max_total_cells on top of the reduced factors the component already
+ * holds.
+ */
+static int
+gibbs_init(gchain *g)
+{
+	ctx		   *c = g->c;
+	size_t		nent = 0,
+				total = 0;
+	int			maxcard = 1;
+
+	for (int i = 0; i < g->nf; i++)
+	{
+		interrupt(c);
+		for (size_t k = 0; k < g->fs[i].ncells; k++)
+			if (!(g->fs[i].vals[k] > -INFINITY))
+			{
+				c->err = GX_ENOTPOS;
+				return c->err;
+			}
+		nent += (size_t) g->fs[i].nv;
+	}
+	for (int t = 0; t < g->nloc; t++)
+	{
+		total += (size_t) g->card[t];
+		if (g->card[t] > maxcard)
+			maxcard = g->card[t];
+	}
+	if (c->held + 2 * nent + (GX_CHAINS + 1) * total + 4 * (size_t) g->nloc >
+		c->env->max_total_cells)
+	{
+		c->err = GX_ETOOBIG;
+		return c->err;
+	}
+
+	g->boff = xalloc(c, sizeof(int) * (size_t) (g->nloc + 1));
+	g->bfac = xalloc(c, sizeof(int) * (nent ? nent : 1));
+	g->bstride = xalloc(c, sizeof(size_t) * (nent ? nent : 1));
+	g->val = xalloc(c, sizeof(int) * (size_t) g->nloc);
+	g->cond = xalloc(c, sizeof(double) * (size_t) maxcard);
+	g->accs = xalloc(c, sizeof(double) * total * GX_CHAINS);
+	g->aoff = xalloc(c, sizeof(size_t) * (size_t) g->nloc);
+	if (c->err)
+		return c->err;
+
+	/* Count each variable's factors, then place them. */
+	memset(g->boff, 0, sizeof(int) * (size_t) (g->nloc + 1));
+	for (int i = 0; i < g->nf; i++)
+		for (int j = 0; j < g->fs[i].nv; j++)
+			g->boff[g->fs[i].vars[j] + 1]++;
+	for (int t = 0; t < g->nloc; t++)
+		g->boff[t + 1] += g->boff[t];
+	for (int t = 0; t < g->nloc; t++)
+		g->val[t] = g->boff[t];	/* placement cursor, for now */
+	for (int i = 0; i < g->nf; i++)
+	{
+		size_t		stride = 1;
+
+		for (int j = g->fs[i].nv - 1; j >= 0; j--)
+		{
+			int			t = g->fs[i].vars[j];
+
+			g->bfac[g->val[t]] = i;
+			g->bstride[g->val[t]++] = stride;
+			stride *= (size_t) g->card[t];
+		}
+	}
+
+	total = 0;
+	for (int t = 0; t < g->nloc; t++)
+	{
+		g->aoff[t] = total;
+		total += (size_t) g->card[t];
+	}
+	g->total = total;
+	memset(g->accs, 0, sizeof(double) * total * GX_CHAINS);
+	return GX_OK;
+}
+
+/*
+ * Redraw variable t from its full conditional, and add the conditional to
+ * t's accumulator when keep is set.  Each blanket factor's index is found
+ * once with t at 0; each value of t then adds its stride.
+ */
+static void
+gibbs_step(gchain *g, int t, int keep)
+{
+	int			k = g->card[t];
+	double		mx = -INFINITY,
+				sum = 0.0,
+				u;
+	int			x;
+
+	for (x = 0; x < k; x++)
+		g->cond[x] = 0.0;
+	g->val[t] = 0;
+	for (int b = g->boff[t]; b < g->boff[t + 1]; b++)
+	{
+		const factor *f = &g->fs[g->bfac[b]];
+		size_t		idx = factor_index(f, g->card, g->val);
+
+		for (x = 0; x < k; x++)
+			g->cond[x] += f->vals[idx + (size_t) x * g->bstride[b]];
+		g->work += (size_t) f->nv + (size_t) k;
+	}
+	for (x = 0; x < k; x++)
+		if (g->cond[x] > mx)
+			mx = g->cond[x];
+	for (x = 0; x < k; x++)
+	{
+		g->cond[x] = exp(g->cond[x] - mx);
+		sum += g->cond[x];
+	}
+
+	/* Inverse CDF; the last value takes whatever rounding leaves over. */
+	u = xoshiro_unit(&g->rng) * sum;
+	for (x = 0; x < k - 1; x++)
+	{
+		if (u < g->cond[x])
+			break;
+		u -= g->cond[x];
+	}
+	g->val[t] = x;
+	if (keep)
+		for (x = 0; x < k; x++)
+			g->acc[g->aoff[t] + (size_t) x] += g->cond[x] / sum;
+	if (g->work >= 65536)
+	{
+		interrupt(g->c);
+		g->work = 0;
+	}
+}
+
+/*
+ * Set the starting world of chain k.  The first two chains start at
+ * opposite corners of the state space (every variable at its first value,
+ * then at its last), the others at worlds drawn uniformly, so that chains
+ * stuck in different modes disagree and gibbs_pool() can see it.
+ */
+static void
+gibbs_start(gchain *g, int k)
+{
+	for (int t = 0; t < g->nloc; t++)
+	{
+		if (k == 0)
+			g->val[t] = 0;
+		else if (k == 1)
+			g->val[t] = g->card[t] - 1;
+		else
+			g->val[t] = (int) (xoshiro_unit(&g->rng) * g->card[t]);
+	}
+}
+
+/*
+ * Pool the chains: write each variable's marginal (the sum of all chains'
+ * accumulators, normalized) into marg and its argmax into map, and return
+ * the convergence diagnostic, the largest spread (highest minus lowest)
+ * between the chains' own estimates of any one probability.
+ */
+static double
+gibbs_pool(gchain *g, double *marg, int *map)
+{
+	double		spread = 0.0;
+
+	for (int t = 0; t < g->nloc; t++)
+	{
+		double		s = 0.0,
+					sk[GX_CHAINS] = {0};
+
+		for (int k = 0; k < GX_CHAINS; k++)
+			for (int x = 0; x < g->card[t]; x++)
+				sk[k] += g->accs[k * g->total + g->aoff[t] + (size_t) x];
+		for (int k = 0; k < GX_CHAINS; k++)
+			s += sk[k];
+		map[t] = 0;
+		for (int x = 0; x < g->card[t]; x++)
+		{
+			size_t		i = g->aoff[t] + (size_t) x;
+			double		lo = 1.0,
+						hi = 0.0,
+						a = 0.0;
+
+			for (int k = 0; k < GX_CHAINS; k++)
+			{
+				double		e = g->accs[k * g->total + i] / sk[k];
+
+				lo = e < lo ? e : lo;
+				hi = e > hi ? e : hi;
+				a += g->accs[k * g->total + i];
+			}
+			marg[i] = a / s;
+			if (marg[i] > marg[g->aoff[t] + (size_t) map[t]])
+				map[t] = x;
+			if (hi - lo > spread)
+				spread = hi - lo;
+		}
+	}
+	return spread;
+}
+
+/*
+ * Sample one component: nloc variables with cardinalities card[], reduced
+ * factors fs[0..nf).  Runs GX_CHAINS chains in turn, each with a burn-in
+ * of env->samples / 10 sweeps and then env->samples sweeps.  Writes the
+ * pooled marginals, flattened in local order, into marg, each variable's
+ * most probable pooled value into map, and the chains' disagreement into
+ * c->spread.  Returns GX_ENOTPOS if a factor has a zero entry, GX_ETOOBIG
+ * if the chains' arrays would exceed max_total_cells, and GX_ENOMIX if
+ * the disagreement exceeds GX_MIX_SPREAD.
+ */
+static int
+gibbs(ctx *c, int nloc, const int *card, factor *fs, int nf, uint64_t seed,
+	  double *marg, int *map)
+{
+	gchain		g;
+	int			burnin = c->env->samples / 10;
+
+	memset(&g, 0, sizeof(g));
+	g.c = c;
+	g.nloc = nloc;
+	g.card = card;
+	g.fs = fs;
+	g.nf = nf;
+
+	if (gibbs_init(&g) == GX_OK)
+	{
+		/* Each chain: its own stream, start, burn-in and accumulator. */
+		for (int k = 0; k < GX_CHAINS; k++)
+		{
+			for (int i = 0; i < 4; i++)
+				g.rng.s[i] = splitmix64(&seed);
+			g.acc = g.accs + (size_t) k * g.total;
+			gibbs_start(&g, k);
+			for (int sweep = 0; sweep < burnin + c->env->samples; sweep++)
+			{
+				interrupt(c);
+				for (int t = 0; t < nloc; t++)
+					gibbs_step(&g, t, sweep >= burnin);
+			}
+		}
+
+		c->spread = gibbs_pool(&g, marg, map);
+		if (!(c->spread <= GX_MIX_SPREAD))
+			c->err = GX_ENOMIX;
+	}
+	gibbs_free(&g);
+	return c->err;
+}
+
+/* ----------------------------------------------------------------
  * Components, reduction by evidence, and the sharing cache
  * ----------------------------------------------------------------
  */
@@ -1616,6 +2016,7 @@ typedef struct centry
 	double	   *marg;			/* flattened per local variable */
 	int		   *map;
 	double		map_prob;
+	int			samples;		/* Gibbs samples, 0 if solved exactly */
 } centry;
 
 #define NBUCKETS 1024
@@ -1676,11 +2077,13 @@ cache_find(ctx *c, centry **buckets, uint64_t h, const keybuf *key)
 
 /*
  * Solve a component that missed the cache, and return a new cache entry
- * for it (taking ownership of the key), or NULL on error.
+ * for it (taking ownership of the key), or NULL on error.  h is the
+ * bucket hash and keyhash the key's real hash, which seeds a Gibbs chain
+ * (the two differ only in the hash-collision test build).
  */
 static centry *
 cache_fill(ctx *c, int nloc, const int *lcard, factor *fs, int nf,
-		   uint64_t h, keybuf *key)
+		   uint64_t h, uint64_t keyhash, keybuf *key)
 {
 	size_t		total = 0;
 	double	  **marg;
@@ -1699,13 +2102,34 @@ cache_fill(ctx *c, int nloc, const int *lcard, factor *fs, int nf,
 	}
 	if (!c->err)
 	{
+		const gx_env *env = c->env;
+
 		total = 0;
 		for (int t = 0; t < nloc; t++)
 		{
 			marg[t] = e->marg + total;
 			total += (size_t) lcard[t];
 		}
-		solve(c, nloc, lcard, fs, nf, marg, e->map, &e->map_prob);
+
+		/*
+		 * Exact first.  solve() frees everything it built when a bound
+		 * stops it, so the component can then be sampled from a clean
+		 * slate; the work exact did before giving up is bounded by the
+		 * same limits.
+		 */
+		if (!(env->sample_always && env->samples > 0))
+			solve(c, nloc, lcard, fs, nf, marg, e->map, &e->map_prob);
+		if (env->samples > 0 &&
+			(env->sample_always || c->err == GX_ETOOBIG))
+		{
+			c->err = GX_OK;
+			if (gibbs(c, nloc, lcard, fs, nf, gibbs_seed(env->seed, keyhash),
+					  e->marg, e->map) == GX_OK)
+			{
+				e->map_prob = NAN;
+				e->samples = env->samples;
+			}
+		}
 	}
 	xfree(c, marg);
 	if (c->err)
@@ -1741,7 +2165,8 @@ do_component(ctx *c, int cid, const int *members, int nloc,
 	factor	   *fs;
 	int			nf = 0;
 	keybuf		key = {0};
-	uint64_t	h;
+	uint64_t	h,
+				keyhash;
 	centry	   *e;
 	size_t		held = 0;
 	size_t		off = 0;
@@ -1778,7 +2203,7 @@ do_component(ctx *c, int cid, const int *members, int nloc,
 
 	if (build_key(c, nloc, lcard, fs, nf, &key) != GX_OK)
 		goto done;
-	h = hash_bytes(c, key.b, key.len);
+	keyhash = h = hash_bytes(c, key.b, key.len);
 #ifdef GX_TEST_HASH_COLLIDE
 	h = 0;						/* test build: every key collides */
 #endif
@@ -1787,7 +2212,7 @@ do_component(ctx *c, int cid, const int *members, int nloc,
 		out->cache_hits++;
 	else
 	{
-		e = cache_fill(c, nloc, lcard, fs, nf, h, &key);
+		e = cache_fill(c, nloc, lcard, fs, nf, h, keyhash, &key);
 		if (e == NULL)
 			goto done;
 		e->next = buckets[h % NBUCKETS];
@@ -1805,6 +2230,7 @@ do_component(ctx *c, int cid, const int *members, int nloc,
 		out->map[g] = e->map[t];
 	}
 	out->comp_map_prob[cid] = e->map_prob;
+	out->comp_samples[cid] = e->samples;
 
 done:
 	if (fs)
@@ -1825,6 +2251,8 @@ result_free(ctx *c, gx_result *out)
 	xfree(c, out->map);
 	xfree(c, out->comp_map_prob);
 	xfree(c, out->comp_size);
+	xfree(c, out->comp_samples);
+	out->comp_samples = NULL;
 	out->marg = NULL;
 	out->marg_off = NULL;
 	out->comp = out->map = out->comp_size = NULL;
@@ -1925,6 +2353,7 @@ group_components(ctx *c, inferwork *w, gx_result *out)
 
 	out->comp_size = xalloc(c, sizeof(int) * (size_t) (nc ? nc : 1));
 	out->comp_map_prob = xalloc(c, sizeof(double) * (size_t) (nc ? nc : 1));
+	out->comp_samples = xalloc(c, sizeof(int) * (size_t) (nc ? nc : 1));
 	w->cstart = xalloc(c, sizeof(int) * (size_t) (nc + 1));
 	w->cptsorted = xalloc(c, sizeof(int) * (size_t) (bn->ncpts ? bn->ncpts : 1));
 	if (c->err)
@@ -1985,7 +2414,7 @@ result_init(ctx *c, gx_result *out)
 int
 gx_infer(const gx_env *env, const gx_bn *bn, gx_result *out)
 {
-	ctx			c = {env, bn, GX_OK, 0, 0};
+	ctx			c = {env, bn, GX_OK, 0, 0, 0.0};
 	size_t		nv = (size_t) (bn->nvars ? bn->nvars : 1);
 	inferwork	w;
 
@@ -2016,6 +2445,8 @@ gx_infer(const gx_env *env, const gx_bn *bn, gx_result *out)
 							 w.loc, w.gval, w.buckets, out) != GX_OK)
 			{
 				out->bad_var = w.members[w.start[k]];
+				out->bad_size = out->comp_size[k];
+				out->spread = c.spread;
 				break;
 			}
 		}

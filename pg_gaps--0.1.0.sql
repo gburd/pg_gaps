@@ -935,7 +935,8 @@ LANGUAGE C STRICT STABLE;
 CREATE FUNCTION gaps._infer(card int[], evidence int[], child int[], parent_off int[],
 							parents int[], cpt_off int[], cpts float8[],
 							OUT var int, OUT value int, OUT probability float8,
-							OUT component int, OUT map_value int, OUT map_probability float8)
+							OUT component int, OUT map_value int, OUT map_probability float8,
+							OUT samples int)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gaps_infer'
 LANGUAGE C STRICT VOLATILE;
@@ -1207,9 +1208,14 @@ $$;
 -- Values in one component are correlated: their probabilities are
 -- marginals and must not be multiplied together (doc/DESIGN.md,
 -- Principle 1).  Values in different components are independent.
+-- method is 'exact', or 'gibbs' for a component too large to solve
+-- exactly that was sampled (gaps.samples), with samples the number of
+-- samples per chain; samples is NULL for exact.  A sampled component
+-- whose chains disagree is an ERROR, but chains that agree can still all
+-- be wrong (doc/DESIGN.md, "Gibbs sampling, as built").
 CREATE FUNCTION gaps.marginals(model text,
 	OUT rel regclass, OUT attname name, OUT entity jsonb, OUT value text,
-	OUT probability float8, OUT component int, OUT method text)
+	OUT probability float8, OUT component int, OUT method text, OUT samples int)
 RETURNS SETOF record
 LANGUAGE plpgsql
 ROWS 1000 SUPPORT gaps._rows_support
@@ -1225,7 +1231,8 @@ BEGIN
 	-- quadratic over millions of variables.
 	RETURN QUERY
 		SELECT a.rel, a.attname, v.entity, a.domain[r.value],
-			   r.probability, r.component, 'exact'::text
+			   r.probability, r.component,
+			   CASE WHEN r.samples IS NULL THEN 'exact' ELSE 'gibbs' END, r.samples
 		FROM gaps._infer(g.card, g.evidence, g.child, g.parent_off, g.parents,
 						 g.cpt_off, g.cpts) r
 			JOIN pg_gaps_rv v ON v.v = r.var
@@ -1235,10 +1242,14 @@ $$;
 
 -- The jointly most probable completion of each component: one row per
 -- missing value, with the posterior probability of its component's whole
--- assignment (the same for every row of the component).
+-- assignment (the same for every row of the component).  A sampled
+-- component (method 'gibbs-marginal-argmax') gets each value's most
+-- probable sampled value instead, which need not be the joint MAP, and
+-- probability NULL: sampling does not estimate a joint probability.  The
+-- rows of a sampled component are not one joint completion.
 CREATE FUNCTION gaps.impute(model text,
 	OUT rel regclass, OUT attname name, OUT entity jsonb, OUT value text,
-	OUT probability float8, OUT component int, OUT method text)
+	OUT probability float8, OUT component int, OUT method text, OUT samples int)
 RETURNS SETOF record
 LANGUAGE plpgsql
 ROWS 1000 SUPPORT gaps._rows_support
@@ -1250,7 +1261,9 @@ BEGIN
 	g := gaps._ground(gaps._model_id(model));
 	RETURN QUERY
 		SELECT a.rel, a.attname, v.entity, a.domain[r.map_value],
-			   r.map_probability, r.component, 'exact'::text
+			   r.map_probability, r.component,
+			   CASE WHEN r.samples IS NULL THEN 'exact' ELSE 'gibbs-marginal-argmax' END,
+			   r.samples
 		FROM gaps._infer(g.card, g.evidence, g.child, g.parent_off, g.parents,
 						 g.cpt_off, g.cpts) r
 			JOIN pg_gaps_rv v ON v.v = r.var

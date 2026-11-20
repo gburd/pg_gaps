@@ -463,6 +463,80 @@ Randomized algorithms take a seed and a sample count from the call or
 from GUCs (`gaps.seed`, `gaps.samples`) and are deterministic given them,
 so test output is stable.
 
+**Gibbs sampling, as built.**  A component is sampled only when exact
+inference would exceed `gaps.max_factor_cells` or `gaps.max_total_cells`
+and `gaps.samples` > 0 (the default, 0, keeps exact-or-error).  Each
+chain clamps the evidence, sweeps the missing variables in a fixed
+order, and redraws each from its full conditional (its own CPT row and
+its children's, summed in logs).  After a burn-in of samples / 10 sweeps,
+each of the samples sweeps adds every variable's full conditional to an
+accumulator; the average is the Rao-Blackwellized marginal, which has
+lower variance than counting draws and sums to 1.  The sampler requires
+every reduced factor entry (every CPT entry consistent with the
+evidence) to be positive.  That is sufficient for the chain to reach
+every world, and a component that fails it is an `ERROR`.
+
+Four chains run, and `gaps.samples` counts sweeps per chain, so a
+component costs 4.4 x `gaps.samples` sweeps.  Per chain, not in total,
+because a chain needs its own burn-in and a run long enough to mix:
+splitting 4,000 sweeps four ways made the engine test's 6 x 6 grid
+refuse on 34 of 200 seeds, against none at 4,000 per chain.  The first
+chain starts with every variable at its first value, the second at its
+last, the others at uniform draws.  The answer is the four chains'
+pooled average.
+
+**The convergence check, and what it cannot see.**  Single-site Gibbs
+can stay in one mode of a multimodal posterior far longer than any
+affordable run.  The review of the first version (one chain) found a
+20 x 20 grid whose corner has a parent with 40 more children, with CPTs
+of 0.8/0.2, where every exact marginal is 0.5 and the sampler returned
+0.0 or 1.0 at 4,000 and at 100,000 samples, labelled 'gibbs' with
+nothing to say it was a coin flip.  Now each chain's own estimates are
+compared, and if two chains estimate any probability more than 0.1
+apart (`GX_MIX_SPREAD`), the query fails with an `ERROR` naming the
+component's size, `gaps.samples`, the spread and the limit, with a hint
+to raise `gaps.samples` or the exact-inference bounds.  Measured at the
+default threshold and 4,000 samples per chain:
+
+| model | refused |
+|---|---|
+| 20,000 random strictly positive models of at most 12 variables (`test/engine`) | 0 (largest spread 0.078; largest pooled error 0.025) |
+| the 6 x 6 regression grid, 200 seeds | 0 (largest spread 0.080) |
+| the review's grid + hub (20 x 20, 40 children, p = 0.8), 5 seeds | 5 (spread 1.0) |
+| 20 x 20 grid at p = 0.95, 5 seeds | 5 (spread 0.32-0.45; at 80,000 samples 0.055-0.073 and error 0.021-0.024) |
+| 30 x 30 grid at p = 0.97, 3 seeds | 3 (spread 0.56-0.71) |
+| a hub with 30 or 50 agreeing children, 3 seeds each | 6 (spread 1.0) |
+| **not refused:** a binary hub with 50 ternary children, CPT {0.1, 0.8, 0.1 \| 0.4, 0.2, 0.4}, exact P(hub) = 0.5 | 0 of every seed tried; error 0.5 |
+| **not refused:** a binary hub whose children alternately agree and disagree with it (p = 0.8), 40 seeds | 34 (6 accepted with error 0.5; 5 of 40 still at 100,000 samples) |
+
+A multi-chain check narrows silent failure but cannot rule it out, and
+the last two rows show it failing on ordinary CPTs (no entry below 0.1).
+All four chains can sit in the same mode: in the ternary hub, the
+all-first and all-last starts put every child at an end value and a
+uniform start puts two thirds there, which all pull the hub the same
+way.  Chains can also agree by accident while each is wrong; a spread
+under 0.1 is evidence the chains mixed, not proof.  The 0.1 tolerance the tests use (`GIBBS_TOL`) was
+measured on models of at most 12 variables and on the 6 x 6 grid, where
+any chain mixes in a few sweeps; it is not a property of the method.
+For an answer that must be right, raise the bounds and solve exactly.
+
+**Determinism.**  The PRNG is xoshiro256** seeded from `gaps.seed` and
+the hash of the component's canonical form; the four chains take
+successive streams from it.  Equal components therefore get the same
+answer with sharing on or off.  The answer depends only on the
+component and the relative order of its variables' numbers, which fixes
+the local numbering, the key and the sweep order, and not on where the
+component sits in the network.  The key hashes native `int` and
+`double` bytes, and draws go through `exp()`, which C does not require
+to be correctly rounded, so bit-identical results are promised on one
+platform, not across byte orders or C libraries.
+
+`impute` on a sampled component returns each variable's most probable
+pooled value (method 'gibbs-marginal-argmax') with a NULL probability.
+That is not the joint MAP, and sampling gives no estimate of a joint
+probability, so the rows of a sampled component must not be read as one
+joint completion.
+
 ### Row estimates
 
 `gaps.marginals`, `gaps.impute` and `gaps.learn_cpts` have a planner

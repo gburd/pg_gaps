@@ -33,6 +33,17 @@
 #define GX_EZERO	3			/* the evidence has probability zero */
 #define GX_EINVAL	4			/* malformed network */
 #define GX_ECYCLE	5			/* the network has a directed cycle */
+#define GX_ENOTPOS	6			/* too large for exact inference, and a zero
+								 * in its factors rules out Gibbs sampling */
+#define GX_ENOMIX	7			/* sampled, but the chains disagree by more
+								 * than GX_MIX_SPREAD */
+
+/*
+ * Gibbs sampling runs GX_CHAINS chains and refuses its answer when two of
+ * them estimate some probability more than GX_MIX_SPREAD apart.
+ */
+#define GX_CHAINS	4
+#define GX_MIX_SPREAD 0.1
 
 /*
  * Services the caller provides.  alloc may return NULL (the engine then
@@ -50,6 +61,12 @@ typedef struct gx_env
 	size_t		max_cells;		/* largest factor the engine may build */
 	size_t		max_total_cells;	/* all factors held at once, per component */
 	int			no_sharing;		/* solve every component, even identical ones */
+	int			samples;		/* Gibbs samples (sweeps) per chain for a
+								 * component exact inference cannot solve;
+								 * 0 never samples; at most INT_MAX / 2 */
+	uint64_t	seed;			/* seeds every chain, with the component */
+	int			sample_always;	/* sample even what exact could solve; for
+								 * the tests, which compare the two */
 } gx_env;
 
 typedef struct gx_cpt
@@ -81,12 +98,18 @@ typedef struct gx_result
 	double	   *marg;			/* marginals, flattened: variable v's card[v]
 								 * entries start at marg + marg_off[v] */
 	size_t	   *marg_off;		/* per variable; observed ones have none */
-	int		   *map;			/* per variable: jointly most probable value */
-	double	   *comp_map_prob;	/* per component: P(MAP assignment | evidence) */
+	int		   *map;			/* per variable: jointly most probable value,
+								 * or for a sampled component the most
+								 * probable value of its sampled marginal */
+	double	   *comp_map_prob;	/* per component: P(MAP assignment | evidence),
+								 * NAN for a sampled component */
 	int		   *comp_size;		/* per component: number of variables */
+	int		   *comp_samples;	/* per component: Gibbs samples, 0 if exact */
 	long		cache_hits;		/* components answered from the cache */
 	size_t		peak_cells;		/* largest factor built */
 	int			bad_var;		/* on error, a variable involved, or -1 */
+	int			bad_size;		/* on error, the size of its component */
+	double		spread;			/* on GX_ENOMIX, the chains' disagreement */
 } gx_result;
 
 /*
@@ -106,6 +129,23 @@ extern int	gx_check(const gx_env *env, const gx_bn *bn, int *bad_var);
  * component with its posterior probability.  Components with identical
  * structure, CPTs and evidence are computed once.  bn must pass gx_check.
  * On success out is filled with arrays from env->alloc.
+ *
+ * A component whose exact solution would exceed max_cells or
+ * max_total_cells is sampled instead when env->samples > 0.  GX_CHAINS
+ * Gibbs chains from dispersed starts each burn in for samples / 10
+ * sweeps and then run samples sweeps, and their Rao-Blackwellized
+ * marginals (the average over sweeps of each variable's full conditional)
+ * are pooled.  If two chains estimate some probability more than
+ * GX_MIX_SPREAD apart, the answer is refused with GX_ENOMIX and
+ * out->spread set.  Agreement does not prove convergence: chains that are
+ * all stuck in one mode agree.  Only a component whose reduced factors
+ * (its CPT entries consistent with the evidence) are all positive is
+ * sampled; one with a zero returns GX_ENOTPOS.  The chains are seeded
+ * from env->seed and the component's canonical form, so equal components
+ * get bit-identical answers whether or not they are shared, and a run is
+ * reproducible given (seed, samples).  For a sampled component, map holds
+ * each variable's most probable sampled value (not the joint MAP) and
+ * comp_map_prob is NAN.
  */
 extern int	gx_infer(const gx_env *env, const gx_bn *bn, gx_result *out);
 

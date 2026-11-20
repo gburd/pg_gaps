@@ -40,9 +40,16 @@ PG_MODULE_MAGIC;
 void		_PG_init(void);
 
 /*
- * Register the GUCs.  Both bound inference (AGENTS.md rule 16): a query
- * whose model would need a larger factor, or more cells held at once,
- * fails with an ERROR naming the setting instead of exhausting memory.
+ * Register the GUCs.  The two cell limits bound inference (AGENTS.md rule
+ * 16): a query whose model would need a larger factor, or more cells held
+ * at once, fails with an ERROR naming the setting instead of exhausting
+ * memory.  gaps.samples lets such a component be sampled instead, and
+ * gaps.seed makes the sample reproducible (rule 15).  Sampling holds
+ * memory linear in the component, charged to gaps.max_total_cells; its
+ * time is linear in samples times the component's factor scopes, and it
+ * is cancellable.  gaps.samples counts sweeps per chain, and the engine
+ * runs GX_CHAINS chains; the upper limit keeps a chain's burn-in and
+ * sweep count within an int.
  */
 void
 _PG_init(void)
@@ -69,5 +76,20 @@ _PG_init(void)
 							 true,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("gaps.samples",
+							"Gibbs samples for a component too large for exact inference.",
+							"Per chain; four chains run.  0, the default, never samples: "
+							"such a component is an error.",
+							&gaps_samples,
+							0, 0, INT_MAX / 2,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("gaps.seed",
+							"Seed for Gibbs sampling.",
+							"With the same seed and gaps.samples, sampled answers repeat.",
+							&gaps_seed,
+							0, 0, INT_MAX,
+							PGC_USERSET, 0,
+							NULL, NULL, NULL);
 	MarkGUCPrefixReserved("gaps");
 }
