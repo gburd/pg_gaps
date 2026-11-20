@@ -93,9 +93,10 @@ typedef struct gx_result
  * Check that bn is a well-formed network: cardinalities positive, one CPT
  * per variable, parents in range and distinct, CPT entries finite and
  * non-negative, evidence in range, and no directed cycle (a variable that
- * is its own parent is one).  Returns GX_OK, GX_EINVAL, GX_ECYCLE or GX_ENOMEM, with *bad_var
- * set to a variable involved in a failure.  Does not check that CPT rows sum to 1;
- * the caller validates that where the values enter.
+ * is its own parent is one).  Returns GX_OK, GX_EINVAL, GX_ECYCLE or
+ * GX_ENOMEM, with *bad_var set to a variable involved in a failure.  Does
+ * not check that CPT rows sum to 1; the caller validates that where the
+ * values enter.
  */
 extern int	gx_check(const gx_env *env, const gx_bn *bn, int *bad_var);
 
