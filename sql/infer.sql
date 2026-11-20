@@ -139,6 +139,15 @@ SELECT entity, value, round(probability::numeric, 12) AS p FROM gaps.marginals('
 SELECT gaps.drop_model('nk');
 DROP TABLE nk;
 
+-- Repeated groundings in one transaction reuse their temp tables, so the
+-- locks the backend holds do not grow with the number of calls.
+BEGIN;
+SELECT count(*) > 0 AS works FROM gaps.marginals('c');
+SELECT count(*) AS locks1 FROM pg_locks WHERE pid = pg_backend_pid() \gset
+DO $$ BEGIN FOR i IN 1 .. 50 LOOP PERFORM count(*) FROM gaps.marginals('c'); END LOOP; END $$;
+SELECT count(*) - :locks1 AS lock_growth FROM pg_locks WHERE pid = pg_backend_pid();
+COMMIT;
+
 -- Entity keys must not repeat a column.
 CREATE TABLE dk (id int PRIMARY KEY, g int, x text);
 SELECT gaps.create_model('dk');
