@@ -124,7 +124,7 @@ SELECT * FROM gaps.marginals('self');                        -- fail: cycle
 CREATE FUNCTION pg_temp.share(model text, a text, b text) RETURNS boolean
 LANGUAGE sql AS $$
 	SELECT gaps._may_share_rvs(gaps._stripe_id(model, a), gaps._stripe_id(model, b),
-							   gaps._fixed_columns(s.attribute_id))
+							   gaps._whole_rows(s.attribute_id))
 	FROM gaps.stripe s WHERE s.stripe_id = gaps._stripe_id(model, a)
 $$;
 SELECT gaps.create_model('ops');

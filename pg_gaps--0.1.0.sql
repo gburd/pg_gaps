@@ -606,25 +606,17 @@ AS $$
 		HAVING count(DISTINCT o.oprname) = 5)
 $$;
 
--- The columns of attribute att on which gaps._may_share_rvs may treat
--- contradictory quals as proof that two stripes share no RV.  A column
--- qualifies when it is fixed per entity and its type is a total order
--- (gaps._total_order).  It is fixed per entity when it is an entity key,
--- or when the entity keys include the primary key, so each entity is one
--- row; a qual on any other column selects rows, and rows of one coarse
--- entity may fall on both sides (AGENTS.md rule 19).  The primary key makes
--- an entity one row only when it is checked on every statement (not
--- deferrable) and the relation has no inheritance children or partitions,
--- which grounding reads too and the key does not cover.
-CREATE FUNCTION gaps._fixed_columns(att int) RETURNS name[]
-LANGUAGE plpgsql STABLE
+-- Whether each entity of attribute att is one row, so that a qual on any
+-- column of the relation is fixed per entity.  That holds when the entity
+-- keys include the primary key, the key is checked on every statement (not
+-- deferrable), and the relation has no inheritance children or partitions,
+-- which grounding reads too and the key does not cover.  Otherwise only
+-- quals on the entity keys are fixed per entity: rows of one coarse entity
+-- may fall on both sides of a qual on another column (AGENTS.md rule 19).
+CREATE FUNCTION gaps._whole_rows(att int) RETURNS boolean
+LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
-DECLARE
-	a gaps.attribute;
-	whole_rows boolean;
-BEGIN
-	SELECT * INTO a FROM gaps.attribute WHERE attribute_id = att;
 	SELECT EXISTS (
 		SELECT 1 FROM pg_index i
 		WHERE i.indrelid = a.rel AND i.indisprimary AND i.indimmediate
@@ -632,13 +624,7 @@ BEGIN
 							JOIN pg_attribute t ON t.attrelid = a.rel AND t.attnum = k.attnum
 						  WHERE t.attname <> ALL (a.entity_keys)))
 		AND NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = a.rel)
-	INTO whole_rows;
-	RETURN ARRAY(SELECT t.attname FROM pg_attribute t
-				 WHERE t.attrelid = a.rel AND t.attnum > 0 AND NOT t.attisdropped
-				   AND (whole_rows OR t.attname = ANY (a.entity_keys))
-				   AND gaps._total_order(t.atttypid)
-				 ORDER BY t.attnum);
-END
+	FROM gaps.attribute a WHERE a.attribute_id = att
 $$;
 
 -- Whether stripes s1 and s2 may share a random variable, decided from the
@@ -646,45 +632,62 @@ $$;
 -- the same attribute and their entity sets meet.  The answer is false only
 -- when that is impossible: the attributes differ, or two quals of the
 -- stripes (from either one, so a stripe whose own quals contradict is
--- empty) contradict each other on one of the columns fixed, which the
--- caller passes as gaps._fixed_columns of s1's attribute.
+-- empty) contradict each other on a column that is fixed per entity and
+-- whose type is a total order (gaps._total_order).  A column is fixed per
+-- entity when it is an entity key, or on any column when whole_rows, which
+-- the caller passes as gaps._whole_rows of s1's attribute.
 --
 -- Two quals contradict when one is "= c" and c fails the other, or one is a
 -- lower bound (>, >=) above the other's upper bound (<, <=), or both meet
 -- at one constant and either is strict.  These hold when the operators are
--- a btree total order, which gaps._fixed_columns requires, so the test is
+-- a btree total order, which the column test requires, so the test is
 -- sound.  It is not complete: "<>" never contradicts anything but "=", and
 -- a discrete type's gaps (s > 1 AND s < 2 over int) are not seen, so such
 -- pairs count as may share.
 --
--- Makes at most (n1 + n2)^2 constant comparisons for stripes with n1 and n2
--- quals; gaps.validate bounds the total.
-CREATE FUNCTION gaps._may_share_rvs(s1 int, s2 int, fixed name[]) RETURNS boolean
+-- Examines only the columns the quals name, so for stripes with n1 and n2
+-- quals it makes at most n1 + n2 column tests and (n1 + n2)^2 constant
+-- comparisons, whatever the width of the relation; gaps.validate bounds the
+-- total.
+CREATE FUNCTION gaps._may_share_rvs(s1 int, s2 int, whole_rows boolean) RETURNS boolean
 LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
 	att int;
 	rel regclass;
+	keys name[];
 	q record;
 BEGIN
-	SELECT s.attribute_id, a.rel INTO att, rel
+	SELECT s.attribute_id, a.rel, a.entity_keys INTO att, rel, keys
 	FROM gaps.stripe s JOIN gaps.attribute a USING (attribute_id)
 	WHERE s.stripe_id = s1;
 	IF att IS DISTINCT FROM (SELECT s.attribute_id FROM gaps.stripe s WHERE s.stripe_id = s2) THEN
 		RETURN false;
 	END IF;
+	IF NOT EXISTS (SELECT 1 FROM gaps.stripe_qual sq WHERE sq.stripe_id IN (s1, s2)) THEN
+		RETURN true;
+	END IF;
 
-	-- Every ordered pair of quals on one column, so each rule below needs
-	-- to look at one order only.
-	FOR q IN SELECT x.op AS op1, x.value AS v1, y.op AS op2, y.value AS v2,
-					format_type(t.atttypid, t.atttypmod) AS typ, t.attcollation AS coll
+	-- The columns the quals name that the rules may use, then every ordered
+	-- pair of quals on one of them, so each rule below needs to look at one
+	-- order only.  The first CTE is materialized so that gaps._total_order
+	-- runs once per named column, not over every column of rel.
+	FOR q IN WITH named AS MATERIALIZED (
+				SELECT t.attname, t.atttypid, format_type(t.atttypid, t.atttypmod) AS typ,
+					   t.attcollation AS coll
+				FROM pg_attribute t
+				WHERE t.attrelid = rel AND t.attnum > 0 AND NOT t.attisdropped
+				  AND t.attname IN (SELECT sq.attname FROM gaps.stripe_qual sq
+									WHERE sq.stripe_id IN (s1, s2))
+				  AND (whole_rows OR t.attname = ANY (keys))),
+			 fixed AS MATERIALIZED (
+				SELECT n.attname, n.typ, n.coll FROM named n WHERE gaps._total_order(n.atttypid))
+			 SELECT x.op AS op1, x.value AS v1, y.op AS op2, y.value AS v2, c.typ, c.coll
 			 FROM gaps.stripe_qual x
 				JOIN gaps.stripe_qual y ON y.attname = x.attname
-				JOIN pg_attribute t ON t.attrelid = rel AND t.attname = x.attname
-					AND t.attnum > 0 AND NOT t.attisdropped
-			 WHERE x.stripe_id IN (s1, s2) AND y.stripe_id IN (s1, s2)
-			   AND x.attname = ANY (fixed) LOOP
+				JOIN fixed c ON c.attname = x.attname
+			 WHERE x.stripe_id IN (s1, s2) AND y.stripe_id IN (s1, s2) LOOP
 		IF q.op1 = '=' AND NOT gaps._qual_holds(q.typ, q.coll, q.v1, q.op2, q.v2) THEN
 			RETURN false;
 		END IF;
@@ -773,12 +776,13 @@ $$;
 --
 -- Cost: the attributes are resolved first, as grounding resolves them.
 -- Then each distinct pair of a child stripe and a parent stripe on one
--- attribute is tested once (gaps._may_share_rvs); a pair whose stripes have
--- n1 and n2 quals counts 10 + (n1 + n2)^2 (the test's fixed cost, then a
--- bound on its qual comparisons), and the sum over the pairs is limited to
--- 200000 before any test runs.  So validate makes at most 20000 pair tests
--- and 200000 qual comparisons, a few seconds either way (5.9 s for 19900
--- pairs, 2.3 s for one pair of 440 quals, on the development host).
+-- attribute is tested once (gaps._may_share_rvs, which looks only at the
+-- columns the pair's quals name); a pair whose stripes have n1 and n2 quals
+-- counts 10 + (n1 + n2)^2 (the test's fixed cost, then a bound on its
+-- column tests and qual comparisons), and the sum over the pairs is limited
+-- to 200000 before any test runs.  So validate makes at most 20000 pair
+-- tests and 200000 qual comparisons, a few seconds either way (6.9 s for
+-- 19900 pairs, 2.0 s for one pair of 444 quals, on the development host).
 -- The cycle search makes at most F passes over at most F^2 edges for F
 -- factors, so models are limited to 100 factors.  Grounding does not call
 -- this: gx_check finds ground cycles exactly in time linear in the ground
@@ -837,14 +841,16 @@ BEGIN
 		   string_agg(format('factor "%s": child "%s" may share RVs with parent "%s"',
 							 x.fname, x.c, x.p), '; ' ORDER BY x.fname) FILTER (WHERE x.f = x.g)
 	INTO ef, eg, ep, selfloops
-	FROM (WITH fixed AS MATERIALIZED (
-			SELECT a.attribute_id, gaps._fixed_columns(a.attribute_id) AS cols
-			FROM gaps.attribute a WHERE a.model_id = m),
+	FROM (WITH entity AS MATERIALIZED (
+			SELECT a.attribute_id, gaps._whole_rows(a.attribute_id) AS whole_rows
+			FROM gaps.attribute a
+			WHERE a.attribute_id IN (SELECT s.attribute_id FROM unnest(pc) u(c)
+										JOIN gaps.stripe s ON s.stripe_id = u.c)),
 		  share AS MATERIALIZED (
 			SELECT u.c, u.p FROM unnest(pc, pp) u(c, p)
 				JOIN gaps.stripe s ON s.stripe_id = u.c
-				JOIN fixed ON fixed.attribute_id = s.attribute_id
-			WHERE gaps._may_share_rvs(u.c, u.p, fixed.cols))
+				JOIN entity e ON e.attribute_id = s.attribute_id
+			WHERE gaps._may_share_rvs(u.c, u.p, e.whole_rows))
 		  SELECT f.factor_id AS f, g.factor_id AS g, f.name AS fname, cs.name AS c,
 				 min(ps.name) AS p
 		  FROM gaps.factor f

@@ -182,9 +182,10 @@ Grounding keeps the exact check (gx_check) and does not run validate.
 models: 300 whose entities are rows, and 200 over coarse entities with
 quals on a column outside the entity keys, which must never separate
 entities.  validate tests each distinct pair of child and parent stripe
-once and refuses, before testing any, a model whose pair tests and qual
-comparisons would exceed a fixed budget (200000 units; see the function's
-comment), so it takes seconds at most.
+once, looking only at the columns the pair's quals name, and refuses,
+before testing any, a model whose pair tests and qual comparisons would
+exceed a fixed budget (200000 units; see the function's comment), so it
+takes seconds at most.
 
 Two more conditions are needed for `F` to be a distribution at all, and
 the thesis does not state them (my inference): every RV of a declared
