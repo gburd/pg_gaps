@@ -123,6 +123,38 @@ stripe and a child stripe of _different_ factors when they share RVs
 alternating edges makes it invalid only if tracing an overlapping RV's
 lineage around the cycle returns to that RV.
 
+`gaps.validate(model)` runs this check from the catalog alone, for any
+table contents, and returns one row per test, `(test, ok, detail)`:
+`within-factor` (the precondition) and `dependency graph` (no cycle
+through two or more factors).  Both `ok` proves the ground network
+acyclic.  A row that is not `ok` proves nothing, and validate does not
+trace lineage: the cycle may not exist in the ground network (a chain
+through time, where stripe `t > 1` has parent stripe `t < 2`, fails the
+precondition and is fine), so `detail` names the factors and stripes of
+the cycle it found and grounding decides.  It works on a graph with a
+node per factor and an edge `f -> g` when `f`'s child stripe may share an
+RV with a parent stripe of `g`; that is the thesis's graph with each
+child stripe and its factor merged, and a self-loop is the precondition
+failing.  Every ground edge runs from an RV that is the child of one
+factor (coverage) and a parent in the next, so every ground cycle follows
+a cycle of this graph.
+
+Whether two stripes may share an RV is decided from their quals.  They
+cannot when they are on different attributes, or when two quals (from
+either stripe) contradict on a column fixed per entity: an entity key, or
+any column when the entity keys include the primary key, so each entity
+is one row.  A qual on another column selects rows, and rows of one
+coarse entity can fall on both sides.  Two quals contradict when one is
+`= c` and `c` fails the other, or a lower bound (`>`, `>=`) lies above an
+upper bound (`<`, `<=`), or they meet at one constant and either is
+strict, with constants compared as grounding compares them (cast to the
+column's type, in its collation).  These hold in any total order, so the
+test is sound; anything else counts as may share.  It is not complete:
+`<>` contradicts only `=`, and it does not see the gaps of a discrete
+type (`t > 1` and `t < 2` over `int`).  Grounding keeps the exact check
+(gx_check) and does not run validate.  `sql/validate.sql` checks
+soundness against grounding over 300 random models.
+
 Two more conditions are needed for `F` to be a distribution at all, and
 the thesis does not state them (my inference): every RV of a declared
 probabilistic attribute, present or missing, is covered by exactly one
@@ -374,7 +406,7 @@ SELECT gaps.declare_attribute('sensors', 'sensor1', 'temp', ARRAY['cold','hot'])
 SELECT gaps.add_stripe('sensors', ...);   -- attribute + entity set
 SELECT gaps.add_factor('sensors', child => ..., parents => ..., cpt => ...);
 SELECT gaps.learn_cpts('sensors');        -- MLE from complete rows, smoothed
-SELECT gaps.validate('sensors');          -- CPT shape + first-order acyclicity
+SELECT * FROM gaps.validate('sensors');   -- first-order acyclicity, no data read
 
 -- query
 SELECT * FROM gaps.marginals('sensors', 'sensor1'::regclass);
