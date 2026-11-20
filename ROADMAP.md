@@ -47,6 +47,29 @@ Each has a recommendation.  None blocks Phase 0, which is done.
   because the repository has no remote yet.
 - `AGENTS.md`, this file, `doc/DESIGN.md`, `CONTRIBUTING.md`, `README.md`.
 
+## Status, 2026-11-19
+
+Phases 1 and 2 are built, with three items each still open (below).
+Engine and SQL interface gated on PG 17.12, 18.7 and 19.0 (nixpkgs with
+clang; PGDG on Fedora 44 with gcc 16 and `-Werror`).  Exact inference
+already handles vertical correlations (any component the size bounds
+allow), which was planned for Phase 3; Phase 3 is left with sampling for
+components too large to solve exactly.
+
+| phase | item | status |
+|---|---|---|
+| 1 | catalog, triggers, row-level security, declaration functions | done (`sql/catalog.sql`) |
+| 1 | data-dependent validity: coverage, mappings total, evidence consistent, cycles | done (`sql/infer.sql`) |
+| 1 | the dependency-graph check before grounding [W11 3.3.2] | **open**: cycles are found on the ground network instead (gx_check), which is exact but needs the data |
+| 1 | `pg_dump` / restore TAP test | **open** |
+| 1 | dropped or altered table names the change | done for drop and type change via `_resolve`; no test yet, **open** |
+| 2 | engine: exact inference, bucket tree, log space, bounds, sharing | done; brute-force oracle, closed forms, allocation failure (`test/engine`); two independent reviews |
+| 2 | `marginals`, `impute`, `learn_cpts` | done (`sql/infer.sql`, `sql/learn.sql`) |
+| 2 | pgmpy cross-check | done: 2,647 to 2,762 marginals per run agree to 1e-9 (`test/pgmpy`, flake check `pgmpy`) |
+| 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
+| 2 | `SupportRequestRows` for the SRFs | **open** |
+| 2 | grounding cost | **open**: about 100x the inference cost (23 s for 2M variables); jsonb entity keys are next (Phase 6) |
+
 ## Phase 1: model catalog and validation
 
 **Goal:** a user can declare a first-order Bayesian network over an
@@ -190,12 +213,17 @@ the join's evidence closure.  Top-k completions for k > 1 over FOBN
 models land here, with the join they are most useful for.  Done when both agree with the oracle on small models and
 with a manual SQL formulation of the same possible-worlds computation.
 
-## Phase 6: planner integration
+## Phase 6: planner integration and grounding cost
 
-Costs for every SRF from model statistics (component sizes, distinct
-evidence signatures), so plans are reasonable without hints.  A custom scan
-only if a measurement shows the SRF form costs something real; otherwise
-this phase closes with that measurement.
+Grounding dominates: about 100 times the inference cost at 2M variables
+(`bench/RESULTS_SHARING_2026-11-19.md`), from building and joining jsonb
+entity keys in every step.  First, entity keys as typed composite or
+integer surrogates, measured against the current form on the hotel
+workload at two scales with A/A runs.  Then costs for every SRF from model
+statistics (component sizes, distinct evidence signatures), so plans are
+reasonable without hints.  A custom scan only if a measurement shows the
+SRF form costs something real; otherwise this phase closes with that
+measurement.
 
 ## Phase 7: CRF instance for information extraction
 

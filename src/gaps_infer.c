@@ -41,6 +41,7 @@ PG_FUNCTION_INFO_V1(gaps_infer);
 /* GUCs, registered in _PG_init. */
 int			gaps_max_factor_cells = 1 << 20;
 int			gaps_max_total_cells = 1 << 26;
+bool		gaps_share_components = true;
 
 static void *
 pg_alloc(void *arg, size_t size)
@@ -289,6 +290,7 @@ gaps_infer(PG_FUNCTION_ARGS)
 	env.arg = NULL;
 	env.max_cells = (size_t) gaps_max_factor_cells;
 	env.max_total_cells = (size_t) gaps_max_total_cells;
+	env.no_sharing = !gaps_share_components;
 
 	report(gx_check(&env, &bn, &bad), bad);
 	report(gx_infer(&env, &bn, &res), res.bad_var);

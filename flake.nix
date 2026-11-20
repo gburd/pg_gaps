@@ -96,6 +96,32 @@
             '';
           };
 
+        # pg_gaps against pgmpy, an independent implementation (ROADMAP Q5).
+        # Kept out of `make installcheck` so distribution builds need no
+        # Python.
+        pgmpyPython = pkgs.python3.withPackages (ps: [ ps.pgmpy ps.psycopg ]);
+        pgmpyFor = pg:
+          let pgWith = pg.withPackages (_: [ (buildFor pg) ]);
+          in pkgs.stdenv.mkDerivation {
+            name = "pg_gaps-pgmpy-${pg.version}";
+            inherit src;
+            nativeBuildInputs = [ pgWith pgmpyPython ];
+            dontConfigure = true;
+            dontInstall = true;
+            buildPhase = ''
+              runHook preBuild
+              export PGDATA=$TMPDIR/pgdata PGHOST=$TMPDIR PGPORT=5432 PGUSER=postgres PGDATABASE=postgres
+              initdb -U postgres --no-locale --encoding=UTF8 >/dev/null
+              pg_ctl -D "$PGDATA" -l "$TMPDIR/server.log" -w \
+                -o "-k $TMPDIR -c listen_addresses=" start
+              python3 test/pgmpy/check.py --models 300 \
+                || { cat "$TMPDIR/server.log"; exit 1; }
+              pg_ctl -D "$PGDATA" -w stop
+              touch $out
+              runHook postBuild
+            '';
+          };
+
         packages = builtins.mapAttrs (_: buildFor) pgVersions;
 
         devPg = pgVersions.pg18;
@@ -106,6 +132,8 @@
         checks = packages
           // lib.mapAttrs' (n: pg: lib.nameValuePair "installcheck-${n}" (installcheckFor pg)) pgVersions
           // {
+            pgmpy = pgmpyFor devPg;
+
             # The standalone engine against brute force, plain, with ASan and
             # UBSan, and with every cache key forced to collide.
             engine = pkgs.runCommand "pg_gaps-engine"

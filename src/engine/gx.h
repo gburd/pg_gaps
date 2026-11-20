@@ -49,6 +49,7 @@ typedef struct gx_env
 	void	   *arg;
 	size_t		max_cells;		/* largest factor the engine may build */
 	size_t		max_total_cells;	/* all factors held at once, per component */
+	int			no_sharing;		/* solve every component, even identical ones */
 } gx_env;
 
 typedef struct gx_cpt

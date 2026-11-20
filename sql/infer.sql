@@ -116,6 +116,11 @@ SELECT gaps.add_stripe_qual('bad', 'tp1', 'sid', '=', '1');
 SELECT gaps.add_factor('bad', 'p', 'tp', ARRAY['tp1'], ARRAY[0.5, 0.5, 0.5, 0.5]);
 SELECT gaps.map_factor('bad', 'p', 1, 't', 't');
 SELECT * FROM gaps.marginals('bad');                         -- fail: maps to several parents
+-- Also require room = room and the child's sid = the parent's room: the
+-- parent stripe holds only sid 1, so a child in room 2 finds no parent.
+SELECT gaps.map_factor('bad', 'p', 1, 'room', 'room');
+SELECT gaps.map_factor('bad', 'p', 1, 'sid', 'room');
+SELECT * FROM gaps.marginals('bad');                         -- fail: maps to no parent
 SELECT gaps.drop_model('bad');
 
 -- A cycle: temp of sensor 1 depends on sensor 2's and the other way round.

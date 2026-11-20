@@ -61,5 +61,13 @@ _PG_init(void)
 							1 << 26, 1, INT_MAX / 2,
 							PGC_USERSET, 0,
 							NULL, NULL, NULL);
+	DefineCustomBoolVariable("gaps.share_components",
+							 "Solve identical components once (first-order sharing).",
+							 "Turning this off solves every component separately; "
+							 "the answers are the same.",
+							 &gaps_share_components,
+							 true,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
 	MarkGUCPrefixReserved("gaps");
 }

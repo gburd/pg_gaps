@@ -1777,7 +1777,7 @@ do_component(ctx *c, int cid, const int *members, int nloc,
 #ifdef GX_TEST_HASH_COLLIDE
 	h = 0;						/* test build: every key collides */
 #endif
-	e = cache_find(c, buckets, h, &key);
+	e = c->env->no_sharing ? NULL : cache_find(c, buckets, h, &key);
 	if (e)
 		out->cache_hits++;
 	else

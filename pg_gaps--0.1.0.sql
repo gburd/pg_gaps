@@ -616,31 +616,35 @@ BEGIN
 		v int, attribute_id int, entity jsonb, card int, ev int)
 		ON COMMIT DROP;
 	TRUNCATE pg_gaps_rv;
+	-- One pass per attribute reads the table once: every entity is stored,
+	-- numbered in a stable order, with its evidence, and the two kinds of
+	-- bad evidence (rows that disagree, a value outside the domain) are
+	-- stored as ev -1 and -2 and reported afterwards, so the common, clean
+	-- case does not aggregate the table three times.
 	FOR a IN SELECT * FROM gaps.attribute WHERE model_id = m ORDER BY attribute_id LOOP
 		PERFORM gaps._resolve(a);
 		sql := gaps._entities_sql(a);
-		EXECUTE format('SELECT e.entity, e.ev FROM (%s) e '
-					   'WHERE cardinality(e.ev) > 1 LIMIT 1', sql) INTO bad;
+		EXECUTE format('INSERT INTO pg_gaps_rv (v, attribute_id, entity, card, ev) '
+					   'SELECT $4 + row_number() OVER (ORDER BY e.entity), $1, e.entity, $2, '
+					   'CASE WHEN cardinality(e.ev) > 1 THEN -1 '
+					   'WHEN e.ev IS NULL THEN 0 '
+					   'ELSE coalesce(array_position($3, e.ev[1]), -2) END '
+					   'FROM (%s) e', sql)
+			USING a.attribute_id, array_length(a.domain, 1), a.domain,
+				  (SELECT coalesce(max(r.v), 0) FROM pg_gaps_rv r);
+		SELECT r.entity, r.ev INTO bad FROM pg_gaps_rv r
+		WHERE r.attribute_id = a.attribute_id AND r.ev < 0 ORDER BY r.v LIMIT 1;
 		IF bad.entity IS NOT NULL THEN
-			RAISE EXCEPTION 'rows of entity % of %.% disagree: %', bad.entity, a.relname,
-				a.attname, bad.ev;
-		END IF;
-		EXECUTE format('SELECT e.entity, e.ev[1] AS v FROM (%s) e '
-					   'WHERE cardinality(e.ev) = 1 AND NOT e.ev[1] = ANY ($1) LIMIT 1', sql)
-			INTO bad USING a.domain;
-		IF bad.entity IS NOT NULL THEN
+			EXECUTE format('SELECT e.ev FROM (%s) e WHERE e.entity = $1', sql)
+				INTO sql USING bad.entity;
+			IF bad.ev = -1 THEN
+				RAISE EXCEPTION 'rows of entity % of %.% disagree: %', bad.entity, a.relname,
+					a.attname, sql;
+			END IF;
 			RAISE EXCEPTION 'value "%" of %.% for entity % is not in its domain %',
-				bad.v, a.relname, a.attname, bad.entity, a.domain;
+				trim(both '{}' from sql), a.relname, a.attname, bad.entity, a.domain;
 		END IF;
-		EXECUTE format('INSERT INTO pg_gaps_rv (attribute_id, entity, card, ev) '
-					   'SELECT $1, e.entity, $2, coalesce(array_position($3, e.ev[1]), 0) '
-					   'FROM (%s) e ORDER BY e.entity', sql)
-			USING a.attribute_id, array_length(a.domain, 1), a.domain;
 	END LOOP;
-	UPDATE pg_gaps_rv r SET v = x.n
-	FROM (SELECT attribute_id, entity,
-				 row_number() OVER (ORDER BY attribute_id, entity) AS n FROM pg_gaps_rv) x
-	WHERE r.attribute_id = x.attribute_id AND r.entity = x.entity;
 	CREATE INDEX IF NOT EXISTS pg_gaps_rv_key ON pg_gaps_rv (attribute_id, entity);
 	ANALYZE pg_gaps_rv;
 
@@ -658,14 +662,14 @@ BEGIN
 		SELECT * INTO a FROM gaps.attribute WHERE attribute_id = f.cattr;
 		w := gaps._stripe_where(f.child_stripe, 'c', 1);
 
-		-- The child entities (ord 0 marks the child itself).
+		-- The child entities (ord 0 marks the child itself): the distinct
+		-- entities of the stripe's rows, joined to their variables.
 		EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
-					   'SELECT $2, r.v, 0, r.v FROM pg_gaps_rv r '
-					   'WHERE r.attribute_id = $3 AND EXISTS (SELECT 1 FROM %s c '
-					   'WHERE jsonb_build_object(%s) = r.entity%s)',
-					   a.rel,
+					   'SELECT $2, r.v, 0, r.v FROM '
+					   '(SELECT DISTINCT jsonb_build_object(%s) AS entity FROM %s c WHERE TRUE%s) x '
+					   'JOIN pg_gaps_rv r ON r.attribute_id = $3 AND r.entity = x.entity',
 					   (SELECT string_agg(format('%L, c.%I', k, k), ', ')
-						FROM unnest(a.entity_keys) k), w.clause)
+						FROM unnest(a.entity_keys) k), a.rel, w.clause)
 			USING w.params, f.factor_id, f.cattr;
 
 		-- Each parent: join child rows to parent rows on the mapping and the
@@ -695,34 +699,44 @@ BEGIN
 					FROM unnest(a.entity_keys) k;
 				END IF;
 				wp := gaps._stripe_where(p.parent_stripe, 'p', cardinality(w.params) + 1);
+
+				-- One pass: each child entity with the distinct parent
+				-- entities its rows reach (the LEFT JOIN keeps a child that
+				-- reaches none, with pes NULL).  Exactly one, which must be a
+				-- parent RV, gives its v; anything else is stored with a
+				-- non-positive pv (minus the number of parents reached, or -1
+				-- for one parent that is not in the parent stripe) and
+				-- reported below.
 				sql := format(
 					'SELECT jsonb_build_object(%s) AS ce, '
-					'array_agg(DISTINCT jsonb_build_object(%s)) AS pes '
+					'array_agg(DISTINCT jsonb_build_object(%s)) '
+					'FILTER (WHERE p.ctid IS NOT NULL) AS pes '
 					'FROM %s c LEFT JOIN %s p ON TRUE%s%s WHERE TRUE%s '
 					'GROUP BY 1',
 					(SELECT string_agg(format('%L, c.%I', k, k), ', ') FROM unnest(a.entity_keys) k),
 					(SELECT string_agg(format('%L, p.%I', k, k), ', ') FROM unnest(pa.entity_keys) k),
 					a.rel, pa.rel, on_clause, wp.clause, w.clause);
-				EXECUTE format('SELECT x.ce, x.pes FROM (%s) x '
-							   'WHERE cardinality(x.pes) <> 1 OR x.pes[1] IS NULL '
-							   'OR NOT EXISTS (SELECT 1 FROM pg_gaps_rv r WHERE r.attribute_id = $2 '
-							   'AND r.entity = x.pes[1]) LIMIT 1',
+				EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
+							   'SELECT $2, rc.v, $3, CASE WHEN cardinality(x.pes) = 1 '
+							   'THEN coalesce(rp.v, -1) ELSE -coalesce(cardinality(x.pes), 0) END '
+							   'FROM (%s) x '
+							   'JOIN pg_gaps_rv rc ON rc.attribute_id = $4 AND rc.entity = x.ce '
+							   'LEFT JOIN pg_gaps_rv rp ON rp.attribute_id = $5 '
+							   'AND rp.entity = x.pes[1] AND cardinality(x.pes) = 1',
 							   sql)
-					INTO bad USING w.params || wp.params, pa.attribute_id;
+					USING w.params || wp.params, f.factor_id, p.ord, f.cattr, pa.attribute_id;
+				SELECT r.entity AS ce, i.pv INTO bad
+				FROM pg_gaps_inst i JOIN pg_gaps_rv r ON r.v = i.v
+				WHERE i.factor_id = f.factor_id AND i.ord = p.ord AND i.pv <= 0
+				ORDER BY i.v LIMIT 1;
 				IF bad.ce IS NOT NULL THEN
 					RAISE EXCEPTION 'factor "%": child entity % maps to % parent entities in parent %',
-						f.name, bad.ce,
-						CASE WHEN bad.pes[1] IS NULL THEN 0 ELSE cardinality(bad.pes) END, p.ord
+						f.name, bad.ce, CASE WHEN bad.pv = -1 THEN 0 ELSE -bad.pv END, p.ord
 						USING HINT = 'Each child must have exactly one parent per parent stripe; '
 							'check the factor''s mapping (gaps.map_factor) and the parent stripe''s '
 							'predicate.';
 				END IF;
-				EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
-							   'SELECT $2, rc.v, $3, rp.v FROM (%s) x '
-							   'JOIN pg_gaps_rv rc ON rc.attribute_id = $4 AND rc.entity = x.ce '
-							   'JOIN pg_gaps_rv rp ON rp.attribute_id = $5 AND rp.entity = x.pes[1]',
-							   sql)
-					USING w.params || wp.params, f.factor_id, p.ord, f.cattr, pa.attribute_id;
+
 			END;
 		END LOOP;
 	END LOOP;
@@ -748,34 +762,29 @@ BEGIN
 	INTO card, evidence, var_attr, var_entity
 	FROM pg_gaps_rv r;
 
+	-- One ordered pass over the instances: every child variable (ord 0,
+	-- the coverage check above guarantees exactly one per variable) is
+	-- followed by its parents in order, so child[], parent_off[] and
+	-- parents[] all come out of a single sort.
 	WITH fc AS (
-		SELECT fa.factor_id, fa.cpt,
+		SELECT fa.factor_id,
 			   1 + coalesce(sum(cardinality(fa.cpt)) OVER (ORDER BY fa.factor_id
 				   ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS off
 		FROM gaps.factor fa WHERE fa.model_id = m),
-	inst AS (
-		SELECT i.v, fc.off,
-			   coalesce(array_agg(i2.pv ORDER BY i2.ord) FILTER (WHERE i2.ord > 0), '{}') AS ps
-		FROM pg_gaps_inst i
-			JOIN fc USING (factor_id)
-			LEFT JOIN pg_gaps_inst i2 ON i2.factor_id = i.factor_id AND i2.v = i.v
-		WHERE i.ord = 0
-		GROUP BY i.v, fc.off),
-	ordered AS (
-		SELECT inst.*,
-			   1 + coalesce(sum(cardinality(ps)) OVER (ORDER BY v
-				   ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS poff
-		FROM inst)
-	SELECT array_agg(o.v ORDER BY o.v),
-		   array_agg(o.poff::int ORDER BY o.v) || (1 + sum(cardinality(o.ps)))::int,
-		   array_agg(o.off::int ORDER BY o.v)
-	INTO child, parent_off, cpt_off
-	FROM ordered o;
-	SELECT coalesce(array_agg(x ORDER BY o.v, k), '{}') INTO parents
-	FROM (SELECT i.v, coalesce(array_agg(i2.pv ORDER BY i2.ord) FILTER (WHERE i2.ord > 0), '{}') AS ps
-		  FROM pg_gaps_inst i LEFT JOIN pg_gaps_inst i2 ON i2.factor_id = i.factor_id AND i2.v = i.v
-		  WHERE i.ord = 0 GROUP BY i.v) o,
-		 unnest(o.ps) WITH ORDINALITY u(x, k);
+	seq AS (
+		SELECT i.v, i.ord, i.pv, fc.off,
+			   count(*) FILTER (WHERE i.ord > 0)
+				   OVER (ORDER BY i.v, i.ord ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+				   AS nparents_before
+		FROM pg_gaps_inst i JOIN fc USING (factor_id))
+	SELECT array_agg(s.v ORDER BY s.v) FILTER (WHERE s.ord = 0),
+		   array_agg((1 + coalesce(s.nparents_before, 0))::int ORDER BY s.v)
+			   FILTER (WHERE s.ord = 0)
+			   || (1 + count(*) FILTER (WHERE s.ord > 0))::int,
+		   array_agg(s.off::int ORDER BY s.v) FILTER (WHERE s.ord = 0),
+		   coalesce(array_agg(s.pv ORDER BY s.v, s.ord) FILTER (WHERE s.ord > 0), '{}')
+	INTO child, parent_off, cpt_off, parents
+	FROM seq s;
 	SELECT coalesce(array_agg(x ORDER BY fa.factor_id, k), '{}') INTO cpts
 	FROM gaps.factor fa, unnest(fa.cpt) WITH ORDINALITY u(x, k) WHERE fa.model_id = m;
 END
@@ -797,12 +806,17 @@ DECLARE
 	g record;
 BEGIN
 	g := gaps._ground(gaps._model_id(model));
+	-- Variables are named by joining pg_gaps_rv, which _ground leaves
+	-- behind for the transaction, not by subscripting g.var_entity: a
+	-- subscript into an array of jsonb scans from its start, which is
+	-- quadratic over millions of variables.
 	RETURN QUERY
-		SELECT a.rel, a.attname, g.var_entity[r.var], a.domain[r.value],
+		SELECT a.rel, a.attname, v.entity, a.domain[r.value],
 			   r.probability, r.component, 'exact'::text
 		FROM gaps._infer(g.card, g.evidence, g.child, g.parent_off, g.parents,
 						 g.cpt_off, g.cpts) r
-			JOIN gaps.attribute a ON a.attribute_id = g.var_attr[r.var];
+			JOIN pg_gaps_rv v ON v.v = r.var
+			JOIN gaps.attribute a ON a.attribute_id = v.attribute_id;
 END
 $$;
 
@@ -821,11 +835,12 @@ DECLARE
 BEGIN
 	g := gaps._ground(gaps._model_id(model));
 	RETURN QUERY
-		SELECT a.rel, a.attname, g.var_entity[r.var], a.domain[r.map_value],
+		SELECT a.rel, a.attname, v.entity, a.domain[r.map_value],
 			   r.map_probability, r.component, 'exact'::text
 		FROM gaps._infer(g.card, g.evidence, g.child, g.parent_off, g.parents,
 						 g.cpt_off, g.cpts) r
-			JOIN gaps.attribute a ON a.attribute_id = g.var_attr[r.var]
+			JOIN pg_gaps_rv v ON v.v = r.var
+			JOIN gaps.attribute a ON a.attribute_id = v.attribute_id
 		WHERE r.value = 1;
 END
 $$;

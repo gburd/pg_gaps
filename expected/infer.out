@@ -329,6 +329,22 @@ SELECT gaps.map_factor('bad', 'p', 1, 't', 't');
 
 SELECT * FROM gaps.marginals('bad');                         -- fail: maps to several parents
 ERROR:  factor "p": child entity {"t": 1, "sid": 1, "room": 1} maps to 2 parent entities in parent 1
+-- Also require room = room and the child's sid = the parent's room: the
+-- parent stripe holds only sid 1, so a child in room 2 finds no parent.
+SELECT gaps.map_factor('bad', 'p', 1, 'room', 'room');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('bad', 'p', 1, 'sid', 'room');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT * FROM gaps.marginals('bad');                         -- fail: maps to no parent
+ERROR:  factor "p": child entity {"t": 1, "sid": 1, "room": 2} maps to 0 parent entities in parent 1
 SELECT gaps.drop_model('bad');
  drop_model 
 ------------

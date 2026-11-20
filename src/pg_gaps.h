@@ -13,5 +13,6 @@
 /* GUCs (gaps_infer.c), registered in _PG_init (pg_gaps.c). */
 extern int	gaps_max_factor_cells;
 extern int	gaps_max_total_cells;
+extern bool gaps_share_components;
 
 #endif							/* PG_GAPS_H */

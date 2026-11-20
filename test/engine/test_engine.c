@@ -47,7 +47,7 @@ t_free(void *arg, void *ptr)
 	free(ptr);
 }
 
-static gx_env env = {t_alloc, t_free, NULL, NULL, (size_t) 1 << 20, (size_t) 1 << 26};
+static gx_env env = {t_alloc, t_free, NULL, NULL, (size_t) 1 << 20, (size_t) 1 << 26, 0};
 
 /*
  * Interrupt accounting for the scale tests: the engine's work between two
@@ -75,7 +75,7 @@ c_interrupt(void *arg)
 	allocs_since_interrupt = 0;
 }
 
-static gx_env cenv = {c_alloc, t_free, c_interrupt, NULL, (size_t) 1 << 20, (size_t) 1 << 26};
+static gx_env cenv = {c_alloc, t_free, c_interrupt, NULL, (size_t) 1 << 20, (size_t) 1 << 26, 0};
 
 /* splitmix64: a small seeded PRNG, so failures reproduce from the seed. */
 static uint64_t rng;
@@ -223,6 +223,28 @@ check_case(net *n, uint64_t cseed)
 	memset(&r, 0, sizeof(r));
 	rc = gx_infer(&env, bn, &r);
 	nchecks++;
+
+	/* With sharing off the engine must give bit-identical answers. */
+	{
+		gx_env		ns = env;
+		gx_result	r2;
+		int			rc2;
+
+		ns.no_sharing = 1;
+		memset(&r2, 0, sizeof(r2));
+		rc2 = gx_infer(&ns, bn, &r2);
+		if (rc2 != rc)
+			FAIL("sharing off returned %d, on returned %d", rc2, rc);
+		if (rc == GX_OK)
+		{
+			for (int v = 0; v < bn->nvars; v++)
+				if (bn->evidence[v] < 0)
+					for (int x = 0; x < bn->card[v]; x++)
+						if (M(&r2, v, x) != M(&r, v, x))
+							FAIL("var %d value %d differs with sharing off", v, x);
+			free_result(bn, &r2);
+		}
+	}
 
 	if (o.z == 0)
 	{
@@ -762,7 +784,7 @@ check_alloc_failure(void)
 		{4, 0, NULL, pr}, {5, 1, p3, c5}, {6, 0, NULL, pr}, {7, 1, p6, c5}
 	};
 	gx_bn		bn = {8, card, ev, 8, cpts};
-	gx_env		fenv = {fa_alloc, fa_free, NULL, NULL, (size_t) 1 << 20, (size_t) 1 << 26};
+	gx_env		fenv = {fa_alloc, fa_free, NULL, NULL, (size_t) 1 << 20, (size_t) 1 << 26, 0};
 	gx_result	r;
 	long		total;
 	int			bad;

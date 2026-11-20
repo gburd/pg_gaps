@@ -4,6 +4,10 @@
 # against a throwaway cluster.  The inner loop; `nix flake check` is the gate.
 #
 # Usage: dev/regress.sh [pg_regress test name ...]
+#        dev/regress.sh -- command [args ...]
+#
+# With "--", runs the command instead of the regression suite, with PGHOST
+# and PGUSER set for the throwaway cluster (where pg_gaps is installable).
 #
 # Uses whatever pg_config and postgres are on PATH (the dev shell provides
 # PostgreSQL 18).  Needs PostgreSQL 18 or later, because it points the server
@@ -51,11 +55,19 @@ EOF
 pg_ctl -D "$run/data" -l "$run/server.log" -w start >/dev/null
 trap 'pg_ctl -D "$run/data" -w -m fast stop >/dev/null' EXIT
 
-regress=()
-if [ "$#" -gt 0 ]; then
-	regress=("REGRESS=$*")
+if [ "${1:-}" = "--" ]; then
+	shift
+	run_test() { PGHOST="$run" PGUSER=postgres PGDATABASE=postgres "$@"; }
+else
+	run_test() {
+		local regress=()
+		if [ "$#" -gt 0 ]; then
+			regress=("REGRESS=$*")
+		fi
+		mk installcheck PGHOST="$run" PGUSER=postgres "${regress[@]}"
+	}
 fi
-if mk installcheck PGHOST="$run" PGUSER=postgres "${regress[@]}"; then
+if run_test "$@"; then
 	pg_ctl -D "$run/data" -w -m fast stop >/dev/null
 	trap - EXIT
 	if command -v trash >/dev/null; then
