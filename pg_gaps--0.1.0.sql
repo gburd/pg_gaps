@@ -541,26 +541,36 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gaps_infer'
 LANGUAGE C STRICT VOLATILE;
 
--- The temp tables that hold attribute a's entities during a grounding:
--- ktab, an empty table whose row type is the entity key (the key columns
--- with their names, types, typmods and collations), and etab, the
--- entities of every attribute whose key has that shape:
+-- For each attribute of model m, the temp tables that hold its entities
+-- during a grounding: ktab, an empty table whose row type is the entity
+-- key (the key columns with their names, types, typmods and collations),
+-- and etab, the entities of every attribute whose key has that shape:
 -- (attribute_id int, v int, k ktab, ev int), v the variable number and ev
 -- the evidence code as in pg_gaps_rv.  The names are a hash of the shape,
 -- so attributes with the same key share both tables, and a key column
--- whose type changes gets new ones.  NB: call gaps._resolve(a) first; a
--- missing key column would drop out of the hash.
-CREATE FUNCTION gaps._key_tables(a gaps.attribute, OUT ktab text, OUT etab text)
+-- whose type changes gets new ones.  NB: call gaps._resolve on every
+-- attribute first; a missing key column would drop out of the hash.  Each
+-- key column is looked up by name alone, one scalar subquery per column,
+-- so that pg_attribute's index on (attrelid, attname) answers (a join was
+-- planned as a scan of every column of the relation per attribute); no
+-- user column shares a system column's name, so attnum > 0 adds nothing.
+CREATE FUNCTION gaps._key_tables(m int,
+	OUT attribute_id int, OUT ktab text, OUT etab text)
+RETURNS SETOF record
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
-	SELECT 'pg_gaps_k' || h, 'pg_gaps_e' || h
-	FROM (SELECT left(encode(sha256(convert_to(string_agg(
-				format('%I %s %s', u.k, format_type(t.atttypid, t.atttypmod), t.attcollation),
+	SELECT x.attribute_id, 'pg_gaps_k' || x.h, 'pg_gaps_e' || x.h
+	FROM (SELECT a.attribute_id, left(encode(sha256(convert_to(string_agg(
+				(SELECT format('%I %s %s', t.attname, format_type(t.atttypid, t.atttypmod),
+							   t.attcollation)
+				 FROM pg_attribute t
+				 WHERE t.attrelid = a.rel AND t.attname = u.k AND NOT t.attisdropped),
 				', ' ORDER BY u.o), 'UTF8')), 'hex'), 32) AS h
-		  FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o)
-			JOIN pg_attribute t ON t.attrelid = a.rel AND t.attname = u.k
-				AND t.attnum > 0 AND NOT t.attisdropped) x
+		  FROM gaps.attribute a
+			CROSS JOIN LATERAL unnest(a.entity_keys) WITH ORDINALITY u(k, o)
+		  WHERE a.model_id = m
+		  GROUP BY a.attribute_id) x
 $$;
 
 -- The key of attribute a's entity, over the rows of table alias, as a
@@ -710,6 +720,11 @@ DECLARE
 	bad record;
 	sql text;
 BEGIN
+	-- Every attribute's names still resolve, then each gets its tables,
+	-- named in one query; each shape's entity table is emptied once.
+	FOR a IN SELECT * FROM gaps.attribute WHERE model_id = m ORDER BY attribute_id LOOP
+		PERFORM gaps._resolve(a);
+	END LOOP;
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_rv (
 		v int, attribute_id int, card int, ev int)
 		ON COMMIT DROP;
@@ -718,20 +733,23 @@ BEGIN
 		attribute_id int, ktab text, etab text)
 		ON COMMIT DROP;
 	TRUNCATE pg_gaps_keys;
+	INSERT INTO pg_gaps_keys SELECT * FROM gaps._key_tables(m);
+	ANALYZE pg_gaps_keys;
+	FOR t IN SELECT DISTINCT ON (k.etab) at AS a, k.ktab, k.etab
+			 FROM pg_gaps_keys k JOIN gaps.attribute at USING (attribute_id)
+			 ORDER BY k.etab, k.attribute_id LOOP
+		PERFORM gaps._key_tables_reset(t.a, t.ktab, t.etab);
+	END LOOP;
 
 	-- One pass per attribute reads the table once: every entity is stored,
 	-- numbered in a stable order, with its evidence, and the two kinds of
 	-- bad evidence (rows that disagree, a value outside the domain) are
 	-- stored as ev -1 and -2 and reported afterwards, so the common, clean
-	-- case does not aggregate the table three times.  An entity table is
-	-- emptied when the first attribute of its shape reaches it.
-	FOR a IN SELECT * FROM gaps.attribute WHERE model_id = m ORDER BY attribute_id LOOP
-		PERFORM gaps._resolve(a);
-		t := gaps._key_tables(a);
-		IF NOT EXISTS (SELECT 1 FROM pg_gaps_keys k WHERE k.etab = t.etab) THEN
-			PERFORM gaps._key_tables_reset(a, t.ktab, t.etab);
-		END IF;
-		INSERT INTO pg_gaps_keys VALUES (a.attribute_id, t.ktab, t.etab);
+	-- case does not aggregate the table three times.
+	FOR t IN SELECT at AS a, k.ktab, k.etab
+			 FROM gaps.attribute at JOIN pg_gaps_keys k USING (attribute_id)
+			 ORDER BY at.attribute_id LOOP
+		a := t.a;
 		EXECUTE format('INSERT INTO pg_temp.%I (attribute_id, v, k, ev) '
 					   'SELECT $1, $3 + e.n, e.k, '
 					   'CASE WHEN cardinality(e.ev) > 1 THEN -1 '
@@ -908,7 +926,6 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
 	a gaps.attribute;
-	t record;
 	f record;
 	p record;
 	w record;
@@ -920,8 +937,9 @@ BEGIN
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_inst (
 		factor_id int, v int, ord int, pv int) ON COMMIT DROP;
 	TRUNCATE pg_gaps_inst;
-	FOR f IN SELECT fa.*, s.attribute_id AS cattr
+	FOR f IN SELECT fa.*, s.attribute_id AS cattr, k.ktab, k.etab
 			 FROM gaps.factor fa JOIN gaps.stripe s ON s.stripe_id = fa.child_stripe
+				JOIN pg_gaps_keys k ON k.attribute_id = s.attribute_id
 			 WHERE fa.model_id = m ORDER BY fa.factor_id LOOP
 		IF f.cpt IS NULL THEN
 			RAISE EXCEPTION 'factor "%" has no CPT', f.name
@@ -929,7 +947,6 @@ BEGIN
 		END IF;
 		PERFORM gaps._cpt_check(f.factor_id, true);
 		SELECT * INTO a FROM gaps.attribute WHERE attribute_id = f.cattr;
-		SELECT k.ktab, k.etab INTO t FROM pg_gaps_keys k WHERE k.attribute_id = a.attribute_id;
 		w := gaps._stripe_where(f.child_stripe, 'c', 1);
 
 		-- The child entities (ord 0 marks the child itself): the distinct
@@ -938,7 +955,7 @@ BEGIN
 					   'SELECT $2, x.v, 0, x.v FROM '
 					   '(SELECT DISTINCT rc.v FROM %s c JOIN pg_temp.%I rc '
 					   'ON rc.attribute_id = $3 AND rc.k = %s WHERE TRUE%s) x',
-					   a.rel, t.etab, gaps._key_row(a, 'c', t.ktab), w.clause)
+					   a.rel, f.etab, gaps._key_row(a, 'c', f.ktab), w.clause)
 			USING w.params, f.factor_id, a.attribute_id;
 
 		FOR p IN SELECT fp.ord FROM gaps.factor_parent fp
