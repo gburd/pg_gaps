@@ -69,7 +69,7 @@ components too large to solve exactly.
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
 | 2 | `SupportRequestRows` for the SRFs | **open** |
 | 2 | grounding cost | **open**: about 100x the inference cost (23 s for 2M variables); jsonb entity keys are next (Phase 6) |
-| 3 | Gibbs sampling for components too large for exact | done (branch wip/gibbs): `gaps.samples`, `gaps.seed`; Rao-Blackwellized marginals within 0.1 of exact at 4,000 samples on 2,000 random positive models (max seen 0.055 of 20,000), refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
+| 3 | Gibbs sampling for components too large for exact | done (branch wip/gibbs): `gaps.samples`, `gaps.seed`; Rao-Blackwellized marginals within 0.1 of exact at 4,000 samples on 2,000 random cases (largest error 0.055 over 20,000 positive models measured), refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
 | 3 | full hotel workload with its vertical factors | done: runs exact, components of at most 4 variables (`bench/hotel.sql`, `bench/RESULTS_HOTEL_2026-11-20.md`) |
 
 ## Phase 1: model catalog and validation
