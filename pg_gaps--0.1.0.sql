@@ -536,30 +536,113 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gaps_infer'
 LANGUAGE C STRICT VOLATILE;
 
--- The SQL to select one attribute's entities and their evidence:
--- SELECT entity jsonb, ev text[] (the distinct non-NULL values of the
--- attribute among the entity's rows) FROM rel GROUP BY the entity keys.
--- Identifiers come from the catalog and are quoted; nothing from callers
--- is interpolated.
-CREATE FUNCTION gaps._entities_sql(a gaps.attribute) RETURNS text
+-- The names of the temp tables gaps._ground keeps for attribute id:
+-- ktab, whose row type is the attribute's entity key (one column per key
+-- column, with that column's name, type and collation), and etab, the
+-- attribute's entities: (v int, k ktab, ev int), v its variable number,
+-- ev its evidence code as in pg_gaps_rv.
+CREATE FUNCTION gaps._key_tables(id int, OUT ktab text, OUT etab text)
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+	SELECT 'pg_gaps_k' || id, 'pg_gaps_e' || id
+$$;
+
+-- The key of attribute a's entity, over the rows of table alias, as a
+-- value of a's key type: ROW(alias.k1, ...)::pg_temp.ktab.  Keys compare
+-- by record equality, which hashes, uses each column's own equality and
+-- collation, and treats NULLs as equal, as GROUP BY does; so an entity
+-- whose key has a NULL is found like any other.
+CREATE FUNCTION gaps._key_row(a gaps.attribute, alias text) RETURNS text
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+	SELECT format('ROW(%s)::pg_temp.%I',
+				  string_agg(format('%I.%I', alias, k), ', ' ORDER BY o),
+				  (gaps._key_tables(a.attribute_id)).ktab)
+	FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o)
+$$;
+
+-- The entity of variable v of attribute id, as a jsonb object of its key
+-- columns.  NB: valid only after gaps._ground in the same transaction,
+-- for the variables that grounding numbered.
+CREATE FUNCTION gaps._entity_name(id int, v int) RETURNS jsonb
 LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-	keyobj text := '';
-	keylist text := '';
+	name jsonb;
 BEGIN
-	FOR i IN 1 .. array_length(a.entity_keys, 1) LOOP
-		keyobj := keyobj || CASE WHEN i > 1 THEN ', ' ELSE '' END
-			|| format('%L, %I', a.entity_keys[i], a.entity_keys[i]);
-		keylist := keylist || CASE WHEN i > 1 THEN ', ' ELSE '' END
-			|| format('%I', a.entity_keys[i]);
-	END LOOP;
-	RETURN format('SELECT jsonb_build_object(%s) AS entity, '
-				  'array_agg(DISTINCT %I::text) FILTER (WHERE %I IS NOT NULL) AS ev '
-				  'FROM %s GROUP BY %s',
-				  keyobj, a.attname, a.attname, a.rel, keylist);
+	EXECUTE format('SELECT to_jsonb(e.k) FROM pg_temp.%I e WHERE e.v = $1',
+				   (gaps._key_tables(id)).etab)
+		INTO name USING v;
+	RETURN name;
 END
+$$;
+
+-- Every missing variable of model m in the current grounding, with its
+-- attribute and its entity as a jsonb object of the key columns.  NB:
+-- valid only after gaps._ground(m) in the same transaction.  Entity
+-- names are built here, for the variables a result reports, and nowhere
+-- in grounding itself.
+CREATE FUNCTION gaps._missing_names(m int,
+	OUT v int, OUT attribute_id int, OUT entity jsonb)
+RETURNS SETOF record
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	id int;
+BEGIN
+	FOR id IN SELECT a.attribute_id FROM gaps.attribute a WHERE a.model_id = m LOOP
+		RETURN QUERY EXECUTE format('SELECT e.v, $1, to_jsonb(e.k) FROM pg_temp.%I e '
+									'WHERE e.ev = 0', (gaps._key_tables(id)).etab)
+			USING id;
+	END LOOP;
+END
+$$;
+
+-- Create attribute a's key and entity tables (gaps._key_tables), dropping
+-- any left by an earlier grounding in this transaction.  The key table is
+-- empty; only its row type is used.
+CREATE FUNCTION gaps._make_key_tables(a gaps.attribute) RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	t record := gaps._key_tables(a.attribute_id);
+BEGIN
+	IF to_regclass('pg_temp.' || t.etab) IS NOT NULL THEN
+		EXECUTE format('DROP TABLE pg_temp.%I', t.etab);
+	END IF;
+	IF to_regclass('pg_temp.' || t.ktab) IS NOT NULL THEN
+		EXECUTE format('DROP TABLE pg_temp.%I', t.ktab);
+	END IF;
+	EXECUTE format('CREATE TEMP TABLE %I ON COMMIT DROP AS SELECT %s FROM %s LIMIT 0',
+				   t.ktab,
+				   (SELECT string_agg(format('%I', k), ', ' ORDER BY o)
+					FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o)),
+				   a.rel);
+	EXECUTE format('CREATE TEMP TABLE %I (v int, k pg_temp.%I, ev int) ON COMMIT DROP',
+				   t.etab, t.ktab);
+END
+$$;
+
+-- The SQL to select one attribute's entities and their evidence:
+-- SELECT n (1, 2, ... in key order), k (the key, gaps._key_row), ev text[]
+-- (the distinct non-NULL values of the attribute among the entity's rows)
+-- FROM rel GROUP BY the entity keys.  Identifiers come from the catalog
+-- and are quoted; nothing from callers is interpolated.
+CREATE FUNCTION gaps._entities_sql(a gaps.attribute) RETURNS text
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+	SELECT format('SELECT row_number() OVER (ORDER BY %s) AS n, %s AS k, '
+				  'array_agg(DISTINCT c.%I::text) FILTER (WHERE c.%I IS NOT NULL) AS ev '
+				  'FROM %s c GROUP BY %s',
+				  keylist, gaps._key_row(a, 'c'), a.attname, a.attname, a.rel, keylist)
+	FROM (SELECT string_agg(format('c.%I', k), ', ' ORDER BY o) AS keylist
+		  FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o)) x
 $$;
 
 -- The WHERE clause of a stripe's entity set.  Its constants are elements
@@ -591,9 +674,15 @@ END
 $$;
 
 -- Ground a model.  Returns one row per random variable, numbered 1..n,
--- with what gaps._infer needs and what is needed to name the variable in
--- results.  All reads of user tables happen here, through dynamic SQL run
--- as the caller.
+-- with what gaps._infer needs and each variable's attribute.  All reads of
+-- user tables happen here, through dynamic SQL run as the caller.
+--
+-- Entities are identified by their key as a typed composite (one temp
+-- table per attribute, gaps._key_tables), and every later step carries
+-- only variable numbers.  The tables stay behind for the transaction:
+-- pg_gaps_rv (v, attribute_id, card, ev), pg_gaps_inst (the factor
+-- instances), and each attribute's entities, from which
+-- gaps._missing_names and gaps._entity_name build jsonb names.
 --
 -- Validity checks (doc/DESIGN.md, "Validity" and "Mappings"):
 --   - every RV of every declared attribute is the child of exactly one CPT;
@@ -605,7 +694,7 @@ $$;
 CREATE FUNCTION gaps._ground(m int,
 	OUT card int[], OUT evidence int[], OUT child int[], OUT parent_off int[],
 	OUT parents int[], OUT cpt_off int[], OUT cpts float8[],
-	OUT var_attr int[], OUT var_entity jsonb[])
+	OUT var_attr int[])
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
@@ -620,7 +709,7 @@ DECLARE
 BEGIN
 	-- Entities and evidence, per attribute, numbered in a stable order.
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_rv (
-		v int, attribute_id int, entity jsonb, card int, ev int)
+		v int, attribute_id int, card int, ev int)
 		ON COMMIT DROP;
 	TRUNCATE pg_gaps_rv;
 	-- One pass per attribute reads the table once: every entity is stored,
@@ -630,29 +719,37 @@ BEGIN
 	-- case does not aggregate the table three times.
 	FOR a IN SELECT * FROM gaps.attribute WHERE model_id = m ORDER BY attribute_id LOOP
 		PERFORM gaps._resolve(a);
+		PERFORM gaps._make_key_tables(a);
 		sql := gaps._entities_sql(a);
-		EXECUTE format('INSERT INTO pg_gaps_rv (v, attribute_id, entity, card, ev) '
-					   'SELECT $4 + row_number() OVER (ORDER BY e.entity), $1, e.entity, $2, '
+		EXECUTE format('INSERT INTO pg_temp.%I (v, k, ev) '
+					   'SELECT $3 + e.n, e.k, '
 					   'CASE WHEN cardinality(e.ev) > 1 THEN -1 '
 					   'WHEN e.ev IS NULL THEN 0 '
-					   'ELSE coalesce(array_position($3, e.ev[1]), -2) END '
-					   'FROM (%s) e', sql)
-			USING a.attribute_id, array_length(a.domain, 1), a.domain,
+					   'ELSE coalesce(array_position($2, e.ev[1]), -2) END '
+					   'FROM (%s) e', (gaps._key_tables(a.attribute_id)).etab, sql)
+			USING a.attribute_id, a.domain,
 				  (SELECT coalesce(max(r.v), 0) FROM pg_gaps_rv r);
-		SELECT r.entity, r.ev INTO bad FROM pg_gaps_rv r
+		EXECUTE format('INSERT INTO pg_gaps_rv (v, attribute_id, card, ev) '
+					   'SELECT e.v, $1, $2, e.ev FROM pg_temp.%I e',
+					   (gaps._key_tables(a.attribute_id)).etab)
+			USING a.attribute_id, array_length(a.domain, 1);
+		EXECUTE format('ANALYZE pg_temp.%I', (gaps._key_tables(a.attribute_id)).etab);
+		SELECT r.v, r.ev INTO bad FROM pg_gaps_rv r
 		WHERE r.attribute_id = a.attribute_id AND r.ev < 0 ORDER BY r.v LIMIT 1;
-		IF bad.entity IS NOT NULL THEN
-			EXECUTE format('SELECT e.ev FROM (%s) e WHERE e.entity = $1', sql)
-				INTO sql USING bad.entity;
+		IF bad.v IS NOT NULL THEN
+			EXECUTE format('SELECT e.ev FROM (%s) e WHERE e.k = '
+						   '(SELECT x.k FROM pg_temp.%I x WHERE x.v = $1)',
+						   sql, (gaps._key_tables(a.attribute_id)).etab)
+				INTO sql USING bad.v;
 			IF bad.ev = -1 THEN
-				RAISE EXCEPTION 'rows of entity % of %.% disagree: %', bad.entity, a.relname,
-					a.attname, sql;
+				RAISE EXCEPTION 'rows of entity % of %.% disagree: %',
+					gaps._entity_name(a.attribute_id, bad.v), a.relname, a.attname, sql;
 			END IF;
 			RAISE EXCEPTION 'value "%" of %.% for entity % is not in its domain %',
-				trim(both '{}' from sql), a.relname, a.attname, bad.entity, a.domain;
+				trim(both '{}' from sql), a.relname, a.attname,
+				gaps._entity_name(a.attribute_id, bad.v), a.domain;
 		END IF;
 	END LOOP;
-	CREATE INDEX IF NOT EXISTS pg_gaps_rv_key ON pg_gaps_rv (attribute_id, entity);
 	ANALYZE pg_gaps_rv;
 
 	-- Each factor: its child entities, each with its parent entities.
@@ -671,14 +768,14 @@ BEGIN
 		w := gaps._stripe_where(f.child_stripe, 'c', 1);
 
 		-- The child entities (ord 0 marks the child itself): the distinct
-		-- entities of the stripe's rows, joined to their variables.
+		-- variables of the stripe's rows.
 		EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
-					   'SELECT $2, r.v, 0, r.v FROM '
-					   '(SELECT DISTINCT jsonb_build_object(%s) AS entity FROM %s c WHERE TRUE%s) x '
-					   'JOIN pg_gaps_rv r ON r.attribute_id = $3 AND r.entity = x.entity',
-					   (SELECT string_agg(format('%L, c.%I', k, k), ', ')
-						FROM unnest(a.entity_keys) k), a.rel, w.clause)
-			USING w.params, f.factor_id, f.cattr;
+					   'SELECT $2, x.v, 0, x.v FROM '
+					   '(SELECT DISTINCT rc.v FROM %s c JOIN pg_temp.%I rc ON rc.k = %s '
+					   'WHERE TRUE%s) x',
+					   a.rel, (gaps._key_tables(a.attribute_id)).etab,
+					   gaps._key_row(a, 'c'), w.clause)
+			USING w.params, f.factor_id;
 
 		-- Each parent: join child rows to parent rows on the mapping and the
 		-- parent stripe's predicate; each child entity must reach exactly one
@@ -708,38 +805,31 @@ BEGIN
 				END IF;
 				wp := gaps._stripe_where(p.parent_stripe, 'p', cardinality(w.params) + 1);
 
-				-- One pass: each child entity with the distinct parent
-				-- entities its rows reach (the LEFT JOIN keeps a child that
-				-- reaches none, with pes NULL).  Exactly one, which must be a
-				-- parent RV, gives its v; anything else is stored with a
-				-- non-positive pv (minus the number of parents reached, or -1
-				-- for one parent that is not in the parent stripe) and
-				-- reported below.
-				sql := format(
-					'SELECT jsonb_build_object(%s) AS ce, '
-					'array_agg(DISTINCT jsonb_build_object(%s)) '
-					'FILTER (WHERE p.ctid IS NOT NULL) AS pes '
-					'FROM %s c LEFT JOIN %s p ON TRUE%s%s WHERE TRUE%s '
-					'GROUP BY 1',
-					(SELECT string_agg(format('%L, c.%I', k, k), ', ') FROM unnest(a.entity_keys) k),
-					(SELECT string_agg(format('%L, p.%I', k, k), ', ') FROM unnest(pa.entity_keys) k),
-					a.rel, pa.rel, on_clause, wp.clause, w.clause);
-				EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
-							   'SELECT $2, rc.v, $3, CASE WHEN cardinality(x.pes) = 1 '
-							   'THEN coalesce(rp.v, -1) ELSE -coalesce(cardinality(x.pes), 0) END '
-							   'FROM (%s) x '
-							   'JOIN pg_gaps_rv rc ON rc.attribute_id = $4 AND rc.entity = x.ce '
-							   'LEFT JOIN pg_gaps_rv rp ON rp.attribute_id = $5 '
-							   'AND rp.entity = x.pes[1] AND cardinality(x.pes) = 1',
-							   sql)
-					USING w.params || wp.params, f.factor_id, p.ord, f.cattr, pa.attribute_id;
-				SELECT r.entity AS ce, i.pv INTO bad
-				FROM pg_gaps_inst i JOIN pg_gaps_rv r ON r.v = i.v
+				-- One pass: each child variable with the distinct parent
+				-- variables its rows reach (the LEFT JOIN keeps a child that
+				-- reaches none).  Exactly one gives its v; anything else is
+				-- stored as minus the number reached and reported below.
+				-- Every row of the parent's relation belongs to an entity of
+				-- the parent attribute, so the inner join to the parent's
+				-- entities loses no row.
+				EXECUTE format(
+					'INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
+					'SELECT $2, rc.v, $3, CASE WHEN count(DISTINCT rp.v) = 1 THEN min(rp.v) '
+					'ELSE -count(DISTINCT rp.v) END '
+					'FROM %s c JOIN pg_temp.%I rc ON rc.k = %s '
+					'LEFT JOIN (%s p JOIN pg_temp.%I rp ON rp.k = %s) ON TRUE%s%s '
+					'WHERE TRUE%s GROUP BY rc.v',
+					a.rel, (gaps._key_tables(a.attribute_id)).etab, gaps._key_row(a, 'c'),
+					pa.rel, (gaps._key_tables(pa.attribute_id)).etab, gaps._key_row(pa, 'p'),
+					on_clause, wp.clause, w.clause)
+					USING w.params || wp.params, f.factor_id, p.ord;
+				SELECT i.v, i.pv INTO bad
+				FROM pg_gaps_inst i
 				WHERE i.factor_id = f.factor_id AND i.ord = p.ord AND i.pv <= 0
 				ORDER BY i.v LIMIT 1;
-				IF bad.ce IS NOT NULL THEN
+				IF bad.v IS NOT NULL THEN
 					RAISE EXCEPTION 'factor "%": child entity % maps to % parent entities in parent %',
-						f.name, bad.ce, CASE WHEN bad.pv = -1 THEN 0 ELSE -bad.pv END, p.ord
+						f.name, gaps._entity_name(a.attribute_id, bad.v), -bad.pv, p.ord
 						USING HINT = 'Each child must have exactly one parent per parent stripe; '
 							'check the factor''s mapping (gaps.map_factor) and the parent stripe''s '
 							'predicate.';
@@ -750,24 +840,24 @@ BEGIN
 	END LOOP;
 
 	-- Coverage: every RV is the child of exactly one factor.
-	SELECT r.v, r.entity, at.relname, at.attname, count(DISTINCT i.factor_id) AS n
+	SELECT r.v, r.attribute_id, at.relname, at.attname, count(DISTINCT i.factor_id) AS n
 	INTO bad
 	FROM pg_gaps_rv r JOIN gaps.attribute at USING (attribute_id)
 		LEFT JOIN pg_gaps_inst i ON i.v = r.v AND i.ord = 0
-	GROUP BY r.v, r.entity, at.relname, at.attname
+	GROUP BY r.v, r.attribute_id, at.relname, at.attname
 	HAVING count(DISTINCT i.factor_id) <> 1
 	ORDER BY r.v LIMIT 1;
 	IF bad.v IS NOT NULL THEN
 		RAISE EXCEPTION '%.% of entity % is the child of % factors, not exactly one',
-			bad.relname, bad.attname, bad.entity, bad.n
+			bad.relname, bad.attname, gaps._entity_name(bad.attribute_id, bad.v), bad.n
 			USING HINT = 'Every probabilistic value, present or missing, needs one CPT.';
 	END IF;
 
 	-- Assemble the arrays, in variable order; each CPT appears once in cpts
 	-- and every instance of its factor points at it.
 	SELECT array_agg(r.card ORDER BY r.v), array_agg(r.ev ORDER BY r.v),
-		   array_agg(r.attribute_id ORDER BY r.v), array_agg(r.entity ORDER BY r.v)
-	INTO card, evidence, var_attr, var_entity
+		   array_agg(r.attribute_id ORDER BY r.v)
+	INTO card, evidence, var_attr
 	FROM pg_gaps_rv r;
 
 	-- One ordered pass over the instances: every child variable (ord 0,
@@ -811,11 +901,11 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+	m int := gaps._model_id(model);
 	g record;
 BEGIN
-	g := gaps._ground(gaps._model_id(model));
-	-- Variables are named by joining pg_gaps_rv, which _ground leaves
-	-- behind for the transaction, not by subscripting g.var_entity: a
+	g := gaps._ground(m);
+	-- Variables are named by a join, not by subscripting an array: a
 	-- subscript into an array of jsonb scans from its start, which is
 	-- quadratic over millions of variables.
 	RETURN QUERY
@@ -823,7 +913,7 @@ BEGIN
 			   r.probability, r.component, 'exact'::text
 		FROM gaps._infer(g.card, g.evidence, g.child, g.parent_off, g.parents,
 						 g.cpt_off, g.cpts) r
-			JOIN pg_gaps_rv v ON v.v = r.var
+			JOIN gaps._missing_names(m) v ON v.v = r.var
 			JOIN gaps.attribute a ON a.attribute_id = v.attribute_id;
 END
 $$;
@@ -839,15 +929,16 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+	m int := gaps._model_id(model);
 	g record;
 BEGIN
-	g := gaps._ground(gaps._model_id(model));
+	g := gaps._ground(m);
 	RETURN QUERY
 		SELECT a.rel, a.attname, v.entity, a.domain[r.map_value],
 			   r.map_probability, r.component, 'exact'::text
 		FROM gaps._infer(g.card, g.evidence, g.child, g.parent_off, g.parents,
 						 g.cpt_off, g.cpts) r
-			JOIN pg_gaps_rv v ON v.v = r.var
+			JOIN gaps._missing_names(m) v ON v.v = r.var
 			JOIN gaps.attribute a ON a.attribute_id = v.attribute_id
 		WHERE r.value = 1;
 END

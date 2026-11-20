@@ -91,6 +91,54 @@ SELECT gaps.add_stripe('c', 's', 'reading', 'status');
 SELECT gaps.add_factor('c', 'p', 's', '{}', ARRAY[0.9, 0.1]);
 SELECT entity, value, round(probability::numeric, 12) AS p
 FROM gaps.marginals('c') ORDER BY entity::text, value;
+-- A coarse parent mapped one-to-many: room occupancy per (room, t), over
+-- several rows each, is the parent of every sensor's temperature in that
+-- room and time.  Room 1 at time 1 is observed occupied; room 2 at time 1
+-- has one hot reading below it, room 1 at time 2 one cold reading.  The
+-- oracle is Bayes' rule by hand: P(yes | hot) = 0.3 * 0.1 / (0.3 * 0.1 +
+-- 0.7 * 0.8), and so on.
+CREATE TABLE occ (room int, t int, k int, occupied text, PRIMARY KEY (room, t, k));
+INSERT INTO occ VALUES (1, 1, 1, 'yes'), (1, 1, 2, NULL), (2, 1, 1, NULL), (2, 1, 2, NULL),
+	(1, 2, 1, NULL);
+SELECT gaps.create_model('o');
+SELECT gaps.declare_attribute('o', 'occ', 'occupied', ARRAY['yes', 'no'],
+							  ARRAY['room', 't']::name[]);
+SELECT gaps.declare_attribute('o', 'sensor', 'temp', ARRAY['cold', 'hot']);
+SELECT gaps.add_stripe('o', 'occ', 'occ', 'occupied');
+SELECT gaps.add_stripe('o', 'tp', 'sensor', 'temp');
+SELECT gaps.add_factor('o', 'occ', 'occ', '{}', ARRAY[0.3, 0.7]);
+SELECT gaps.add_factor('o', 'tp', 'tp', ARRAY['occ'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT gaps.map_factor('o', 'tp', 1, 't', 't');
+SELECT gaps.map_factor('o', 'tp', 1, 'room', 'room');
+WITH oracle(attname, entity, value, p) AS (VALUES
+	('occupied', '{"room": 2, "t": 1}', 'yes', 0.03 / 0.59),
+	('occupied', '{"room": 1, "t": 2}', 'yes', 0.27 / 0.41),
+	('temp', '{"t": 1, "room": 1, "sid": 1}', 'cold', 0.9),
+	('temp', '{"t": 1, "room": 1, "sid": 2}', 'cold', 0.9),
+	('temp', '{"t": 1, "room": 2, "sid": 2}', 'cold', 0.139 / 0.59),
+	('temp', '{"t": 2, "room": 1, "sid": 1}', 'cold', 0.271 / 0.41))
+SELECT o.attname, o.entity, count(m.*) AS found,
+	   abs(o.p - m.probability) < 1e-12 AS agrees
+FROM oracle o
+	FULL JOIN (SELECT * FROM gaps.marginals('o') WHERE value IN ('yes', 'cold')) m
+	  ON m.attname = o.attname AND m.entity = o.entity::jsonb
+GROUP BY o.attname, o.entity, o.p, m.probability
+ORDER BY 1, 2;
+SELECT gaps.drop_model('o');
+DROP TABLE occ;
+
+-- An entity key may be NULL: rows with a NULL key are one entity, as in
+-- GROUP BY.  Here that entity is observed through one of its two rows.
+CREATE TABLE nk (id int PRIMARY KEY, g int, x text);
+INSERT INTO nk VALUES (1, NULL, NULL), (2, NULL, 'b'), (3, 1, NULL);
+SELECT gaps.create_model('nk');
+SELECT gaps.declare_attribute('nk', 'nk', 'x', ARRAY['a', 'b'], ARRAY['g']::name[]);
+SELECT gaps.add_stripe('nk', 'x', 'nk', 'x');
+SELECT gaps.add_factor('nk', 'p', 'x', '{}', ARRAY[0.25, 0.75]);
+SELECT entity, value, round(probability::numeric, 12) AS p FROM gaps.marginals('nk') ORDER BY value;
+SELECT gaps.drop_model('nk');
+DROP TABLE nk;
+
 UPDATE reading SET status = 'down' WHERE (sid, t, k) = (1, 1, 2);
 SELECT * FROM gaps.marginals('c');                          -- fail: conflicting evidence
 UPDATE reading SET status = 'sideways' WHERE (sid, t) = (1, 1);

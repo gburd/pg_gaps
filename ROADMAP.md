@@ -68,7 +68,7 @@ components too large to solve exactly.
 | 2 | pgmpy cross-check | done: 2,647 to 2,762 marginals per run agree to 1e-9 (`test/pgmpy`, flake check `pgmpy`) |
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
 | 2 | `SupportRequestRows` for the SRFs | **open** |
-| 2 | grounding cost | **open**: about 100x the inference cost (23 s for 2M variables); jsonb entity keys are next (Phase 6) |
+| 2 | grounding cost | **open**: entity keys are typed composites, 1.9-2.0x faster (17 s for 2M variables on floki; `bench/RESULTS_GROUNDING_2026-11-20.md`); what remains is sorting integer instance rows (Phase 6) |
 
 ## Phase 1: model catalog and validation
 
@@ -216,10 +216,14 @@ with a manual SQL formulation of the same possible-worlds computation.
 ## Phase 6: planner integration and grounding cost
 
 Grounding dominates: about 100 times the inference cost at 2M variables
-(`bench/RESULTS_SHARING_2026-11-19.md`), from building and joining jsonb
-entity keys in every step.  First, entity keys as typed composite or
-integer surrogates, measured against the current form on the hotel
-workload at two scales with A/A runs.  Then costs for every SRF from model
+(`bench/RESULTS_SHARING_2026-11-19.md`).  Entity keys are now typed
+composites joined once per step, with jsonb built only for reported
+variables: 1.9-2.0x faster at 200,000 and 2M variables, A/A checked
+(`bench/RESULTS_GROUNDING_2026-11-20.md`).  No step is dominated by keys
+any more; a third of what is left is the coverage check and array
+assembly, sorts over integer instance rows.  Next: fold the coverage
+check into building the instances, and measure assembling the engine's
+arrays in C over SPI.  Then costs for every SRF from model
 statistics (component sizes, distinct evidence signatures), so plans are
 reasonable without hints.  A custom scan only if a measurement shows the
 SRF form costs something real; otherwise this phase closes with that
