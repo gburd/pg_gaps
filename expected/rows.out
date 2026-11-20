@@ -1,0 +1,359 @@
+-- Row estimates of the set-returning functions (doc/DESIGN.md, "Row
+-- estimates").  With a constant model name the support function estimates
+-- from reltuples, each attribute's null fraction and its domain size;
+-- otherwise the planner uses the declared ROWS (1000 for marginals and
+-- impute, 10 for learn_cpts).
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_gaps;
+\set VERBOSITY terse
+-- The planner's row estimate for a query, from EXPLAIN (FORMAT JSON), so
+-- the test does not depend on cost numbers that differ across versions.
+CREATE FUNCTION plan_rows(q text) RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE
+	j json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	RETURN (j -> 0 -> 'Plan' ->> 'Plan Rows')::float8;
+END
+$$;
+-- 1000 rows; a is missing in 250 of them (domain of 2), b in 100 (domain
+-- of 3).  ANALYZE samples every row of a table this small, so reltuples and
+-- the null fractions are exact, and the estimate equals the real count:
+-- marginals 250 * 2 + 100 * 3 = 800 rows, impute 250 + 100 = 350.
+CREATE TABLE t (id int PRIMARY KEY, a text, b text);
+INSERT INTO t
+SELECT i, CASE WHEN i % 4 = 0 THEN NULL WHEN i % 3 = 0 THEN 'x' ELSE 'y' END,
+	   CASE WHEN i % 10 = 0 THEN NULL ELSE (ARRAY['p', 'q', 'r'])[i % 3 + 1] END
+FROM generate_series(1, 1000) i;
+ANALYZE t;
+SELECT gaps.create_model('rm');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('rm', 't', 'a', ARRAY['x', 'y']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('rm', 't', 'b', ARRAY['p', 'q', 'r']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('rm', 'sa', 't', 'a');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('rm', 'sb', 't', 'b');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('rm', 'pa', 'sa');
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('rm', 'pb', 'sb', ARRAY['sa']);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT factor, complete_entities FROM gaps.learn_cpts('rm') ORDER BY factor;
+ factor | complete_entities 
+--------+-------------------
+ pa     |               750
+ pb     |               700
+(2 rows)
+
+-- The estimates, and the actual counts beside them.
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS marginals_est,
+	   (SELECT count(*) FROM gaps.marginals('rm')) AS marginals_actual,
+	   plan_rows($$SELECT * FROM gaps.impute('rm')$$) AS impute_est,
+	   (SELECT count(*) FROM gaps.impute('rm')) AS impute_actual,
+	   plan_rows($$SELECT * FROM gaps.learn_cpts('rm')$$) AS learn_est;
+ marginals_est | marginals_actual | impute_est | impute_actual | learn_est 
+---------------+------------------+------------+---------------+-----------
+           800 |              800 |        350 |           350 |         2
+(1 row)
+
+-- A parameter: a custom plan sees the bound value, a generic plan does not
+-- and falls back to ROWS.
+PREPARE pm(text) AS SELECT * FROM gaps.marginals($1);
+SET plan_cache_mode = force_custom_plan;
+SELECT plan_rows($$EXECUTE pm('rm')$$) AS custom;
+ custom 
+--------
+    800
+(1 row)
+
+SET plan_cache_mode = force_generic_plan;
+SELECT plan_rows($$EXECUTE pm('rm')$$) AS generic;
+ generic 
+---------
+    1000
+(1 row)
+
+RESET plan_cache_mode;
+DEALLOCATE pm;
+-- No such model, or a NULL name: no error at plan time, the default
+-- estimate.  Executing it fails as it always did.
+SELECT plan_rows($$SELECT * FROM gaps.marginals('nosuch')$$) AS nosuch,
+	   plan_rows($$SELECT * FROM gaps.marginals(NULL)$$) AS null_name;
+ nosuch | null_name 
+--------+-----------
+   1000 |      1000
+(1 row)
+
+SELECT * FROM gaps.marginals('nosuch');                      -- fail
+ERROR:  model "nosuch" does not exist
+-- A role that is not a member of the model's owner cannot see the model,
+-- and gets the default, not the model's size.
+CREATE ROLE gaps_rows_other;
+GRANT SELECT ON t TO gaps_rows_other;
+GRANT EXECUTE ON FUNCTION plan_rows(text) TO gaps_rows_other;
+SET ROLE gaps_rows_other;
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS hidden_model;
+ hidden_model 
+--------------
+         1000
+(1 row)
+
+RESET ROLE;
+-- A cached plan is not reused across roles: the estimate is replanned.
+PREPARE pq AS SELECT * FROM gaps.marginals('rm');
+SELECT plan_rows('EXECUTE pq') AS owner_plan;
+ owner_plan 
+------------
+        800
+(1 row)
+
+SET ROLE gaps_rows_other;
+SELECT plan_rows('EXECUTE pq') AS other_plan;
+ other_plan 
+------------
+       1000
+(1 row)
+
+RESET ROLE;
+DEALLOCATE pq;
+-- A member of the owner role who may not read the table's columns may not
+-- read their statistics either: the default.  With SELECT on one column
+-- only, the other column's statistics stay hidden, so still the default.
+UPDATE gaps.model SET owner = 'gaps_rows_other' WHERE name = 'rm';
+GRANT gaps_rows_other TO current_user;
+REVOKE SELECT ON t FROM gaps_rows_other;
+GRANT SELECT (id, a) ON t TO gaps_rows_other;
+SET ROLE gaps_rows_other;
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS one_column;
+ one_column 
+------------
+       1000
+(1 row)
+
+RESET ROLE;
+GRANT SELECT ON t TO gaps_rows_other;
+SET ROLE gaps_rows_other;
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS readable;
+ readable 
+----------
+      800
+(1 row)
+
+RESET ROLE;
+-- Row-level security on the table hides its statistics from the role, as
+-- pg_stats does.
+ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+CREATE POLICY few ON t TO gaps_rows_other USING (id < 10);
+SET ROLE gaps_rows_other;
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS rls_table;
+ rls_table 
+-----------
+      1000
+(1 row)
+
+RESET ROLE;
+ALTER TABLE t DISABLE ROW LEVEL SECURITY;
+-- An error inside the estimate (here, no SELECT on the catalog) is not
+-- an error of the query being planned.
+REVOKE SELECT ON gaps.attribute FROM PUBLIC;
+SET ROLE gaps_rows_other;
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS catalog_error;
+ catalog_error 
+---------------
+          1000
+(1 row)
+
+RESET ROLE;
+GRANT SELECT ON gaps.attribute TO PUBLIC;
+-- Under SERIALIZABLE there is no estimate, so that planning takes no
+-- predicate locks on the catalog.
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS serializable;
+ serializable 
+--------------
+         1000
+(1 row)
+
+COMMIT;
+-- A cached plan depends on the data table: ANALYZE replans it, and the
+-- estimate follows the new null fraction (a missing in 625 rows now, so
+-- 625 * 2 + 100 * 3 = 1550).  Ordinary inserts into the catalog send no
+-- invalidation, so after declaring another attribute (c, missing in all
+-- 1000 rows) the cached estimate may lag until something replans it.  Only
+-- the fresh plan is shown: whether the cached one has replanned depends on
+-- autovacuum and the invalidation queue.
+ALTER TABLE t ADD COLUMN c text;
+PREPARE pq AS SELECT * FROM gaps.marginals('rm');
+SELECT plan_rows('EXECUTE pq') AS before_analyze;
+ before_analyze 
+----------------
+            800
+(1 row)
+
+UPDATE t SET a = NULL WHERE id <= 500;
+ANALYZE t;
+SELECT plan_rows('EXECUTE pq') AS after_analyze;
+ after_analyze 
+---------------
+          1550
+(1 row)
+
+SELECT gaps.declare_attribute('rm', 't', 'c', ARRAY['1']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS fresh;
+ fresh 
+-------
+  2550
+(1 row)
+
+DEALLOCATE pq;
+-- A table with inheritance children: grounding reads the children, which
+-- the parent's reltuples does not count, so no estimate.
+CREATE TABLE par (id int PRIMARY KEY, a text);
+CREATE TABLE ch () INHERITS (par);
+INSERT INTO par SELECT i, CASE WHEN i % 2 = 0 THEN 'x' END
+FROM generate_series(1, 100) i;
+ANALYZE par;
+SELECT gaps.create_model('pm');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('pm', 'par', 'a', ARRAY['x']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT plan_rows($$SELECT * FROM gaps.marginals('pm')$$) AS inherited;
+ inherited 
+-----------
+      1000
+(1 row)
+
+-- A coarse entity key: 1000 rows share 10 entities and a is missing in the
+-- 100 rows of entity 0, so 100 * 2 = 200 estimated against one variable,
+-- 2 rows, actual.  The estimate counts rows, not entities, as documented.
+CREATE TABLE ce (id int, k int, a text);
+INSERT INTO ce SELECT i, i % 10, CASE WHEN i % 10 = 0 THEN NULL ELSE 'x' END
+FROM generate_series(1, 1000) i;
+ANALYZE ce;
+SELECT gaps.create_model('cm');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('cm', 'ce', 'a', ARRAY['x', 'y'], ARRAY['k']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('cm', 's', 'ce', 'a');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('cm', 'f', 's');
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.set_cpt('cm', 'f', ARRAY[0.5, 0.5]);
+ set_cpt 
+---------
+ 
+(1 row)
+
+SELECT plan_rows($$SELECT * FROM gaps.marginals('cm')$$) AS coarse_est,
+	   (SELECT count(*) FROM gaps.marginals('cm')) AS coarse_actual;
+ coarse_est | coarse_actual 
+------------+---------------
+        200 |             2
+(1 row)
+
+-- A table never analyzed has no statistics: the default.
+CREATE TABLE u (id int PRIMARY KEY, c text);
+SELECT gaps.create_model('um');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('um', 'u', 'c', ARRAY['x']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT plan_rows($$SELECT * FROM gaps.marginals('um')$$) AS unanalyzed;
+ unanalyzed 
+------------
+       1000
+(1 row)
+
+DROP TABLE t, u, par, ch, ce;
+SELECT gaps.drop_model('rm');
+ drop_model 
+------------
+ 
+(1 row)
+
+SELECT gaps.drop_model('um');
+ drop_model 
+------------
+ 
+(1 row)
+
+SELECT gaps.drop_model('pm');
+ drop_model 
+------------
+ 
+(1 row)
+
+SELECT gaps.drop_model('cm');
+ drop_model 
+------------
+ 
+(1 row)
+
+DROP FUNCTION plan_rows(text);
+DROP ROLE gaps_rows_other;

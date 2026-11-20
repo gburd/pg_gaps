@@ -22,6 +22,14 @@ PostgreSQL 17, 18 or 19, a C compiler, and the server headers.
 
 ## Build and install
 
+From PGXN:
+
+```sh
+pgxn install pg_gaps
+```
+
+From a source tree or a release zip:
+
 ```sh
 make PG_CONFIG=/path/to/pg_config
 sudo make install PG_CONFIG=/path/to/pg_config

@@ -1,0 +1,134 @@
+name: Release
+
+# A vX.Y.Z tag builds and tests the tagged tree, attaches the PGXN source
+# zip (make dist) to a GitHub Release, and uploads it to PGXN.  PGXN
+# rejects a duplicate version, so re-publishing a version it already has
+# reports 409 and moves on.  workflow_dispatch republishes an existing tag
+# without re-tagging; a rerun of the tag's own run would execute the
+# workflow as it was when the tag was pushed.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to (re)publish, e.g. v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve release version
+        id: ver
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # A mirror can fire the tag event while the tag still resolves to the
+      # previous release (pg_fts v1.8.4 did).  Refetch the tag until the
+      # checkout's version is the tag's, and refuse to build otherwise:
+      # never publish one release's code under another's number.
+      - name: Verify the checkout is the tagged release
+        env:
+          WANT: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          got=
+          for i in $(seq 1 12); do
+            got=$(sed -n "s/^default_version *= *'\(.*\)'/\1/p" pg_gaps.control)
+            if [ "$got" = "$WANT" ]; then
+              echo "checkout is $got for tag $TAG (attempt $i)"
+              exit 0
+            fi
+            echo "checkout says $got, tag is $TAG; refetching ($i/12)"
+            sleep 10
+            git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG" || true
+            git checkout -q --detach "refs/tags/$TAG" || true
+          done
+          echo "::error::checkout version $got does not match tag $TAG; refusing to build"
+          exit 1
+
+      - name: Install PostgreSQL 18 and server headers
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/microsoft*.sources || true
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-18 postgresql-server-dev-18 gcc make
+
+      - name: Build source distribution (PGXN zip)
+        id: dist
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          make dist PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
+          echo "zip=pg_gaps-$VERSION.zip" >> "$GITHUB_OUTPUT"
+
+      # Gate on the zip itself, built the way a PGXN user builds it.
+      - name: Build and test the zip
+        env:
+          ZIP: ${{ steps.dist.outputs.zip }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          PGC=/usr/lib/postgresql/18/bin/pg_config
+          work=$(mktemp -d)
+          unzip -q "$ZIP" -d "$work"
+          cd "$work/pg_gaps-$VERSION"
+          make PG_CONFIG=$PGC COPT=-Werror
+          sudo make install PG_CONFIG=$PGC
+          pg_virtualenv -v 18 make installcheck PG_CONFIG=$PGC \
+            || { cat regression.diffs 2>/dev/null; exit 1; }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: ${{ steps.dist.outputs.zip }}
+
+      - name: Publish to PGXN
+        env:
+          PGXN_USERNAME: ${{ secrets.PGXN_USER }}
+          PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
+          ZIP: ${{ steps.dist.outputs.zip }}
+        run: |
+          if [ -z "$PGXN_USERNAME" ] || [ -z "$PGXN_PASSWORD" ]; then
+            echo "::warning::PGXN_USER/PGXN_PASSWORD secrets not set; skipping the PGXN upload."
+            exit 0
+          fi
+          # 2xx/3xx: accepted.  409: either this version is already
+          # published (a rerun) or PGXN rejected META.json; the body says which.
+          code=$(curl -sS -o pgxn_resp.txt -w '%{http_code}' \
+            --user "$PGXN_USERNAME:$PGXN_PASSWORD" \
+            -F "archive=@$ZIP;type=application/zip" \
+            https://manager.pgxn.org/upload)
+          echo "PGXN upload HTTP $code"
+          cat pgxn_resp.txt || true
+          case "$code" in
+            2*|3*)
+              echo "PGXN upload accepted." ;;
+            409)
+              if grep -qiE 'already exists|already (been )?(released|uploaded)|same version|conflicts with' pgxn_resp.txt; then
+                echo "::warning::this version is already on PGXN; skipping."
+              else
+                echo "::error::PGXN rejected the upload (HTTP 409); see the response above."
+                exit 1
+              fi ;;
+            *)
+              echo "::error::PGXN upload failed (HTTP $code)"
+              exit 1 ;;
+          esac

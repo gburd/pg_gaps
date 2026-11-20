@@ -42,6 +42,8 @@ PG_FUNCTION_INFO_V1(gaps_infer);
 int			gaps_max_factor_cells = 1 << 20;
 int			gaps_max_total_cells = 1 << 26;
 bool		gaps_share_components = true;
+int			gaps_samples = 0;
+int			gaps_seed = 0;
 
 static void *
 pg_alloc(void *arg, size_t size)
@@ -128,7 +130,7 @@ bad_arg(const char *fmt, int a, int b)
  * gaps._infer(card int[], evidence int[], child int[], parent_off int[],
  *			   parents int[], cpt_off int[], cpts float8[])
  * RETURNS TABLE (var int, value int, probability float8, component int,
- *				  map_value int, map_probability float8)
+ *				  map_value int, map_probability float8, samples int)
  *
  * Variables are numbered 1..n (SQL style); card[i] and evidence[i] (NULL is
  * not allowed: missing is 0, observed is the 1-based value) describe
@@ -138,6 +140,11 @@ bad_arg(const char *fmt, int a, int b)
  * and run for as many entries as its variables' cardinalities imply, so
  * every instance of a first-order factor points at the same values.  All
  * offsets are 1-based.
+ *
+ * samples is NULL for a component solved exactly, and otherwise the number
+ * of Gibbs samples per chain behind its probabilities; map_value is then each
+ * variable's most probable sampled value, and map_probability is NULL,
+ * since sampling estimates no joint probability.
  */
 /*
  * Read and check gaps._infer's arrays and build the engine's network from
@@ -226,9 +233,13 @@ build_network(FunctionCallInfo fcinfo, gx_bn *bn)
 	bn->cpts = cpts;
 }
 
-/* Turn an engine error into an ERROR. */
+/*
+ * Turn an engine error into an ERROR.  bad is the variable the engine
+ * names; res, when not NULL, is gx_infer's result, which also carries the
+ * failing component's size and, for GX_ENOMIX, the chains' disagreement.
+ */
 static void
-report(int rc, int bad)
+report(int rc, int bad, const gx_result *res)
 {
 	if (rc == GX_ECYCLE)
 		ereport(ERROR,
@@ -241,14 +252,40 @@ report(int rc, int bad)
 				 errmsg("the observed values have probability zero under the model"),
 				 errdetail("Variable %d is involved.", bad + 1),
 				 errhint("A CPT gives zero probability to data that is present.")));
-	if (rc == GX_ETOOBIG)
+	if (rc == GX_ETOOBIG && gaps_samples == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("inference needs a factor larger than gaps.max_factor_cells (%d) "
 						"or more than gaps.max_total_cells (%d)",
 						gaps_max_factor_cells, gaps_max_total_cells),
 				 errdetail("The component containing variable %d is too densely connected "
-						   "for exact inference.", bad + 1)));
+						   "for exact inference.", bad + 1),
+				 errhint("Raise the limits, or set gaps.samples to sample the component.")));
+	if (rc == GX_ETOOBIG)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("inference needs more than gaps.max_total_cells (%d) to hold the "
+						"component's factors, or to sample it", gaps_max_total_cells),
+				 errdetail("The component containing variable %d is too large.", bad + 1)));
+	if (rc == GX_ENOTPOS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("the component containing variable %d is too large for exact "
+						"inference and cannot be sampled", bad + 1),
+				 errdetail("Gibbs sampling needs every CPT entry the component uses to be "
+						   "positive, and one is zero."),
+				 errhint("Raise gaps.max_factor_cells or gaps.max_total_cells, or make the "
+						 "CPT entries positive (gaps.learn_cpts with alpha > 0 does).")));
+	if (rc == GX_ENOMIX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Gibbs sampling did not converge on the component of %d variables "
+						"containing variable %d", res->bad_size, bad + 1),
+				 errdetail("With gaps.samples = %d in each of %d chains, two chains "
+						   "estimate a probability %.3f apart; the limit is %.2f.",
+						   gaps_samples, GX_CHAINS, res->spread, GX_MIX_SPREAD),
+				 errhint("Raise gaps.samples, or raise gaps.max_factor_cells and "
+						 "gaps.max_total_cells so the component is solved exactly.")));
 	if (rc == GX_EINVAL)
 		bad_arg("malformed ground network at variable %d (code %d)", bad + 1, rc);
 	if (rc != GX_OK)
@@ -291,9 +328,12 @@ gaps_infer(PG_FUNCTION_ARGS)
 	env.max_cells = (size_t) gaps_max_factor_cells;
 	env.max_total_cells = (size_t) gaps_max_total_cells;
 	env.no_sharing = !gaps_share_components;
+	env.samples = gaps_samples;
+	env.seed = (uint64_t) gaps_seed;
+	env.sample_always = 0;
 
-	report(gx_check(&env, &bn, &bad), bad);
-	report(gx_infer(&env, &bn, &res), res.bad_var);
+	report(gx_check(&env, &bn, &bad), bad, NULL);
+	report(gx_infer(&env, &bn, &res), res.bad_var, &res);
 
 	MemoryContextSwitchTo(old);
 	for (int v = 0; v < bn.nvars; v++)
@@ -302,15 +342,19 @@ gaps_infer(PG_FUNCTION_ARGS)
 			continue;
 		for (int x = 0; x < bn.card[v]; x++)
 		{
-			Datum		values[6];
-			bool		nulls[6] = {0};
+			int			k = res.comp[v];
+			Datum		values[7];
+			bool		nulls[7] = {0};
 
 			values[0] = Int32GetDatum(v + 1);
 			values[1] = Int32GetDatum(x + 1);
 			values[2] = Float8GetDatum(res.marg[res.marg_off[v] + (size_t) x]);
-			values[3] = Int32GetDatum(res.comp[v] + 1);
+			values[3] = Int32GetDatum(k + 1);
 			values[4] = Int32GetDatum(res.map[v] + 1);
-			values[5] = Float8GetDatum(res.comp_map_prob[res.comp[v]]);
+			values[5] = Float8GetDatum(res.comp_map_prob[k]);
+			values[6] = Int32GetDatum(res.comp_samples[k]);
+			nulls[5] = res.comp_samples[k] > 0;
+			nulls[6] = res.comp_samples[k] == 0;
 			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 		}
 	}

@@ -49,7 +49,7 @@ Each has a recommendation.  None blocks Phase 0, which is done.
 
 ## Status, 2026-11-19
 
-Phases 1 and 2 are built, with three items each still open (below).
+Phase 1 is done.  Phase 2 is built, with two items still open (below).
 Engine and SQL interface gated on PG 17.12, 18.7 and 19.0 (nixpkgs with
 clang; PGDG on Fedora 44 with gcc 16 and `-Werror`).  Exact inference
 already handles vertical correlations (any component the size bounds
@@ -60,15 +60,18 @@ components too large to solve exactly.
 |---|---|---|
 | 1 | catalog, triggers, row-level security, declaration functions | done (`sql/catalog.sql`) |
 | 1 | data-dependent validity: coverage, mappings total, evidence consistent, cycles | done (`sql/infer.sql`) |
-| 1 | the dependency-graph check before grounding [W11 3.3.2] | **open**: cycles are found on the ground network instead (gx_check), which is exact but needs the data |
+| 1 | the dependency-graph check before grounding [W11 3.3.2] | done: `gaps.validate`, sound from the predicates alone, no lineage trace; grounding keeps gx_check (`sql/validate.sql`, 500 random models, row and coarse entities); one review, its 4 counterexamples fixed; re-review's two cost holes fixed (only qual-named columns examined; at most 20000 parent slots), worst measured model under 7 s |
+| 1 | store `stripe_qual` constants in canonical form (cast to the column type and back at `add_stripe_qual`) | **open**: constants are text cast at use, so a model over `timestamptz`, `date`, `interval` or `money` columns means different things under different TimeZone, DateStyle, IntervalStyle or lc_monetary; `validate` refuses to reason about those types meanwhile. Catalog change |
 | 1 | `pg_dump` / restore test | done (`test/dump`; in the flake, CI and `dev/qualify-pgdg.sh`; fails if one config table is not registered) |
 | 1 | dropped or altered table names the change | done: rename, type change and drop each refused with the name (`test/dump`) |
 | 2 | engine: exact inference, bucket tree, log space, bounds, sharing | done; brute-force oracle, closed forms, allocation failure (`test/engine`); two independent reviews |
 | 2 | `marginals`, `impute`, `learn_cpts` | done (`sql/infer.sql`, `sql/learn.sql`) |
 | 2 | pgmpy cross-check | done: 2,647 to 2,762 marginals per run agree to 1e-9 (`test/pgmpy`, flake check `pgmpy`) |
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
-| 2 | `SupportRequestRows` for the SRFs | **open** |
-| 2 | grounding cost | **open**: entity keys are typed composites and temp tables are reused per transaction: `marginals` 2.0-2.6x faster on the hotel workload (10.3 s for 2M variables on EC2), 1.7x on a 900-attribute model, 3 ms slower on a 2-attribute one (`bench/RESULTS_GROUNDING_2026-11-20.md`); what remains is sorting integer instance rows (Phase 6) |
+| 2 | `SupportRequestRows` for the SRFs | done: catalog plus `stanullfrac` estimate, under the `pg_stats` visibility rule; ROWS fallback; no lock waits, none on a standby or under SERIALIZABLE; replans on ANALYZE (`sql/rows.sql`) |
+| 2 | grounding cost | **open**: entity keys are typed composites and temp tables are reused per transaction: `marginals` 2.0-2.6x faster on the hotel workload (10.3 s for 2M variables on EC2), 1.7x on a 900-attribute model, 3 ms slower on a 2-attribute one (`bench/RESULTS_GROUNDING_2026-11-20.md`); keys of the same types share tables whatever their names, so 300 and 2,000 relations keyed by differently named int columns hold main's lock count plus 12 and take 0.70-0.83x its time per call (local), and more than 100 key shapes is an `ERROR`; what remains is sorting integer instance rows (Phase 6) |
+| 3 | Gibbs sampling for components too large for exact | done (branch wip/gibbs): `gaps.samples` (per chain), `gaps.seed`; 4 chains from dispersed starts, refused (`ERROR`) when two chains' estimates differ by more than 0.1.  On models of at most 12 variables (20,000 random strictly positive cases) and the 6 x 6 grid, Rao-Blackwellized marginals are within 0.1 of exact at 4,000 samples (largest error 0.025) with no refusals; the review's multimodal grid and hub models are refused.  The check cannot see chains all stuck in one mode, so a sampled answer can still be wrong without an error (DESIGN.md "Gibbs sampling, as built").  Refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
+| 3 | full hotel workload with its vertical factors | done: runs exact, components of at most 4 variables (`bench/hotel.sql`, `bench/RESULTS_HOTEL_2026-11-20.md`) |
 
 ## Phase 1: model catalog and validation
 
@@ -97,9 +100,11 @@ Delivers:
 - Data-dependent validity (DESIGN.md "Validity"): within each factor the
   child stripe shares no RV with a parent; every mapping is total on the
   child entities; every value of a declared attribute, present or
-  missing, is covered by exactly one child stripe; the dependency-graph
-  check [W11 3.3.2] with the lineage trace on a cycle.  Run at `validate`
-  and again at every grounding.
+  missing, is covered by exactly one child stripe; no directed cycle.
+  Checked at every grounding.  Before grounding, `validate` runs the
+  dependency-graph check [W11 3.3.2] from the catalog alone; it proves
+  acyclicity or names the cycle it found, and does not trace lineage, so
+  a cycle there is not a rejection.
 - Privilege checks on every referenced column, as the caller.
 
 Done when: regression tests cover each rejection with a `-- fail` case and
@@ -158,11 +163,24 @@ Delivers:
   with `gaps.seed` and `gaps.samples`, deterministic given both, only for
   components whose CPTs are all strictly positive (DESIGN.md "Inference":
   Gibbs cannot cross zero-probability regions).  A large component with
-  zeros is an `ERROR` naming the reason.
-- `gaps.max_component_vars`: refuse (`ERROR`, with the component size in
-  the message) rather than build an exponential factor.
+  zeros is an `ERROR` naming the reason.  Four chains run; when they disagree by more than 0.1 on any
+  probability, the answer is an `ERROR`, not a guess.
+- `gaps.max_component_vars`: declined.  `gaps.max_factor_cells` and
+  `gaps.max_total_cells` already refuse an exponential factor before it
+  is built, and they measure what costs memory, which a variable count
+  does not.  Sampling holds memory linear in the component (charged to
+  `gaps.max_total_cells`) and takes time proportional to 4.4 x
+  `gaps.samples` times the component's factor scopes, which the caller chooses and can
+  cancel.
 - Output columns say which method answered and, for sampling, how many
-  samples it used.
+  samples it used: `method` ('exact', 'gibbs', or for `impute`
+  'gibbs-marginal-argmax') and `samples` (NULL for exact).
+
+Open: start two of the four chains from forward samples of the prior
+(evidence respected), which in a prototype caught the ternary-hub case on
+4 of 5 seeds and cut the alternating hub from 6 to 4 of 40 accepted
+wrong answers (DESIGN.md "Gibbs sampling, as built").  It narrows, it
+does not close, the same-mode gap.
 
 Done when: exact and oracle agree on correlated models, including
 coarse entity sets and one-to-many mappings; Gibbs is within a stated
@@ -223,6 +241,10 @@ key shape and truncated after: on EC2, `marginals` is 2.0-2.6x faster at
 200,000 and 2M variables and 1.7x on a 900-attribute model, A/A checked,
 and 3 ms (25-30%) slower on a 2-attribute model, from creating the
 tables in each transaction (`bench/RESULTS_GROUNDING_2026-11-20.md`).
+Tables are shared by key shape (types, typmods and collations, not
+column names), so a model over many relations with same-typed keys
+holds one set; a model with more than 100 shapes is refused, since each
+holds about 16 locks until commit (doc/DESIGN.md, "Key shapes").
 No step is dominated by keys any more; a third of what is left is the
 coverage check and array assembly, sorts over integer instance rows.
 Next: fold the coverage check into building the instances, and measure

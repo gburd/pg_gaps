@@ -1,0 +1,51 @@
+{
+   "name": "pg_gaps",
+   "abstract": "Probabilistic graphical models over incomplete relations",
+   "description": "pg_gaps brings BayesStore (Wang, Michelakis, Garofalakis and Hellerstein, VLDB 2008) to ordinary PostgreSQL tables. Columns may be missing values; a first-order Bayesian network stored in the gaps schema says how those values are distributed and correlated, and functions return the posterior distribution of every missing value, the most likely completion of each row, and maximum-likelihood CPTs learned from the data. Inference is exact (variable elimination over a bucket tree, cross-checked against brute force and pgmpy), with opt-in Gibbs sampling for components too large to solve exactly.",
+   "version": "0.1.0",
+   "maintainer": [
+      "Gregory Burd <greg@burd.me>"
+   ],
+   "license": "postgresql",
+   "provides": {
+      "pg_gaps": {
+         "abstract": "Bayesian-network inference over tables with missing values",
+         "file": "pg_gaps--0.1.0.sql",
+         "docfile": "README.md",
+         "version": "0.1.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "17.0.0"
+         }
+      }
+   },
+   "resources": {
+      "repository": {
+         "url": "https://codeberg.org/gregburd/pg_gaps.git",
+         "web": "https://codeberg.org/gregburd/pg_gaps",
+         "type": "git"
+      },
+      "bugtracker": {
+         "web": "https://codeberg.org/gregburd/pg_gaps/issues"
+      },
+      "homepage": "https://codeberg.org/gregburd/pg_gaps"
+   },
+   "generated_by": "Gregory Burd",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "probabilistic database",
+      "bayesian network",
+      "missing values",
+      "imputation",
+      "inference",
+      "bayesstore",
+      "graphical model"
+   ],
+   "release_status": "testing"
+}
