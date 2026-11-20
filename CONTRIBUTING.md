@@ -64,6 +64,15 @@ There is no CLA and no sign-off requirement.  By contributing you agree
 that your contribution is licensed under the PostgreSQL License
 (`LICENSE`).
 
+## Continuous integration
+
+Codeberg (the origin) runs `.woodpecker/ci.yaml` on Woodpecker
+(ci.codeberg.org); GitHub, which mirrors it, runs
+`.github/workflows/ci.yml`.  Both build and test against the PGDG packages
+of PostgreSQL 17, 18 and 19 through the same script, `ci/pgdg.sh`, so the
+two cannot drift; GitHub also runs `nix flake check`.  Run `ci/pgdg.sh
+MAJOR` in a `debian:trixie` container to reproduce either locally.
+
 ## Releasing
 
 1. Bump `default_version` in `pg_gaps.control` and both `"version"`

@@ -1,0 +1,47 @@
+# Codeberg CI (Woodpecker, ci.codeberg.org) for pg_gaps.
+#
+# Codeberg hosts Woodpecker, not Forgejo Actions (those need a self-hosted
+# runner), so this is the Codeberg-side gate; GitHub Actions
+# (.github/workflows/ci.yml) runs the same checks on the mirror.  Both call
+# ci/pgdg.sh, so the PGDG build cannot drift between the two.  Codeberg's
+# CI is a shared, donated service: this runs only on pushes to main, pull
+# requests and manual runs, and the slower engine and pgmpy checks run in
+# one leg only.
+when:
+  - event: [push, manual]
+    branch: main
+  - event: pull_request
+
+matrix:
+  PG:
+    - 17
+    - 18
+    - 19
+
+steps:
+  pgdg:
+    image: debian:trixie
+    commands:
+      - bash ci/pgdg.sh ${PG}
+
+  engine:
+    image: debian:trixie
+    commands:
+      - apt-get update -q
+      - apt-get install -y -q --no-install-recommends gcc libc6-dev
+      - CC=gcc bash test/engine/run.sh 1 20000
+    when:
+      - matrix:
+          PG: 19
+
+  pgmpy:
+    image: debian:trixie
+    commands:
+      - bash ci/pgdg.sh ${PG}
+      - apt-get install -y -q --no-install-recommends python3-venv
+      - python3 -m venv /tmp/venv
+      - /tmp/venv/bin/pip install --quiet pgmpy 'psycopg[binary]'
+      - pg_virtualenv -v ${PG} /tmp/venv/bin/python test/pgmpy/check.py --models 300
+    when:
+      - matrix:
+          PG: 19
