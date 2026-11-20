@@ -110,14 +110,65 @@ SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS catalog_error;
 RESET ROLE;
 GRANT SELECT ON gaps.attribute TO PUBLIC;
 
+-- Under SERIALIZABLE there is no estimate, so that planning takes no
+-- predicate locks on the catalog.
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS serializable;
+COMMIT;
+
+-- A cached plan depends on the data table: ANALYZE replans it, and the
+-- estimate follows the new null fraction (a missing in 625 rows now, so
+-- 625 * 2 + 100 * 3 = 1550).  Ordinary inserts into the catalog send no
+-- invalidation, so declaring another attribute (c, missing in all 1000
+-- rows) leaves the cached estimate as it was until something replans it;
+-- a fresh plan sees 1550 + 1000.
+ALTER TABLE t ADD COLUMN c text;
+PREPARE pq AS SELECT * FROM gaps.marginals('rm');
+SELECT plan_rows('EXECUTE pq') AS before_analyze;
+UPDATE t SET a = NULL WHERE id <= 500;
+ANALYZE t;
+SELECT plan_rows('EXECUTE pq') AS after_analyze;
+SELECT gaps.declare_attribute('rm', 't', 'c', ARRAY['1']);
+SELECT plan_rows('EXECUTE pq') AS cached_after_model_edit,
+	   plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS fresh;
+DEALLOCATE pq;
+
+-- A table with inheritance children: grounding reads the children, which
+-- the parent's reltuples does not count, so no estimate.
+CREATE TABLE par (id int PRIMARY KEY, a text);
+CREATE TABLE ch () INHERITS (par);
+INSERT INTO par SELECT i, CASE WHEN i % 2 = 0 THEN 'x' END
+FROM generate_series(1, 100) i;
+ANALYZE par;
+SELECT gaps.create_model('pm');
+SELECT gaps.declare_attribute('pm', 'par', 'a', ARRAY['x']);
+SELECT plan_rows($$SELECT * FROM gaps.marginals('pm')$$) AS inherited;
+
+-- A coarse entity key: 1000 rows share 10 entities and a is missing in the
+-- 100 rows of entity 0, so 100 * 2 = 200 estimated against one variable,
+-- 2 rows, actual.  The estimate counts rows, not entities, as documented.
+CREATE TABLE ce (id int, k int, a text);
+INSERT INTO ce SELECT i, i % 10, CASE WHEN i % 10 = 0 THEN NULL ELSE 'x' END
+FROM generate_series(1, 1000) i;
+ANALYZE ce;
+SELECT gaps.create_model('cm');
+SELECT gaps.declare_attribute('cm', 'ce', 'a', ARRAY['x', 'y'], ARRAY['k']);
+SELECT gaps.add_stripe('cm', 's', 'ce', 'a');
+SELECT gaps.add_factor('cm', 'f', 's');
+SELECT gaps.set_cpt('cm', 'f', ARRAY[0.5, 0.5]);
+SELECT plan_rows($$SELECT * FROM gaps.marginals('cm')$$) AS coarse_est,
+	   (SELECT count(*) FROM gaps.marginals('cm')) AS coarse_actual;
+
 -- A table never analyzed has no statistics: the default.
 CREATE TABLE u (id int PRIMARY KEY, c text);
 SELECT gaps.create_model('um');
 SELECT gaps.declare_attribute('um', 'u', 'c', ARRAY['x']);
 SELECT plan_rows($$SELECT * FROM gaps.marginals('um')$$) AS unanalyzed;
 
-DROP TABLE t, u;
+DROP TABLE t, u, par, ch, ce;
 SELECT gaps.drop_model('rm');
 SELECT gaps.drop_model('um');
+SELECT gaps.drop_model('pm');
+SELECT gaps.drop_model('cm');
 DROP FUNCTION plan_rows(text);
 DROP ROLE gaps_rows_other;

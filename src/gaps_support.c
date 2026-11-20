@@ -26,7 +26,10 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "access/xact.h"
+#include "access/xlog.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_statistic.h"
@@ -38,9 +41,11 @@
 #include "nodes/pathnodes.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
+#include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/rls.h"
 #include "utils/syscache.h"
@@ -71,13 +76,31 @@ typedef enum
  * readable by everyone in pg_class, so it needs no check.
  */
 static bool
-missing_values(Oid rel, const char *attname, double *out)
+missing_values(PlannerGlobal *glob, Oid rel, const char *attname,
+			   double *out)
 {
 	HeapTuple	tup;
 	Form_pg_class classform;
 	double		reltuples;
 	AttrNumber	attnum;
 	Oid			user = GetUserId();
+
+	/*
+	 * The estimate depends on the relation's statistics and privileges, so a
+	 * cached plan depends on the relation: ANALYZE, GRANT and REVOKE send a
+	 * relcache invalidation that replans it.  It is recorded before any
+	 * check, so a plan that got no estimate also replans after a GRANT.  We
+	 * run in SPI's memory context, so the list is extended in the planner's,
+	 * the context that holds glob.
+	 */
+	if (glob != NULL)
+	{
+		MemoryContext oldcontext;
+
+		oldcontext = MemoryContextSwitchTo(GetMemoryChunkContext(glob));
+		glob->relationOids = lappend_oid(glob->relationOids, rel);
+		MemoryContextSwitchTo(oldcontext);
+	}
 
 	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(rel));
 	if (!HeapTupleIsValid(tup))
@@ -120,7 +143,7 @@ missing_values(Oid rel, const char *attname, double *out)
  * connected to SPI and catches errors.
  */
 static bool
-estimate_rows(GapsSrf srf, Datum model, double *rows)
+estimate_rows(GapsSrf srf, Datum model, PlannerGlobal *glob, double *rows)
 {
 	static const char *const factors_sql =
 		"SELECT (SELECT pg_catalog.count(*) FROM gaps.factor f "
@@ -168,11 +191,77 @@ estimate_rows(GapsSrf srf, Datum model, double *rows)
 		if (isnull)
 			continue;
 		card = DatumGetFloat8(SPI_getbinval(tup, desc, 3, &isnull));
-		if (!missing_values(rel, SPI_getvalue(tup, desc, 2), &missing))
+		if (!missing_values(glob, rel, SPI_getvalue(tup, desc, 2), &missing))
 			return false;
 		*rows += srf == SRF_MARGINALS ? missing * card : missing;
 	}
 	return true;
+}
+
+/*
+ * Take AccessShareLock on relid and on each of its indexes without waiting.
+ * Returns false, leaving any locks already granted in place, if the relation
+ * is gone or a lock is not free right now.  Sets *toastrelid to the
+ * relation's TOAST table, or InvalidOid.
+ */
+static bool
+lock_with_indexes(Oid relid, Oid *toastrelid)
+{
+	Relation	rel;
+	List	   *indexes;
+	ListCell   *lc;
+	bool		ok = true;
+
+	if (!ConditionalLockRelationOid(relid, AccessShareLock))
+		return false;
+	rel = try_relation_open(relid, NoLock);
+	if (rel == NULL)
+		return false;
+	*toastrelid = rel->rd_rel->reltoastrelid;
+	indexes = RelationGetIndexList(rel);
+	relation_close(rel, NoLock);
+	foreach(lc, indexes)
+	{
+		if (!ConditionalLockRelationOid(lfirst_oid(lc), AccessShareLock))
+		{
+			ok = false;
+			break;
+		}
+	}
+	list_free(indexes);
+	return ok;
+}
+
+/*
+ * Lock gaps.<relname>, its TOAST table, and their indexes without waiting,
+ * and make cached plans depend on the table.  Returns false if the table is
+ * missing or any lock is not free right now.
+ *
+ * These are the locks the lookup's SPI queries take anyway (the planner
+ * opens the indexes, detoasting opens the TOAST table), taken first so that
+ * planning never waits for them: a plain EXPLAIN must not block behind
+ * someone's LOCK or REINDEX of the catalog.  Locks granted are kept to the
+ * end of the transaction, as the queries' own locks would be.
+ *
+ * The dependency replans on DDL, VACUUM or ANALYZE of the table, not on
+ * ordinary inserts and updates, which send no relcache invalidation for a
+ * user table.  So a cached plan's estimate can lag an edit of the model
+ * (doc/DESIGN.md, "Row estimates").
+ */
+static bool
+lock_catalog_table(Oid nsp, const char *relname, PlannerGlobal *glob)
+{
+	Oid			relid = get_relname_relid(relname, nsp);
+	Oid			toastrelid;
+	Oid			unused;
+
+	if (!OidIsValid(relid))
+		return false;
+	if (glob != NULL)
+		glob->relationOids = lappend_oid(glob->relationOids, relid);
+	if (!lock_with_indexes(relid, &toastrelid))
+		return false;
+	return !OidIsValid(toastrelid) || lock_with_indexes(toastrelid, &unused);
 }
 
 /*
@@ -183,7 +272,8 @@ estimate_rows(GapsSrf srf, Datum model, double *rows)
  * statement unkillable for the duration.
  */
 static bool
-estimate_rows_safely(GapsSrf srf, Datum model, double *rows)
+estimate_rows_safely(GapsSrf srf, Datum model, PlannerGlobal *glob,
+					 double *rows)
 {
 	MemoryContext oldcontext = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
@@ -195,7 +285,7 @@ estimate_rows_safely(GapsSrf srf, Datum model, double *rows)
 	{
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed");
-		ok = estimate_rows(srf, model, rows);
+		ok = estimate_rows(srf, model, glob, rows);
 		SPI_finish();
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcontext);
@@ -233,10 +323,24 @@ gaps_rows_support(PG_FUNCTION_ARGS)
 	char	   *fname;
 	GapsSrf		srf;
 	Node	   *arg;
+	PlannerGlobal *glob;
+	Oid			nsp;
 	double		rows;
 
-	/* A subtransaction cannot start in parallel mode. */
-	if (!IsA(rawreq, SupportRequestRows) || IsInParallelMode())
+	/*
+	 * No estimate in parallel mode: the worker has no use for one, the
+	 * leader having planned the query, and planning there should stay cheap
+	 * and inert.  No estimate during recovery either: a recovery conflict
+	 * that arrives while the lookup runs in its subtransaction terminates
+	 * the session rather than cancelling the query (postgres.c promotes it
+	 * to FATAL inside a subtransaction), and a row estimate is not worth a
+	 * session on a hot standby.  And none under SERIALIZABLE, where the
+	 * lookup's reads would take predicate locks on the catalog, so that
+	 * merely planning (an EXPLAIN, a branch never executed) could make a
+	 * transaction fail to serialize against a concurrent model edit.
+	 */
+	if (!IsA(rawreq, SupportRequestRows) || IsInParallelMode() ||
+		RecoveryInProgress() || IsolationIsSerializable())
 		PG_RETURN_POINTER(NULL);
 	req = (SupportRequestRows *) rawreq;
 	if (!is_funcclause(req->node) || ((FuncExpr *) req->node)->args == NIL)
@@ -266,10 +370,22 @@ gaps_rows_support(PG_FUNCTION_ARGS)
 	 * plan must be replanned for another role rather than show it this
 	 * role's estimate.
 	 */
-	if (req->root != NULL)
-		req->root->glob->dependsOnRole = true;
+	glob = req->root != NULL ? req->root->glob : NULL;
+	if (glob != NULL)
+		glob->dependsOnRole = true;
 
-	if (!estimate_rows_safely(srf, ((Const *) arg)->constvalue, &rows))
+	/*
+	 * The lookup's tables, locked without waiting.  The lookup reads
+	 * gaps.model, and gaps.attribute or gaps.factor; the catalog's policies
+	 * read only gaps.model.
+	 */
+	nsp = get_namespace_oid("gaps", true);
+	if (!OidIsValid(nsp) || !lock_catalog_table(nsp, "model", glob) ||
+		!lock_catalog_table(nsp, srf == SRF_LEARN_CPTS ? "factor" :
+							"attribute", glob))
+		PG_RETURN_POINTER(NULL);
+
+	if (!estimate_rows_safely(srf, ((Const *) arg)->constvalue, glob, &rows))
 		PG_RETURN_POINTER(NULL);
 	req->rows = rows;
 	PG_RETURN_POINTER(req);

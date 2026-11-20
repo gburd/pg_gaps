@@ -430,7 +430,44 @@ declared `ROWS` (1000 for `marginals` and `impute`, 10 for
 hidden, a relation has never been analyzed or has inheritance children, the
 caller may not see a column's statistics, or anything in the lookup raises
 an error, which a subtransaction catches so that planning never fails
-because of it (a query cancel still propagates).
+because of it (a query cancel still propagates).  With `row_security = off`
+the lookup's query on the catalog raises an error for any role that the
+catalog's policies would filter, so such a role gets no estimate.
+
+Planning never waits for a lock.  Before the lookup the support function
+takes `AccessShareLock` on `gaps.model` and on `gaps.attribute` (or
+`gaps.factor` for `learn_cpts`), their TOAST tables and all their indexes
+with `ConditionalLockRelationOid`, the locks the lookup's queries take
+anyway, and gives no estimate if any of them is not free, for instance
+during someone's `LOCK` or `REINDEX` of the catalog.  The locks it gets are
+held to the end of the transaction, as a query's would be.  The data
+tables are not locked: their `pg_class`, `pg_attribute` and `pg_statistic`
+rows are read through the syscache, which needs no lock on the table, and
+a table dropped meanwhile simply has no rows there.
+
+There is no estimate during recovery.  The lookup runs in a
+subtransaction, and on a hot standby a recovery conflict (a replayed
+`ACCESS EXCLUSIVE` lock, or cleanup of rows the snapshot can still see)
+that arrives inside a subtransaction terminates the session rather than
+cancelling the query (`postgres.c`, `ProcessRecoveryConflictInterrupt` in
+17 and 18, `report_recovery_conflict` in 19).  The conditional locks
+remove the lock wait but not the snapshot case, and a row estimate is not
+worth a session.  There is no estimate under `SERIALIZABLE` either, where
+the lookup's reads would take predicate locks on the catalog, so that
+planning alone (an `EXPLAIN`, a branch never executed) could make the
+transaction fail to serialize against a concurrent model edit.  Nor in
+parallel mode, where a worker has no use for an estimate.
+
+A cached plan depends on every data table it estimated and on the catalog
+tables the lookup read, so `ANALYZE`, `GRANT`, `REVOKE` or DDL on any of
+them replans it, and the estimate follows.  Ordinary inserts, updates and
+deletes send no invalidation for a user table, the catalog included, so a
+cached plan's estimate can lag an edit of the model (a new attribute, a
+dropped factor) until something else replans it.  Only the estimate lags:
+the plan calls the function, which reads the model as it is when it runs.
+The estimate also uses `reltuples` as `ANALYZE` or `VACUUM` stored it,
+without the planner's scaling by the table's current size, so after a bulk
+load without `ANALYZE` it lags the planner's own row count for the table.
 
 ### Security
 
