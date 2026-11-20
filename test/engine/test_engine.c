@@ -1061,6 +1061,66 @@ check_gibbs_nomix(void)
 }
 
 /*
+ * The chain's seed depends on the component and nothing else.  Three
+ * copies of a three-variable chain are separate components, sampled with
+ * sharing off; the third copy has one CPT entry moved by 1e-9.  The two
+ * equal copies must be bit-identical (a seed that depends on where a
+ * component sits in the network breaks that), and the third must differ
+ * from them by Monte Carlo noise, not by about 1e-9 (a seed that ignores
+ * the component runs the same chain on a near-identical model).
+ */
+static void
+check_gibbs_seed(void)
+{
+	uint64_t	cseed = 0;
+	int			card[9],
+				ev[9],
+				par[9];
+	double		pr[2] = {0.3, 0.7},
+				c1[4] = {0.8, 0.2, 0.35, 0.65},
+				c1b[4] = {0.8 + 1e-9, 0.2 - 1e-9, 0.35, 0.65},
+				c2[4] = {0.6, 0.4, 0.1, 0.9};
+	gx_cpt		cpts[9];
+	gx_bn		bn = {9, card, ev, 9, cpts};
+	gx_env		g = env;
+	gx_result	r;
+	double		d12 = 0,
+				d13 = 0;
+
+	for (int k = 0; k < 3; k++)
+	{
+		int			b = 3 * k;
+
+		for (int i = 0; i < 3; i++)
+		{
+			card[b + i] = 2;
+			ev[b + i] = -1;
+			par[b + i] = b + i - 1;
+		}
+		cpts[b] = (gx_cpt) {b, 0, NULL, pr};
+		cpts[b + 1] = (gx_cpt) {b + 1, 1, &par[b + 1], k == 2 ? c1b : c1};
+		cpts[b + 2] = (gx_cpt) {b + 2, 1, &par[b + 2], c2};
+	}
+	g.no_sharing = 1;
+	g.samples = GIBBS_N;
+	g.seed = 5;
+	g.sample_always = 1;
+	if (gx_infer(&g, &bn, &r) != GX_OK)
+		FAIL("gibbs seed: gx_infer failed");
+	for (int i = 0; i < 3; i++)
+	{
+		d12 = fmax(d12, fabs(M(&r, i, 0) - M(&r, 3 + i, 0)));
+		d13 = fmax(d13, fabs(M(&r, i, 0) - M(&r, 6 + i, 0)));
+	}
+	if (d12 != 0)
+		FAIL("gibbs seed: equal components differ by %g", d12);
+	if (!(d13 > 1e-6))
+		FAIL("gibbs seed: different components differ by only %g", d13);
+	free_result(&bn, &r);
+	nchecks++;
+}
+
+/*
  * The fallback as a user meets it: a grid of binary variables (loopy,
  * induced width about its side) with every factor bound set too low for
  * exact.  With samples 0 that is GX_ETOOBIG; with samples set, it is
@@ -1175,6 +1235,7 @@ main(int argc, char **argv)
 	check_star(1501);
 	check_star(100001);
 	check_gibbs_fallback();
+	check_gibbs_seed();
 	check_gibbs_nomix();
 	for (long i = 0; i < cases; i++)
 	{
