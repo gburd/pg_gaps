@@ -68,7 +68,7 @@ components too large to solve exactly.
 | 2 | pgmpy cross-check | done: 2,647 to 2,762 marginals per run agree to 1e-9 (`test/pgmpy`, flake check `pgmpy`) |
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
 | 2 | `SupportRequestRows` for the SRFs | **open** |
-| 2 | grounding cost | **open**: entity keys are typed composites, 1.9-2.0x faster (17 s for 2M variables on floki; `bench/RESULTS_GROUNDING_2026-11-20.md`); what remains is sorting integer instance rows (Phase 6) |
+| 2 | grounding cost | **open**: entity keys are typed composites and temp tables are reused per transaction: `marginals` 2.0-2.6x faster on the hotel workload (10.3 s for 2M variables on EC2), 1.7x on a 900-attribute model, 3 ms slower on a 2-attribute one (`bench/RESULTS_GROUNDING_2026-11-20.md`); what remains is sorting integer instance rows (Phase 6) |
 
 ## Phase 1: model catalog and validation
 
@@ -218,12 +218,22 @@ with a manual SQL formulation of the same possible-worlds computation.
 Grounding dominates: about 100 times the inference cost at 2M variables
 (`bench/RESULTS_SHARING_2026-11-19.md`).  Entity keys are now typed
 composites joined once per step, with jsonb built only for reported
-variables: 1.9-2.0x faster at 200,000 and 2M variables, A/A checked
-(`bench/RESULTS_GROUNDING_2026-11-20.md`).  No step is dominated by keys
-any more; a third of what is left is the coverage check and array
-assembly, sorts over integer instance rows.  Next: fold the coverage
-check into building the instances, and measure assembling the engine's
-arrays in C over SPI.  Then costs for every SRF from model
+variables, and the entity tables are created once per transaction per
+key shape and truncated after: on EC2, `marginals` is 2.0-2.6x faster at
+200,000 and 2M variables and 1.7x on a 900-attribute model, A/A checked,
+and 3 ms (25-30%) slower on a 2-attribute model, from creating the
+tables in each transaction (`bench/RESULTS_GROUNDING_2026-11-20.md`).
+No step is dominated by keys any more; a third of what is left is the
+coverage check and array assembly, sorts over integer instance rows.
+Next: fold the coverage check into building the instances, and measure
+assembling the engine's arrays in C over SPI.
+
+Grounding reads the user's tables in many statements, so under READ
+COMMITTED a concurrent commit can make its steps disagree.  It detects
+the case it can see (a mapped parent row with no entity) and recommends
+REPEATABLE READ (doc/DESIGN.md, "Snapshots"); **open**: grounding under
+one snapshot at any isolation level, which needs the reads in C over SPI
+with one registered snapshot, and fits with moving the assembly there.  Then costs for every SRF from model
 statistics (component sizes, distinct evidence signatures), so plans are
 reasonable without hints.  A custom scan only if a measurement shows the
 SRF form costs something real; otherwise this phase closes with that
