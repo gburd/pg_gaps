@@ -528,6 +528,14 @@ $$;
 -- Inference.
 --
 
+-- The row estimate of a call to marginals, impute or learn_cpts with a
+-- constant model name, from the catalog and the planner statistics
+-- (doc/DESIGN.md, "Row estimates").  Without one, the planner uses the
+-- function's declared ROWS.
+CREATE FUNCTION gaps._rows_support(internal) RETURNS internal
+AS 'MODULE_PATHNAME', 'gaps_rows_support'
+LANGUAGE C STRICT STABLE;
+
 CREATE FUNCTION gaps._infer(card int[], evidence int[], child int[], parent_off int[],
 							parents int[], cpt_off int[], cpts float8[],
 							OUT var int, OUT value int, OUT probability float8,
@@ -808,6 +816,7 @@ CREATE FUNCTION gaps.marginals(model text,
 	OUT probability float8, OUT component int, OUT method text)
 RETURNS SETOF record
 LANGUAGE plpgsql
+ROWS 1000 SUPPORT gaps._rows_support
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
@@ -836,6 +845,7 @@ CREATE FUNCTION gaps.impute(model text,
 	OUT probability float8, OUT component int, OUT method text)
 RETURNS SETOF record
 LANGUAGE plpgsql
+ROWS 1000 SUPPORT gaps._rows_support
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
@@ -869,6 +879,7 @@ CREATE FUNCTION gaps.learn_cpts(model text, alpha float8 DEFAULT 1.0,
 	OUT factor text, OUT complete_entities bigint)
 RETURNS SETOF record
 LANGUAGE plpgsql
+ROWS 10 SUPPORT gaps._rows_support
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
