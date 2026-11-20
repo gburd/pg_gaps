@@ -39,7 +39,6 @@
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -125,7 +124,8 @@ estimate_rows(GapsSrf srf, Datum model, double *rows)
 {
 	static const char *const factors_sql =
 		"SELECT (SELECT pg_catalog.count(*) FROM gaps.factor f "
-		"WHERE f.model_id OPERATOR(pg_catalog.=) m.model_id)::pg_catalog.float8 "
+		"WHERE f.model_id OPERATOR(pg_catalog.=) m.model_id)"
+		"::pg_catalog.float8 "
 		"FROM gaps.model m WHERE m.name OPERATOR(pg_catalog.=) $1";
 	static const char *const attributes_sql =
 		"SELECT a.rel::pg_catalog.oid, a.attname::pg_catalog.text, "
@@ -134,18 +134,19 @@ estimate_rows(GapsSrf srf, Datum model, double *rows)
 		"ON a.model_id OPERATOR(pg_catalog.=) m.model_id "
 		"WHERE m.name OPERATOR(pg_catalog.=) $1";
 	Oid			argtype = TEXTOID;
+	const char *sql = srf == SRF_LEARN_CPTS ? factors_sql : attributes_sql;
 	TupleDesc	desc;
 	bool		isnull;
 
-	if (SPI_execute_with_args(srf == SRF_LEARN_CPTS ? factors_sql : attributes_sql,
-							  1, &argtype, &model, NULL, true, 0) != SPI_OK_SELECT ||
-		SPI_processed == 0)
+	if (SPI_execute_with_args(sql, 1, &argtype, &model, NULL, true, 0) !=
+		SPI_OK_SELECT || SPI_processed == 0)
 		return false;
 	desc = SPI_tuptable->tupdesc;
 
 	if (srf == SRF_LEARN_CPTS)
 	{
-		*rows = DatumGetFloat8(SPI_getbinval(SPI_tuptable->vals[0], desc, 1, &isnull));
+		*rows = DatumGetFloat8(SPI_getbinval(SPI_tuptable->vals[0], desc, 1,
+											 &isnull));
 		return true;
 	}
 
