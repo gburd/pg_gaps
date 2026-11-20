@@ -526,7 +526,7 @@ ERROR:  CPT 1 needs 2 values from its offset
 SELECT * FROM gaps._infer('{2}', '{0}', '{2}', '{1,1}', '{}', '{1}', '{0.5,0.5}');  -- fail
 ERROR:  CPT 1 names child 2
 SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,2}', '{1}', '{1}', '{0.5,0.5,0.5,0.5}');   -- fail
-ERROR:  malformed ground network at variable 1 (code 4)
+ERROR:  the ground network has a directed cycle through variable 1
 DROP TABLE sensor, reading;
 SELECT gaps.drop_model('m');
  drop_model 

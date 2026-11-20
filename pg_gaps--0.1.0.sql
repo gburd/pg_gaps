@@ -130,8 +130,9 @@ GRANT USAGE ON SEQUENCE gaps.model_model_id_seq, gaps.attribute_attribute_id_seq
 --
 
 -- Resolve an attribute row against the live catalogs, failing with a
--- message naming what changed since it was declared.  Returns the column's
--- current type.
+-- message naming what changed since it was declared: the relation, the
+-- column, its type, an entity key, or a column an entity set selects on.
+-- Returns the column's current type.
 CREATE FUNCTION gaps._resolve(a gaps.attribute) RETURNS text
 LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog, pg_temp
@@ -139,6 +140,8 @@ AS $$
 DECLARE
 	cur text;
 	typ text;
+	qstripe text;
+	qcol name;
 BEGIN
 	SELECT c.oid::regclass::text INTO cur FROM pg_class c WHERE c.oid = a.rel;
 	IF cur IS NULL OR cur <> a.relname THEN
@@ -166,6 +169,17 @@ BEGIN
 				a.entity_keys[i], a.relname;
 		END IF;
 	END LOOP;
+	SELECT s.name, q.attname INTO qstripe, qcol
+	FROM gaps.stripe s JOIN gaps.stripe_qual q USING (stripe_id)
+	WHERE s.attribute_id = a.attribute_id
+	  AND NOT EXISTS (SELECT 1 FROM pg_attribute t
+					  WHERE t.attrelid = a.rel AND t.attname = q.attname
+						AND t.attnum > 0 AND NOT t.attisdropped)
+	ORDER BY s.name, q.ord LIMIT 1;
+	IF FOUND THEN
+		RAISE EXCEPTION 'column "%" of relation "%" in the entity set of stripe "%" no longer exists',
+			qcol, a.relname, qstripe;
+	END IF;
 	RETURN typ;
 END
 $$;
@@ -521,6 +535,388 @@ BEGIN
 	END IF;
 	PERFORM gaps._cpt_check(x.factor_id, true) FROM gaps.factor x
 	WHERE x.model_id = gaps._model_id(model) AND x.name = set_cpt.factor;
+END
+$$;
+
+--
+-- Structural validity [W11 3.3.2] (doc/DESIGN.md, "Validity").
+--
+
+-- Whether "v1 op v2" holds for two constants of a column, compared as
+-- grounding compares them: cast to the column's type, in the column's
+-- collation.  op is one of the operators gaps.stripe_qual allows.
+CREATE FUNCTION gaps._qual_holds(typ text, coll oid, v1 text, op text, v2 text)
+RETURNS boolean
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	coll_clause text := '';
+	r boolean;
+BEGIN
+	IF coll <> 0 THEN
+		SELECT format(' COLLATE %I.%I', n.nspname, c.collname) INTO coll_clause
+		FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace
+		WHERE c.oid = coll;
+	END IF;
+	EXECUTE format('SELECT ($1)::%s%s %s ($2)::%s', typ, coll_clause, op, typ) INTO r USING v1, v2;
+	RETURN r;
+END
+$$;
+
+-- Whether the quals on a column of type typ can be reasoned about as a
+-- total order.  True when the operators grounding applies to two values of
+-- typ (gaps._stripe_where writes "col op const::typ" under search_path
+-- pg_catalog, so these are the pg_catalog operators taking typ on both
+-- sides) are <, <=, =, >= and > of one btree operator family, at their
+-- btree strategies, and <> is the negator of that =.  Then = is an
+-- equivalence and the order is total and consistent with it, which is what
+-- the contradiction rules of gaps._may_share_rvs assume.  Box, for one, has
+-- all six operators and = compares areas, so it fails here.
+--
+-- Also requires the type's input function to be immutable.  A stable one
+-- (date, timestamp, timestamptz, time, timetz, interval, money, the reg*
+-- types) parses a constant by TimeZone, DateStyle, IntervalStyle or
+-- lc_monetary, so a proof over its constants would hold only for the
+-- session's settings.
+--
+-- shortcut: a type with no operators of its own (varchar, a domain) fails,
+-- although grounding resolves its quals to the base type's operators;
+-- resolve through binary coercion if such proofs are wanted.
+CREATE FUNCTION gaps._total_order(typ oid) RETURNS boolean
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+	SELECT (SELECT p.provolatile = 'i' FROM pg_type t JOIN pg_proc p ON p.oid = t.typinput
+			WHERE t.oid = typ)
+	   AND EXISTS (
+		SELECT 1
+		FROM pg_operator o
+			JOIN pg_amop am ON am.amopopr = o.oid
+			JOIN pg_am ON pg_am.oid = am.amopmethod AND pg_am.amname = 'btree'
+		WHERE o.oprnamespace = 'pg_catalog'::regnamespace
+		  AND o.oprleft = typ AND o.oprright = typ
+		  AND (o.oprname, am.amopstrategy) IN (('<', 1), ('<=', 2), ('=', 3),
+											   ('>=', 4), ('>', 5))
+		  AND (o.oprname <> '=' OR EXISTS (
+				SELECT 1 FROM pg_operator ne
+				WHERE ne.oprnamespace = 'pg_catalog'::regnamespace AND ne.oprname = '<>'
+				  AND ne.oprleft = typ AND ne.oprright = typ AND ne.oprnegate = o.oid))
+		GROUP BY am.amopfamily
+		HAVING count(DISTINCT o.oprname) = 5)
+$$;
+
+-- Whether each entity of attribute att is one row, so that a qual on any
+-- column of the relation is fixed per entity.  That holds when the entity
+-- keys include the primary key, the key is checked on every statement (not
+-- deferrable), and the relation has no inheritance children or partitions,
+-- which grounding reads too and the key does not cover.  Otherwise only
+-- quals on the entity keys are fixed per entity: rows of one coarse entity
+-- may fall on both sides of a qual on another column (AGENTS.md rule 19).
+CREATE FUNCTION gaps._whole_rows(att int) RETURNS boolean
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+	SELECT EXISTS (
+		SELECT 1 FROM pg_index i
+		WHERE i.indrelid = a.rel AND i.indisprimary AND i.indimmediate
+		  AND NOT EXISTS (SELECT 1 FROM unnest(i.indkey) k(attnum)
+							JOIN pg_attribute t ON t.attrelid = a.rel AND t.attnum = k.attnum
+						  WHERE t.attname <> ALL (a.entity_keys)))
+		AND NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = a.rel)
+	FROM gaps.attribute a WHERE a.attribute_id = att
+$$;
+
+-- Whether stripes s1 and s2 may share a random variable, decided from the
+-- catalog alone, for any table contents.  They share one when they are over
+-- the same attribute and their entity sets meet.  The answer is false only
+-- when that is impossible: the attributes differ, or two quals of the
+-- stripes (from either one, so a stripe whose own quals contradict is
+-- empty) contradict each other on a column that is fixed per entity and
+-- whose type is a total order (gaps._total_order).  A column is fixed per
+-- entity when it is an entity key, or on any column when whole_rows, which
+-- the caller passes as gaps._whole_rows of s1's attribute.
+--
+-- Two quals contradict when one is "= c" and c fails the other, or one is a
+-- lower bound (>, >=) above the other's upper bound (<, <=), or both meet
+-- at one constant and either is strict.  These hold when the operators are
+-- a btree total order, which the column test requires, so the test is
+-- sound.  It is not complete: "<>" never contradicts anything but "=", and
+-- a discrete type's gaps (s > 1 AND s < 2 over int) are not seen, so such
+-- pairs count as may share.
+--
+-- Examines only the columns the quals name, so for stripes with n1 and n2
+-- quals it makes at most n1 + n2 column tests and (n1 + n2)^2 constant
+-- comparisons, whatever the width of the relation; gaps.validate bounds the
+-- total.
+CREATE FUNCTION gaps._may_share_rvs(s1 int, s2 int, whole_rows boolean) RETURNS boolean
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	att int;
+	rel regclass;
+	keys name[];
+	q record;
+BEGIN
+	SELECT s.attribute_id, a.rel, a.entity_keys INTO att, rel, keys
+	FROM gaps.stripe s JOIN gaps.attribute a USING (attribute_id)
+	WHERE s.stripe_id = s1;
+	IF att IS DISTINCT FROM (SELECT s.attribute_id FROM gaps.stripe s WHERE s.stripe_id = s2) THEN
+		RETURN false;
+	END IF;
+	IF NOT EXISTS (SELECT 1 FROM gaps.stripe_qual sq WHERE sq.stripe_id IN (s1, s2)) THEN
+		RETURN true;
+	END IF;
+
+	-- The columns the quals name that the rules may use, then every ordered
+	-- pair of quals on one of them, so each rule below needs to look at one
+	-- order only.  The first CTE is materialized so that gaps._total_order
+	-- runs once per named column, not over every column of rel.
+	FOR q IN WITH named AS MATERIALIZED (
+				SELECT t.attname, t.atttypid, format_type(t.atttypid, t.atttypmod) AS typ,
+					   t.attcollation AS coll
+				FROM pg_attribute t
+				WHERE t.attrelid = rel AND t.attnum > 0 AND NOT t.attisdropped
+				  AND t.attname IN (SELECT sq.attname FROM gaps.stripe_qual sq
+									WHERE sq.stripe_id IN (s1, s2))
+				  AND (whole_rows OR t.attname = ANY (keys))),
+			 fixed AS MATERIALIZED (
+				SELECT n.attname, n.typ, n.coll FROM named n WHERE gaps._total_order(n.atttypid))
+			 SELECT x.op AS op1, x.value AS v1, y.op AS op2, y.value AS v2, c.typ, c.coll
+			 FROM gaps.stripe_qual x
+				JOIN gaps.stripe_qual y ON y.attname = x.attname
+				JOIN fixed c ON c.attname = x.attname
+			 WHERE x.stripe_id IN (s1, s2) AND y.stripe_id IN (s1, s2) LOOP
+		IF q.op1 = '=' AND NOT gaps._qual_holds(q.typ, q.coll, q.v1, q.op2, q.v2) THEN
+			RETURN false;
+		END IF;
+		-- A lower bound v1 and an upper bound v2 leave nothing between them
+		-- when v1 > v2, or when v1 = v2 and either bound excludes it.
+		IF q.op1 IN ('>', '>=') AND q.op2 IN ('<', '<=')
+		   AND gaps._qual_holds(q.typ, q.coll, q.v1,
+								CASE WHEN q.op1 = '>=' AND q.op2 = '<=' THEN '>' ELSE '>=' END,
+								q.v2) THEN
+			RETURN false;
+		END IF;
+	END LOOP;
+	RETURN true;
+END
+$$;
+
+-- Render a cycle of the factor graph built by gaps.validate, given in edge
+-- order (cyc[i] -> cyc[i + 1], and the last back to the first), as its
+-- stripes: "p -> c" for a factor's parent and child, "c ~ p" where the
+-- child of one factor may share RVs with a parent of the next, and a single
+-- name where they are the same stripe.  ef, eg and ep are the graph's
+-- edges and each edge's witness parent stripe.
+CREATE FUNCTION gaps._render_cycle(cyc int[], ef int[], eg int[], ep text[]) RETURNS text
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	k int := cardinality(cyc);
+	out text;
+	first text;
+	pin text;
+	prev text;
+	cname text;
+BEGIN
+	FOR i IN 1 .. k LOOP
+		SELECT e.p INTO pin FROM unnest(ef, eg, ep) e(f, g, p)
+		WHERE e.f = cyc[CASE WHEN i = 1 THEN k ELSE i - 1 END] AND e.g = cyc[i];
+		SELECT s.name INTO cname FROM gaps.factor fa JOIN gaps.stripe s
+			ON s.stripe_id = fa.child_stripe WHERE fa.factor_id = cyc[i];
+		IF i = 1 THEN
+			out := pin;
+			first := pin;
+		ELSIF pin <> prev THEN
+			out := out || ' ~ ' || pin;
+		END IF;
+		out := out || ' -> ' || cname;
+		prev := cname;
+	END LOOP;
+	IF prev <> first THEN
+		out := out || ' ~ ' || first;
+	END IF;
+	RETURN (SELECT format('factors %s: ', string_agg(fa.name, ', ' ORDER BY u.i))
+			FROM unnest(cyc) WITH ORDINALITY u(id, i) JOIN gaps.factor fa ON fa.factor_id = u.id)
+		|| out;
+END
+$$;
+
+-- The dependency-graph check of [W11 3.3.2]: whether the model's ground
+-- network is acyclic for every table contents, decided from the catalog
+-- alone, without reading or grounding any data.
+--
+-- The graph has a node per factor and an edge f -> g when f's child stripe
+-- may share an RV with a parent stripe of g (gaps._may_share_rvs).  A ground
+-- edge runs from an RV of a parent stripe of f to an RV of f's child
+-- stripe; for a path to continue, that RV must also be in a parent stripe
+-- of the next factor.  So every ground cycle follows a cycle of this graph,
+-- and an acyclic graph proves the ground network acyclic.  A self-loop is
+-- the thesis's within-factor precondition failing (T2423-2424); a longer
+-- cycle is its cycle of alternating directed and undirected edges.
+--
+-- Returns two rows.  'within-factor': no factor's child may share an RV
+-- with one of its own parents.  'dependency graph': no cycle through two or
+-- more factors.  When both are ok the model grounds to an acyclic network
+-- whatever the data.  A row that is not ok proves nothing: the cycle may
+-- not exist in the ground network (Fig. 3.5's phi3 style is fine, a
+-- one-to-many walk through time is fine), and grounding checks the ground
+-- network exactly (gx_check) in any case.  The detail names what was found.
+--
+-- The proof is for the catalogs and session as they are when it runs.  It
+-- does not survive DDL on the tables (a key dropped or made deferrable, a
+-- child table added).  Constants are text cast at use, so grounding parses
+-- them under the caller's TimeZone and DateStyle and the model's meaning
+-- already depends on the session; validate reasons only about types whose
+-- input is immutable (gaps._total_order), so its verdict does not, and any
+-- other type's quals count as may share.
+--
+-- Cost: the attributes are resolved first, as grounding resolves them.
+-- Before anything else, models are limited to 100 factors and 20000 parent
+-- slots (gaps.factor_parent rows), since a parent with a one-value domain
+-- leaves the slot count unbounded by the CPT.  Then each distinct pair of a
+-- child stripe and a parent stripe on one attribute is tested once
+-- (gaps._may_share_rvs, which looks only at the columns the pair's quals
+-- name); a pair whose stripes have n1 and n2 quals counts 10 + (n1 + n2)^2
+-- (the test's fixed cost, then a bound on its column tests and qual
+-- comparisons), and the sum over the pairs is limited to 200000 before any
+-- test runs.  So validate makes at most 20000 pair tests and 200000 qual
+-- comparisons.  Building the edges joins each pair to the factors over its
+-- stripes, at most F x slots = 2000000 rows.  The cycle search makes at
+-- most F passes over at most F^2 edges for F factors.  On the development
+-- host the worst models measured take under 7 s (6.9 s for 19900 pairs
+-- and 1990000 edge rows, 5.1 s for 100 factors sharing 20000 slots, 2.0 s
+-- for one pair of 444 quals).  Grounding does not call this: gx_check
+-- finds ground cycles exactly in time linear in the ground network, so a
+-- structural proof saves it nothing.
+CREATE FUNCTION gaps.validate(model text, OUT test text, OUT ok boolean, OUT detail text)
+RETURNS SETOF record
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	m int := gaps._model_id(model);
+	nf int;
+	np bigint;
+	ncmp bigint;
+	pc int[];
+	pp int[];
+	ef int[];
+	eg int[];
+	ep text[];
+	selfloops text;
+	alive int[];
+	removed int[];
+	path int[];
+	pred int;
+BEGIN
+	PERFORM gaps._resolve(a) FROM gaps.attribute a WHERE a.model_id = m ORDER BY a.attribute_id;
+	SELECT count(*) INTO nf FROM gaps.factor fa WHERE fa.model_id = m;
+	IF nf > 100 THEN
+		RAISE EXCEPTION 'model "%" has % factors; gaps.validate handles at most 100', model, nf
+			USING HINT = 'Grounding (gaps.marginals) still checks the ground network for cycles exactly.';
+	END IF;
+	SELECT count(*) INTO np FROM gaps.factor_parent fp JOIN gaps.factor fa USING (factor_id)
+	WHERE fa.model_id = m;
+	IF np > 20000 THEN
+		RAISE EXCEPTION 'model "%" has % parent slots; gaps.validate handles at most 20000',
+			model, np
+			USING HINT = 'Grounding (gaps.marginals) still checks the ground network for cycles exactly.';
+	END IF;
+
+	-- The distinct (child stripe, parent stripe) pairs on one attribute, and
+	-- what testing them all costs, in the units of the header comment.
+	SELECT coalesce(array_agg(x.c), '{}'), coalesce(array_agg(x.p), '{}') INTO pc, pp
+	FROM (SELECT DISTINCT f.child_stripe AS c, gp.parent_stripe AS p
+		  FROM gaps.factor f
+			JOIN gaps.stripe cs ON cs.stripe_id = f.child_stripe
+			JOIN gaps.factor g ON g.model_id = f.model_id
+			JOIN gaps.factor_parent gp ON gp.factor_id = g.factor_id
+			JOIN gaps.stripe ps ON ps.stripe_id = gp.parent_stripe
+		  WHERE f.model_id = m AND ps.attribute_id = cs.attribute_id) x;
+	SELECT coalesce(sum(10 + ((SELECT count(*) FROM gaps.stripe_qual q WHERE q.stripe_id = x.c)
+							 + (SELECT count(*) FROM gaps.stripe_qual q WHERE q.stripe_id = x.p))
+							^ 2), 0)
+	INTO ncmp FROM unnest(pc, pp) x(c, p);
+	IF ncmp > 200000 THEN
+		RAISE EXCEPTION 'model "%" needs % units of stripe tests; gaps.validate allows 200000',
+			model, ncmp
+			USING HINT = 'Grounding (gaps.marginals) still checks the ground network for cycles exactly.';
+	END IF;
+
+	-- The edges, each with one witness parent of g, and the self-loops.
+	SELECT coalesce(array_agg(x.f ORDER BY x.f, x.g), '{}'),
+		   coalesce(array_agg(x.g ORDER BY x.f, x.g), '{}'),
+		   coalesce(array_agg(x.p ORDER BY x.f, x.g), '{}'),
+		   string_agg(format('factor "%s": child "%s" may share RVs with parent "%s"',
+							 x.fname, x.c, x.p), '; ' ORDER BY x.fname) FILTER (WHERE x.f = x.g)
+	INTO ef, eg, ep, selfloops
+	FROM (WITH entity AS MATERIALIZED (
+			SELECT a.attribute_id, gaps._whole_rows(a.attribute_id) AS whole_rows
+			FROM gaps.attribute a
+			WHERE a.attribute_id IN (SELECT s.attribute_id FROM unnest(pc) u(c)
+										JOIN gaps.stripe s ON s.stripe_id = u.c)),
+		  share AS MATERIALIZED (
+			SELECT u.c, u.p FROM unnest(pc, pp) u(c, p)
+				JOIN gaps.stripe s ON s.stripe_id = u.c
+				JOIN entity e ON e.attribute_id = s.attribute_id
+			WHERE gaps._may_share_rvs(u.c, u.p, e.whole_rows))
+		  SELECT f.factor_id AS f, g.factor_id AS g, f.name AS fname, cs.name AS c,
+				 min(ps.name) AS p
+		  FROM gaps.factor f
+			JOIN gaps.stripe cs ON cs.stripe_id = f.child_stripe
+			JOIN share x ON x.c = f.child_stripe
+			JOIN (SELECT DISTINCT fp.factor_id, fp.parent_stripe
+				  FROM gaps.factor_parent fp JOIN gaps.factor g USING (factor_id)
+				  WHERE g.model_id = m) gp ON gp.parent_stripe = x.p
+			JOIN gaps.factor g ON g.factor_id = gp.factor_id
+			JOIN gaps.stripe ps ON ps.stripe_id = gp.parent_stripe
+		  WHERE f.model_id = m
+		  GROUP BY f.factor_id, g.factor_id, f.name, cs.name) x;
+	test := 'within-factor';
+	ok := selfloops IS NULL;
+	detail := coalesce(selfloops, 'no child stripe may share an RV with its own parents');
+	RETURN NEXT;
+
+	-- Kahn's algorithm, ignoring self-loops: repeatedly remove the factors
+	-- with no edge from a remaining factor.  What remains lies on or behind
+	-- a cycle.
+	alive := ARRAY(SELECT fa.factor_id FROM gaps.factor fa WHERE fa.model_id = m ORDER BY 1);
+	LOOP
+		removed := ARRAY(SELECT u.id FROM unnest(alive) u(id)
+						 EXCEPT
+						 SELECT e.g FROM unnest(ef, eg) e(f, g)
+							JOIN unnest(alive) u(id) ON u.id = e.f
+						 WHERE e.f <> e.g);
+		EXIT WHEN cardinality(removed) = 0;
+		alive := ARRAY(SELECT u.id FROM unnest(alive) u(id) WHERE u.id <> ALL (removed));
+	END LOOP;
+	test := 'dependency graph';
+	ok := cardinality(alive) = 0;
+	IF ok THEN
+		detail := 'no cycle through two or more factors';
+		RETURN NEXT;
+		RETURN;
+	END IF;
+
+	-- Every remaining factor has a predecessor that remains, so walking
+	-- predecessors from one of them repeats a factor within cardinality(alive)
+	-- steps.  The walk runs against the edges; reversed, its tail from the
+	-- repeated factor is a cycle in edge order.
+	path := ARRAY[alive[1]];
+	LOOP
+		SELECT min(e.f) INTO pred FROM unnest(ef, eg) e(f, g)
+		WHERE e.g = path[cardinality(path)] AND e.f <> e.g AND e.f = ANY (alive);
+		EXIT WHEN pred = ANY (path);
+		path := path || pred;
+	END LOOP;
+	path := ARRAY(SELECT path[i] FROM generate_series(cardinality(path),
+													  array_position(path, pred), -1) i);
+	detail := 'may have a cycle through ' || gaps._render_cycle(path, ef, eg, ep);
+	RETURN NEXT;
 END
 $$;
 

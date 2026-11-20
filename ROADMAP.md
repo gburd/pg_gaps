@@ -49,7 +49,7 @@ Each has a recommendation.  None blocks Phase 0, which is done.
 
 ## Status, 2026-11-19
 
-Phases 1 and 2 are built, with three items each still open (below).
+Phase 1 is done.  Phase 2 is built, with two items still open (below).
 Engine and SQL interface gated on PG 17.12, 18.7 and 19.0 (nixpkgs with
 clang; PGDG on Fedora 44 with gcc 16 and `-Werror`).  Exact inference
 already handles vertical correlations (any component the size bounds
@@ -60,7 +60,8 @@ components too large to solve exactly.
 |---|---|---|
 | 1 | catalog, triggers, row-level security, declaration functions | done (`sql/catalog.sql`) |
 | 1 | data-dependent validity: coverage, mappings total, evidence consistent, cycles | done (`sql/infer.sql`) |
-| 1 | the dependency-graph check before grounding [W11 3.3.2] | **open**: cycles are found on the ground network instead (gx_check), which is exact but needs the data |
+| 1 | the dependency-graph check before grounding [W11 3.3.2] | done: `gaps.validate`, sound from the predicates alone, no lineage trace; grounding keeps gx_check (`sql/validate.sql`, 500 random models, row and coarse entities); one review, its 4 counterexamples fixed; re-review's two cost holes fixed (only qual-named columns examined; at most 20000 parent slots), worst measured model under 7 s |
+| 1 | store `stripe_qual` constants in canonical form (cast to the column type and back at `add_stripe_qual`) | **open**: constants are text cast at use, so a model over `timestamptz`, `date`, `interval` or `money` columns means different things under different TimeZone, DateStyle, IntervalStyle or lc_monetary; `validate` refuses to reason about those types meanwhile. Catalog change |
 | 1 | `pg_dump` / restore test | done (`test/dump`; in the flake, CI and `dev/qualify-pgdg.sh`; fails if one config table is not registered) |
 | 1 | dropped or altered table names the change | done: rename, type change and drop each refused with the name (`test/dump`) |
 | 2 | engine: exact inference, bucket tree, log space, bounds, sharing | done; brute-force oracle, closed forms, allocation failure (`test/engine`); two independent reviews |
@@ -97,9 +98,11 @@ Delivers:
 - Data-dependent validity (DESIGN.md "Validity"): within each factor the
   child stripe shares no RV with a parent; every mapping is total on the
   child entities; every value of a declared attribute, present or
-  missing, is covered by exactly one child stripe; the dependency-graph
-  check [W11 3.3.2] with the lineage trace on a cycle.  Run at `validate`
-  and again at every grounding.
+  missing, is covered by exactly one child stripe; no directed cycle.
+  Checked at every grounding.  Before grounding, `validate` runs the
+  dependency-graph check [W11 3.3.2] from the catalog alone; it proves
+  acyclicity or names the cycle it found, and does not trace lineage, so
+  a cycle there is not a rejection.
 - Privilege checks on every referenced column, as the caller.
 
 Done when: regression tests cover each rejection with a `-- fail` case and

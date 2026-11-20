@@ -147,7 +147,12 @@ check_cpt(const gx_bn *bn, const gx_cpt *c, unsigned char *mark, int *bad_var)
 			int			p = c->parents[j];
 
 			if (p < 0 || p >= bn->nvars || p == c->child || mark[p])
+			{
+				/* A variable that is its own parent is a cycle of length 1. */
+				if (p == c->child)
+					rc = GX_ECYCLE;
 				break;
+			}
 			mark[p] = 1;
 			/* The caller bounds table sizes; this only guards the scan below. */
 			if (n > SIZE_MAX / (size_t) bn->card[p])

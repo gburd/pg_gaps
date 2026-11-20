@@ -360,8 +360,8 @@ check_errors(void)
 	if (gx_check(&env, &bn, &bad) != GX_EINVAL)
 		FAIL("two CPTs for one variable were not rejected");
 	bn.cpts = self;
-	if (gx_check(&env, &bn, &bad) != GX_EINVAL || bad != 0)
-		FAIL("a variable that is its own parent was not rejected");
+	if (gx_check(&env, &bn, &bad) != GX_ECYCLE || bad != 0)
+		FAIL("a variable that is its own parent was not rejected as GX_ECYCLE");
 	bn.cpts = neg;
 	if (gx_check(&env, &bn, &bad) != GX_EINVAL || bad != 0)
 		FAIL("a negative CPT entry was not rejected");
