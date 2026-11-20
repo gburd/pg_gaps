@@ -67,7 +67,7 @@ components too large to solve exactly.
 | 2 | `marginals`, `impute`, `learn_cpts` | done (`sql/infer.sql`, `sql/learn.sql`) |
 | 2 | pgmpy cross-check | done: 2,647 to 2,762 marginals per run agree to 1e-9 (`test/pgmpy`, flake check `pgmpy`) |
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
-| 2 | `SupportRequestRows` for the SRFs | **open** |
+| 2 | `SupportRequestRows` for the SRFs | done: catalog plus `stanullfrac` estimate, under the `pg_stats` visibility rule; ROWS fallback (`sql/rows.sql`) |
 | 2 | grounding cost | **open**: about 100x the inference cost (23 s for 2M variables); jsonb entity keys are next (Phase 6) |
 
 ## Phase 1: model catalog and validation

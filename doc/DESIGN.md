@@ -398,6 +398,40 @@ Randomized algorithms take a seed and a sample count from the call or
 from GUCs (`gaps.seed`, `gaps.samples`) and are deterministic given them,
 so test output is stable.
 
+### Row estimates
+
+`gaps.marginals`, `gaps.impute` and `gaps.learn_cpts` have a planner
+support function, `gaps._rows_support` (`src/gaps_support.c`), that
+answers `SupportRequestRows` when the model name is a constant (a literal,
+or a bound parameter in a custom plan).  It reads the catalog and the
+planner statistics, never user data:
+
+- `marginals`: the sum over the model's attributes of
+  `reltuples * null_frac * |domain|`, one row per (missing value, domain
+  value);
+- `impute`: the same sum without `|domain|`, one row per missing value;
+- `learn_cpts`: the number of factors.
+
+`null_frac` is the column's `pg_statistic.stanullfrac`.  On a table that
+ANALYZE samples completely the estimate is exact; otherwise it is as good
+as the column statistics.  It ignores stripe predicates, because every
+random variable of an attribute is one of its entities whatever its
+stripes, and it ignores coarse entity keys (several rows sharing one
+variable), so for those it overestimates by the rows-per-entity ratio.
+
+The lookup runs as the caller through read-only SPI, so the catalog's
+row-level security hides a model the caller cannot read, and the statistics
+are used only under the rule of the `pg_stats` view: SELECT on the column
+and no row-level security active on the table for the caller.  Because
+row-level security makes the estimate depend on the role, the plan is
+marked role-dependent.  There is no estimate, and the planner uses the
+declared `ROWS` (1000 for `marginals` and `impute`, 10 for
+`learn_cpts`), when the name is not a constant, the model is missing or
+hidden, a relation has never been analyzed or has inheritance children, the
+caller may not see a column's statistics, or anything in the lookup raises
+an error, which a subtransaction catches so that planning never fails
+because of it (a query cancel still propagates).
+
 ### Security
 
 The extension is **not trusted** (`trusted = false`, the default) until a
