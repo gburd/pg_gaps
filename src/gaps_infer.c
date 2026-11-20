@@ -300,6 +300,7 @@ gaps_infer(PG_FUNCTION_ARGS)
 	gx_env		env;
 	gx_result	res;
 	int			bad;
+	int			rc;
 	MemoryContext work,
 				old;
 
@@ -332,8 +333,14 @@ gaps_infer(PG_FUNCTION_ARGS)
 	env.seed = (uint64_t) gaps_seed;
 	env.sample_always = 0;
 
-	report(gx_check(&env, &bn, &bad), bad, NULL);
-	report(gx_infer(&env, &bn, &res), res.bad_var, &res);
+	/*
+	 * The engine call must finish before bad or res is read: C does not
+	 * order the evaluation of a call's arguments.
+	 */
+	rc = gx_check(&env, &bn, &bad);
+	report(rc, bad, NULL);
+	rc = gx_infer(&env, &bn, &res);
+	report(rc, res.bad_var, &res);
 
 	MemoryContextSwitchTo(old);
 	for (int v = 0; v < bn.nvars; v++)
