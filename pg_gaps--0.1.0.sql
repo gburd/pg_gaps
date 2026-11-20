@@ -793,6 +793,35 @@ BEGIN
 END
 $$;
 
+-- A step of gaps._ground: the ord-0 instances of factor fid in
+-- pg_gaps_inst, one per child variable: the distinct variables of the
+-- child stripe's rows.  a is the child's attribute, etab and ktab its
+-- tables (gaps._key_tables), and wclause and wparams the stripe's
+-- predicate over alias c (gaps._stripe_where).  A stripe with no predicate
+-- holds every entity of its attribute, so its rows need not be read.
+CREATE FUNCTION gaps._ground_child(fid int, a gaps.attribute, etab text, ktab text,
+								   wclause text, wparams text[])
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+	IF wclause = '' THEN
+		EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
+					   'SELECT $1, e.v, 0, e.v FROM pg_temp.%I e '
+					   'WHERE e.attribute_id = $2', etab)
+			USING fid, a.attribute_id;
+	ELSE
+		EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
+					   'SELECT $2, x.v, 0, x.v FROM '
+					   '(SELECT DISTINCT rc.v FROM %s c JOIN pg_temp.%I rc '
+					   'ON rc.attribute_id = $3 AND rc.k = %s WHERE TRUE%s) x',
+					   a.rel, etab, gaps._key_row(a, 'c', ktab), wclause)
+			USING wparams, fid, a.attribute_id;
+	END IF;
+END
+$$;
+
 -- A step of gaps._ground: the instances of factor fid's parent parent_ord
 -- (ord parent_ord in pg_gaps_inst), one per child variable of the factor,
 -- whose ord-0 instances must already be in pg_gaps_inst.  a is the
@@ -952,15 +981,7 @@ BEGIN
 		SELECT * INTO a FROM gaps.attribute WHERE attribute_id = f.cattr;
 		w := gaps._stripe_where(f.child_stripe, 'c', 1);
 
-		-- The child entities (ord 0 marks the child itself): the distinct
-		-- variables of the stripe's rows.
-		EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
-					   'SELECT $2, x.v, 0, x.v FROM '
-					   '(SELECT DISTINCT rc.v FROM %s c JOIN pg_temp.%I rc '
-					   'ON rc.attribute_id = $3 AND rc.k = %s WHERE TRUE%s) x',
-					   a.rel, f.etab, gaps._key_row(a, 'c', f.ktab), w.clause)
-			USING w.params, f.factor_id, a.attribute_id;
-
+		PERFORM gaps._ground_child(f.factor_id, a, f.etab, f.ktab, w.clause, w.params);
 		FOR p IN SELECT fp.ord FROM gaps.factor_parent fp
 				 WHERE fp.factor_id = f.factor_id ORDER BY fp.ord LOOP
 			PERFORM gaps._ground_parent(f.factor_id, p.ord, a, w.clause, w.params);
