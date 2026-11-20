@@ -209,7 +209,8 @@ SET gaps.seed = 42;
 CREATE TEMP TABLE grid_gibbs AS SELECT * FROM gaps.marginals('g');
 -- Every missing value is answered by sampling, every distribution sums to
 -- 1 (rule 14), and every probability is within 0.1 of exact (rule 13; the
--- tolerance is the engine test's, test/engine/test_engine.c GIBBS_TOL).
+-- tolerance is the engine test's, test/engine/test_engine.c GIBBS_TOL,
+-- measured on small models like this one, not a property of sampling).
 SELECT method, samples, count(*) FROM grid_gibbs GROUP BY 1, 2;
 SELECT count(*) AS bad_groups FROM (
 	SELECT entity FROM grid_gibbs GROUP BY entity
@@ -236,13 +237,25 @@ SET statement_timeout = '1s';
 SELECT count(*) FROM gaps.marginals('g');                    -- fail: canceled
 RESET statement_timeout;
 SET gaps.samples = 4000;
+-- A posterior the chains cannot cross: 50 readings of the corner cell,
+-- each agreeing with it with probability 0.8, pin the corner to whichever
+-- value a chain starts it at, so the chains (two of which start at
+-- opposite values) disagree and the answer is refused rather than given.
+CREATE TABLE grid_reading (k int PRIMARY KEY, i int, j int, v text);
+INSERT INTO grid_reading SELECT k, 1, 1, NULL FROM generate_series(1, 50) k;
+SELECT gaps.declare_attribute('g', 'grid_reading', 'v', ARRAY['a', 'b']);
+SELECT gaps.add_stripe('g', 'reading', 'grid_reading', 'v');
+SELECT gaps.add_factor('g', 'reads', 'reading', ARRAY['corner'], ARRAY[0.8, 0.2, 0.2, 0.8]);
+SELECT gaps.map_factor('g', 'reads', 1, 'i', 'i');
+SELECT gaps.map_factor('g', 'reads', 1, 'j', 'j');
+SELECT count(*) FROM gaps.marginals('g');                    -- fail: chains disagree
 -- A zero in a CPT the component uses rules out sampling.
 SELECT gaps.set_cpt('g', 'both', ARRAY[0.9, 0.1, 0.6, 0.4, 0.5, 0.5, 0, 1]);
 SELECT count(*) FROM gaps.marginals('g');                    -- fail: zero, cannot sample
 RESET gaps.samples;
 RESET gaps.seed;
 RESET gaps.max_factor_cells;
-DROP TABLE grid, grid_exact, grid_gibbs;
+DROP TABLE grid, grid_reading, grid_exact, grid_gibbs;
 SELECT gaps.drop_model('g');
 
 -- A role that cannot read the table cannot infer over it, even with the

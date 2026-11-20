@@ -806,7 +806,9 @@ $$;
 -- Principle 1).  Values in different components are independent.
 -- method is 'exact', or 'gibbs' for a component too large to solve
 -- exactly that was sampled (gaps.samples), with samples the number of
--- samples; samples is NULL for exact.
+-- samples per chain; samples is NULL for exact.  A sampled component
+-- whose chains disagree is an ERROR, but chains that agree can still all
+-- be wrong (doc/DESIGN.md, "Gibbs sampling, as built").
 CREATE FUNCTION gaps.marginals(model text,
 	OUT rel regclass, OUT attname name, OUT entity jsonb, OUT value text,
 	OUT probability float8, OUT component int, OUT method text, OUT samples int)
@@ -838,7 +840,8 @@ $$;
 -- assignment (the same for every row of the component).  A sampled
 -- component (method 'gibbs-marginal-argmax') gets each value's most
 -- probable sampled value instead, which need not be the joint MAP, and
--- probability NULL: sampling does not estimate a joint probability.
+-- probability NULL: sampling does not estimate a joint probability.  The
+-- rows of a sampled component are not one joint completion.
 CREATE FUNCTION gaps.impute(model text,
 	OUT rel regclass, OUT attname name, OUT entity jsonb, OUT value text,
 	OUT probability float8, OUT component int, OUT method text, OUT samples int)

@@ -76,7 +76,8 @@ c_interrupt(void *arg)
 	allocs_since_interrupt = 0;
 }
 
-static gx_env cenv = {c_alloc, t_free, c_interrupt, NULL, (size_t) 1 << 20, (size_t) 1 << 26, 0, 0, 0, 0};
+static gx_env cenv = {c_alloc, t_free, c_interrupt, NULL, (size_t) 1 << 20, (size_t) 1 << 26,
+0, 0, 0, 0};
 
 /* splitmix64: a small seeded PRNG, so failures reproduce from the seed. */
 static uint64_t rng;
@@ -829,16 +830,24 @@ check_alloc_failure(int samples)
 }
 
 /*
- * Gibbs against exact.  GIBBS_N sweeps and GIBBS_TOL were set from a
- * measurement on this generator (20,000 strictly positive models, seed
- * 1, Rao-Blackwellized): the largest error of any marginal was 0.055 and
- * the 99th percentile 0.018.  With a child's term dropped from the full
- * conditional, the 99th percentile was 0.27, so the tolerance fails a
- * broken sampler on the first few hundred cases while leaving the correct
- * one twice its worst observed error.
+ * Gibbs against exact.  GIBBS_N sweeps per chain and GIBBS_TOL were set
+ * from a measurement on this generator, which makes at most MAXV
+ * variables: over 20,000 strictly positive models (seed 1, all sampled),
+ * the largest error of any pooled marginal was 0.025 and the largest
+ * spread between the engine's chains 0.078, so none was refused for
+ * disagreeing chains (GX_MIX_SPREAD 0.1).  With a child's term dropped
+ * from the full conditional the error reaches 0.14 on the first few
+ * hundred cases.  A refusal is a safe answer, so the random cases allow
+ * up to 1% of runs to be refused (GIBBS_MAX_REFUSED), each with a spread
+ * above the limit.  The tolerance is a property of these small models,
+ * not of the method.
  */
 #define GIBBS_N 4000
 #define GIBBS_TOL 0.1
+#define GIBBS_MAX_REFUSED(cases) ((cases) / 100 + 1)
+
+static long gibbs_cases,
+			gibbs_refused;
 
 /* Is some completion of the evidence a world of probability zero? */
 static int
@@ -907,6 +916,15 @@ check_gibbs_case(net *n, uint64_t cseed)
 		nchecks++;
 		return;
 	}
+	gibbs_cases++;
+	if (rc == GX_ENOMIX)
+	{
+		if (!(r.spread > GX_MIX_SPREAD) || r.bad_size < 1)
+			FAIL("gibbs: refused with spread %g, component size %d", r.spread, r.bad_size);
+		gibbs_refused++;
+		nchecks++;
+		return;
+	}
 	if (rc != GX_OK)
 		FAIL("gibbs: gx_infer returned %d on a strictly positive case", rc);
 	for (int v = 0; v < bn->nvars; v++)
@@ -947,7 +965,16 @@ check_gibbs_case(net *n, uint64_t cseed)
 	/* Another seed: a different chain, still within the tolerance. */
 	g.no_sharing = 0;
 	g.seed = cseed + 1;
-	if (gx_infer(&g, bn, &r2) != GX_OK)
+	rc = gx_infer(&g, bn, &r2);
+	gibbs_cases++;
+	if (rc == GX_ENOMIX)
+	{
+		gibbs_refused++;
+		free_result(bn, &r);
+		nchecks++;
+		return;
+	}
+	if (rc != GX_OK)
 		FAIL("gibbs: second seed failed");
 	for (int v = 0; v < bn->nvars; v++)
 		if (bn->evidence[v] < 0)
@@ -972,6 +999,64 @@ check_gibbs_case(net *n, uint64_t cseed)
 		FAIL("gibbs: a different seed gave a bit-identical answer");
 	free_result(bn, &r2);
 	free_result(bn, &r);
+	nchecks++;
+}
+
+/* Few enough of the random Gibbs runs were refused for disagreeing chains. */
+static void
+check_gibbs_refusals(uint64_t cseed)
+{
+	if (gibbs_refused > GIBBS_MAX_REFUSED(gibbs_cases))
+		FAIL("gibbs: %ld of %ld runs refused for disagreeing chains", gibbs_refused,
+			 gibbs_cases);
+	nchecks++;
+}
+
+/*
+ * A bimodal posterior that single-site Gibbs cannot cross at this sample
+ * count: a hub with HUB_K children, each agreeing with it with
+ * probability 0.8, and no evidence.  Flipping every variable keeps the
+ * joint, so every marginal is 0.5.  Given the hub, the children are
+ * redrawn independently each sweep, and the hub turns only when at least
+ * half of them disagree with it, which has probability about 1e-6 per
+ * sweep at HUB_K = 50; so each chain stays in the mode it starts in.  The
+ * first two chains start in opposite modes, and the engine must refuse
+ * for every seed tried.
+ */
+#define HUB_K 50
+
+static void
+check_gibbs_nomix(void)
+{
+	uint64_t	cseed = 0;
+	int			card[HUB_K + 1],
+				ev[HUB_K + 1],
+				hub = 0;
+	double		prior[2] = {0.5, 0.5},
+				agree[4] = {0.8, 0.2, 0.2, 0.8};
+	gx_cpt		cpts[HUB_K + 1];
+	gx_bn		bn = {HUB_K + 1, card, ev, HUB_K + 1, cpts};
+	gx_env		g = env;
+	gx_result	r;
+	int			rc;
+
+	for (int v = 0; v <= HUB_K; v++)
+	{
+		card[v] = 2;
+		ev[v] = -1;
+		cpts[v] = v == 0 ? (gx_cpt) {0, 0, NULL, prior} : (gx_cpt) {v, 1, &hub, agree};
+	}
+	g.samples = GIBBS_N;
+	g.sample_always = 1;
+	for (cseed = 0; cseed < 5; cseed++)
+	{
+		g.seed = cseed;
+		if ((rc = gx_infer(&g, &bn, &r)) != GX_ENOMIX)
+			FAIL("gibbs nomix: returned %d, want GX_ENOMIX", rc);
+		if (!(r.spread > GX_MIX_SPREAD) || r.bad_size != HUB_K + 1 || r.bad_var < 0)
+			FAIL("gibbs nomix: spread %g, component size %d, variable %d", r.spread,
+				 r.bad_size, r.bad_var);
+	}
 	nchecks++;
 }
 
@@ -1047,9 +1132,9 @@ check_gibbs_fallback(void)
 	ninterrupts = 0;
 	if ((rc = gx_infer(&small, &bn, &r)) != GX_OK)
 		FAIL("gibbs fallback: sampling returned %d", rc);
-	if (ninterrupts < GIBBS_N + GIBBS_N / 10)
+	if (ninterrupts < GX_CHAINS * (GIBBS_N + GIBBS_N / 10))
 		FAIL("gibbs fallback: %ld interrupts for %d sweeps", ninterrupts,
-			 GIBBS_N + GIBBS_N / 10);
+			 GX_CHAINS * (GIBBS_N + GIBBS_N / 10));
 	for (int v = 0; v < N; v++)
 	{
 		if (ev[v] >= 0)
@@ -1084,12 +1169,13 @@ main(int argc, char **argv)
 	check_many_children(400, 0.1, 0.11);
 	check_many_children(1100, 0.5, 0.5);
 	check_alloc_failure(0);
-	check_alloc_failure(50);	/* the same, sampled */
+	check_alloc_failure(2000);	/* the same, sampled */
 	check_opposing(339);
 	check_opposing(5000);
 	check_star(1501);
 	check_star(100001);
 	check_gibbs_fallback();
+	check_gibbs_nomix();
 	for (long i = 0; i < cases; i++)
 	{
 		net			n;
@@ -1103,6 +1189,7 @@ main(int argc, char **argv)
 		if (i % 10 == 0)
 			check_gibbs_case(&n, cseed);
 	}
+	check_gibbs_refusals(seed);
 	printf("engine: %ld checks passed (seed %llu, %ld random cases)\n",
 		   nchecks, (unsigned long long) seed, cases);
 	return 0;

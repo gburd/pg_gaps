@@ -142,7 +142,7 @@ bad_arg(const char *fmt, int a, int b)
  * offsets are 1-based.
  *
  * samples is NULL for a component solved exactly, and otherwise the number
- * of Gibbs samples behind its probabilities; map_value is then each
+ * of Gibbs samples per chain behind its probabilities; map_value is then each
  * variable's most probable sampled value, and map_probability is NULL,
  * since sampling estimates no joint probability.
  */
@@ -233,9 +233,13 @@ build_network(FunctionCallInfo fcinfo, gx_bn *bn)
 	bn->cpts = cpts;
 }
 
-/* Turn an engine error into an ERROR. */
+/*
+ * Turn an engine error into an ERROR.  bad is the variable the engine
+ * names; res, when not NULL, is gx_infer's result, which also carries the
+ * failing component's size and, for GX_ENOMIX, the chains' disagreement.
+ */
 static void
-report(int rc, int bad)
+report(int rc, int bad, const gx_result *res)
 {
 	if (rc == GX_ECYCLE)
 		ereport(ERROR,
@@ -260,8 +264,8 @@ report(int rc, int bad)
 	if (rc == GX_ETOOBIG)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("inference needs more than gaps.max_total_cells (%d), even to sample",
-						gaps_max_total_cells),
+				 errmsg("inference needs more than gaps.max_total_cells (%d) to hold the "
+						"component's factors, or to sample it", gaps_max_total_cells),
 				 errdetail("The component containing variable %d is too large.", bad + 1)));
 	if (rc == GX_ENOTPOS)
 		ereport(ERROR,
@@ -272,6 +276,16 @@ report(int rc, int bad)
 						   "positive, and one is zero."),
 				 errhint("Raise gaps.max_factor_cells or gaps.max_total_cells, or make the "
 						 "CPT entries positive (gaps.learn_cpts with alpha > 0 does).")));
+	if (rc == GX_ENOMIX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Gibbs sampling did not converge on the component of %d variables "
+						"containing variable %d", res->bad_size, bad + 1),
+				 errdetail("With gaps.samples = %d in each of %d chains, two chains "
+						   "estimate a probability %.3f apart; the limit is %.2f.",
+						   gaps_samples, GX_CHAINS, res->spread, GX_MIX_SPREAD),
+				 errhint("Raise gaps.samples, or raise gaps.max_factor_cells and "
+						 "gaps.max_total_cells so the component is solved exactly.")));
 	if (rc == GX_EINVAL)
 		bad_arg("malformed ground network at variable %d (code %d)", bad + 1, rc);
 	if (rc != GX_OK)
@@ -318,8 +332,8 @@ gaps_infer(PG_FUNCTION_ARGS)
 	env.seed = (uint64_t) gaps_seed;
 	env.sample_always = 0;
 
-	report(gx_check(&env, &bn, &bad), bad);
-	report(gx_infer(&env, &bn, &res), res.bad_var);
+	report(gx_check(&env, &bn, &bad), bad, NULL);
+	report(gx_infer(&env, &bn, &res), res.bad_var, &res);
 
 	MemoryContextSwitchTo(old);
 	for (int v = 0; v < bn.nvars; v++)

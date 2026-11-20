@@ -69,6 +69,8 @@ typedef struct ctx
 	size_t		peak;
 	size_t		held;			/* cells the current component holds outside
 								 * solve(), charged before solve() starts */
+	double		spread;			/* the last sampled component's chain
+								 * disagreement, see gibbs_pool() */
 } ctx;
 
 static void *
@@ -239,7 +241,7 @@ check_acyclic(ctx *cp, const gx_bn *bn, int *indeg, int *queue, int *kstart,
 int
 gx_check(const gx_env *env, const gx_bn *bn, int *bad_var)
 {
-	ctx			c = {env, bn, GX_OK, 0, 0};
+	ctx			c = {env, bn, GX_OK, 0, 0, 0.0};
 	int		   *owner = NULL;	/* CPT index per variable */
 	int		   *indeg = NULL;	/* unremoved parents per variable */
 	int		   *queue = NULL;
@@ -1452,6 +1454,17 @@ solve(ctx *c, int nloc, const int *card, factor *fs, int nf,
  * has lower variance than counting draws and is a proper distribution
  * after every sweep.
  *
+ * GX_CHAINS chains run, one after another, from dispersed starts (all
+ * first values, all last values, then uniform draws), and the answer is
+ * their pooled average.  Single-site Gibbs can stay in one mode of a
+ * multimodal posterior for longer than any affordable run (a hub with
+ * many agreeing children, a strongly coupled grid), and then reports a
+ * confident wrong marginal.  So the chains' own estimates are compared:
+ * if any probability differs by more than GX_MIX_SPREAD between two
+ * chains, the component is refused with GX_ENOMIX.  That catches chains
+ * stuck in different modes; it cannot catch chains that are all stuck in
+ * the same one, so agreement is evidence of mixing, not proof.
+ *
  * Gibbs sampling is correct only when the chain can reach every world of
  * positive probability (thesis T5736-5739: constraints must not break the
  * distribution into disconnected regions).  A sufficient condition, and
@@ -1546,8 +1559,10 @@ typedef struct gchain
 	size_t	   *bstride;
 	int		   *val;			/* the current world */
 	double	   *cond;			/* one full conditional, max card entries */
-	double	   *acc;			/* sum of full conditionals, flattened */
+	double	   *accs;			/* GX_CHAINS accumulators of total entries */
+	double	   *acc;			/* the running chain's, inside accs */
 	size_t	   *aoff;			/* per variable, into acc */
+	size_t		total;			/* entries per accumulator */
 	xoshiro		rng;
 	size_t		work;			/* since the last interrupt */
 } gchain;
@@ -1562,15 +1577,16 @@ gibbs_free(gchain *g)
 	xfree(c, g->bstride);
 	xfree(c, g->val);
 	xfree(c, g->cond);
-	xfree(c, g->acc);
+	xfree(c, g->accs);
 	xfree(c, g->aoff);
 }
 
 /*
  * Check positivity, then build the blanket lists with a counting sort over
- * the factors' variables, and the accumulators.  Everything here is linear
- * in the factors' scopes, and is charged against max_total_cells on top of
- * the reduced factors the component already holds.
+ * the factors' variables, and one accumulator per chain.  Everything here
+ * is linear in the factors' scopes, and is charged against
+ * max_total_cells on top of the reduced factors the component already
+ * holds.
  */
 static int
 gibbs_init(gchain *g)
@@ -1597,7 +1613,7 @@ gibbs_init(gchain *g)
 		if (g->card[t] > maxcard)
 			maxcard = g->card[t];
 	}
-	if (c->held + 2 * nent + 2 * total + 4 * (size_t) g->nloc >
+	if (c->held + 2 * nent + (GX_CHAINS + 1) * total + 4 * (size_t) g->nloc >
 		c->env->max_total_cells)
 	{
 		c->err = GX_ETOOBIG;
@@ -1609,7 +1625,7 @@ gibbs_init(gchain *g)
 	g->bstride = xalloc(c, sizeof(size_t) * (nent ? nent : 1));
 	g->val = xalloc(c, sizeof(int) * (size_t) g->nloc);
 	g->cond = xalloc(c, sizeof(double) * (size_t) maxcard);
-	g->acc = xalloc(c, sizeof(double) * total);
+	g->accs = xalloc(c, sizeof(double) * total * GX_CHAINS);
 	g->aoff = xalloc(c, sizeof(size_t) * (size_t) g->nloc);
 	if (c->err)
 		return c->err;
@@ -1643,7 +1659,8 @@ gibbs_init(gchain *g)
 		g->aoff[t] = total;
 		total += (size_t) g->card[t];
 	}
-	memset(g->acc, 0, sizeof(double) * total);
+	g->total = total;
+	memset(g->accs, 0, sizeof(double) * total * GX_CHAINS);
 	return GX_OK;
 }
 
@@ -1702,11 +1719,81 @@ gibbs_step(gchain *g, int t, int keep)
 }
 
 /*
+ * Set the starting world of chain k.  The first two chains start at
+ * opposite corners of the state space (every variable at its first value,
+ * then at its last), the others at worlds drawn uniformly, so that chains
+ * stuck in different modes disagree and gibbs_pool() can see it.
+ */
+static void
+gibbs_start(gchain *g, int k)
+{
+	for (int t = 0; t < g->nloc; t++)
+	{
+		if (k == 0)
+			g->val[t] = 0;
+		else if (k == 1)
+			g->val[t] = g->card[t] - 1;
+		else
+			g->val[t] = (int) (xoshiro_unit(&g->rng) * g->card[t]);
+	}
+}
+
+/*
+ * Pool the chains: write each variable's marginal (the sum of all chains'
+ * accumulators, normalized) into marg and its argmax into map, and return
+ * the convergence diagnostic, the largest spread (highest minus lowest)
+ * between the chains' own estimates of any one probability.
+ */
+static double
+gibbs_pool(gchain *g, double *marg, int *map)
+{
+	double		spread = 0.0;
+
+	for (int t = 0; t < g->nloc; t++)
+	{
+		double		s = 0.0,
+					sk[GX_CHAINS] = {0};
+
+		for (int k = 0; k < GX_CHAINS; k++)
+			for (int x = 0; x < g->card[t]; x++)
+				sk[k] += g->accs[k * g->total + g->aoff[t] + (size_t) x];
+		for (int k = 0; k < GX_CHAINS; k++)
+			s += sk[k];
+		map[t] = 0;
+		for (int x = 0; x < g->card[t]; x++)
+		{
+			size_t		i = g->aoff[t] + (size_t) x;
+			double		lo = 1.0,
+						hi = 0.0,
+						a = 0.0;
+
+			for (int k = 0; k < GX_CHAINS; k++)
+			{
+				double		e = g->accs[k * g->total + i] / sk[k];
+
+				lo = e < lo ? e : lo;
+				hi = e > hi ? e : hi;
+				a += g->accs[k * g->total + i];
+			}
+			marg[i] = a / s;
+			if (marg[i] > marg[g->aoff[t] + (size_t) map[t]])
+				map[t] = x;
+			if (hi - lo > spread)
+				spread = hi - lo;
+		}
+	}
+	return spread;
+}
+
+/*
  * Sample one component: nloc variables with cardinalities card[], reduced
- * factors fs[0..nf).  Writes the estimated marginals, flattened in local
- * order, into marg, and each variable's most probable estimated value into
- * map.  Returns GX_ENOTPOS if a factor has a zero entry, GX_ETOOBIG if the
- * chain's arrays would exceed max_total_cells.
+ * factors fs[0..nf).  Runs GX_CHAINS chains in turn, each with a burn-in
+ * of env->samples / 10 sweeps and then env->samples sweeps.  Writes the
+ * pooled marginals, flattened in local order, into marg, each variable's
+ * most probable pooled value into map, and the chains' disagreement into
+ * c->spread.  Returns GX_ENOTPOS if a factor has a zero entry, GX_ETOOBIG
+ * if the chains' arrays would exceed max_total_cells, and GX_ENOMIX if
+ * the disagreement exceeds GX_MIX_SPREAD.
  */
 static int
 gibbs(ctx *c, int nloc, const int *card, factor *fs, int nf, uint64_t seed,
@@ -1721,37 +1808,27 @@ gibbs(ctx *c, int nloc, const int *card, factor *fs, int nf, uint64_t seed,
 	g.card = card;
 	g.fs = fs;
 	g.nf = nf;
-	for (int i = 0; i < 4; i++)
-		g.rng.s[i] = splitmix64(&seed);
 
 	if (gibbs_init(&g) == GX_OK)
 	{
-		/* Start from a world drawn uniformly, then burn in and sample. */
-		for (int t = 0; t < nloc; t++)
-			g.val[t] = (int) (xoshiro_next(&g.rng) % (uint64_t) card[t]);
-		for (int sweep = 0; sweep < burnin + c->env->samples; sweep++)
+		/* Each chain: its own stream, start, burn-in and accumulator. */
+		for (int k = 0; k < GX_CHAINS; k++)
 		{
-			interrupt(c);
-			for (int t = 0; t < nloc; t++)
-				gibbs_step(&g, t, sweep >= burnin);
-		}
-
-		/* Average, renormalize away the rounding, and take each argmax. */
-		for (int t = 0; t < nloc; t++)
-		{
-			double	   *a = g.acc + g.aoff[t];
-			double		s = 0.0;
-
-			map[t] = 0;
-			for (int x = 0; x < card[t]; x++)
-				s += a[x];
-			for (int x = 0; x < card[t]; x++)
+			for (int i = 0; i < 4; i++)
+				g.rng.s[i] = splitmix64(&seed);
+			g.acc = g.accs + (size_t) k * g.total;
+			gibbs_start(&g, k);
+			for (int sweep = 0; sweep < burnin + c->env->samples; sweep++)
 			{
-				marg[g.aoff[t] + (size_t) x] = a[x] / s;
-				if (a[x] > a[map[t]])
-					map[t] = x;
+				interrupt(c);
+				for (int t = 0; t < nloc; t++)
+					gibbs_step(&g, t, sweep >= burnin);
 			}
 		}
+
+		c->spread = gibbs_pool(&g, marg, map);
+		if (!(c->spread <= GX_MIX_SPREAD))
+			c->err = GX_ENOMIX;
 	}
 	gibbs_free(&g);
 	return c->err;
@@ -2332,7 +2409,7 @@ result_init(ctx *c, gx_result *out)
 int
 gx_infer(const gx_env *env, const gx_bn *bn, gx_result *out)
 {
-	ctx			c = {env, bn, GX_OK, 0, 0};
+	ctx			c = {env, bn, GX_OK, 0, 0, 0.0};
 	size_t		nv = (size_t) (bn->nvars ? bn->nvars : 1);
 	inferwork	w;
 
@@ -2363,6 +2440,8 @@ gx_infer(const gx_env *env, const gx_bn *bn, gx_result *out)
 							 w.loc, w.gval, w.buckets, out) != GX_OK)
 			{
 				out->bad_var = w.members[w.start[k]];
+				out->bad_size = out->comp_size[k];
+				out->spread = c.spread;
 				break;
 			}
 		}

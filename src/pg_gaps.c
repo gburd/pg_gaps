@@ -47,7 +47,8 @@ void		_PG_init(void);
  * gaps.seed makes the sample reproducible (rule 15).  Sampling holds
  * memory linear in the component, charged to gaps.max_total_cells; its
  * time is linear in samples times the component's factor scopes, and it
- * is cancellable.  The upper limit on samples keeps the burn-in and the
+ * is cancellable.  gaps.samples counts sweeps per chain, and the engine
+ * runs GX_CHAINS chains; the upper limit keeps a chain's burn-in and
  * sweep count within an int.
  */
 void
@@ -77,7 +78,8 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 	DefineCustomIntVariable("gaps.samples",
 							"Gibbs samples for a component too large for exact inference.",
-							"0, the default, never samples: such a component is an error.",
+							"Per chain; four chains run.  0, the default, never samples: "
+							"such a component is an error.",
 							&gaps_samples,
 							0, 0, INT_MAX / 2,
 							PGC_USERSET, 0,
