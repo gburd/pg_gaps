@@ -173,6 +173,12 @@ Delivers:
   samples it used: `method` ('exact', 'gibbs', or for `impute`
   'gibbs-marginal-argmax') and `samples` (NULL for exact).
 
+Open: start two of the four chains from forward samples of the prior
+(evidence respected), which in a prototype caught the ternary-hub case on
+4 of 5 seeds and cut the alternating hub from 6 to 4 of 40 accepted
+wrong answers (DESIGN.md "Gibbs sampling, as built").  It narrows, it
+does not close, the same-mode gap.
+
 Done when: exact and oracle agree on correlated models, including
 coarse entity sets and one-to-many mappings; Gibbs is within a stated
 tolerance of exact on every model both can solve, at the documented

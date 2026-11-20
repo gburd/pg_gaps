@@ -441,12 +441,16 @@ default threshold and 4,000 samples per chain:
 | 20 x 20 grid at p = 0.95, 5 seeds | 5 (spread 0.32-0.45; at 80,000 samples 0.055-0.073 and error 0.021-0.024) |
 | 30 x 30 grid at p = 0.97, 3 seeds | 3 (spread 0.56-0.71) |
 | a hub with 30 or 50 agreeing children, 3 seeds each | 6 (spread 1.0) |
+| **not refused:** a binary hub with 50 ternary children, CPT {0.1, 0.8, 0.1 \| 0.4, 0.2, 0.4}, exact P(hub) = 0.5 | 0 of every seed tried; error 0.5 |
+| **not refused:** a binary hub whose children alternately agree and disagree with it (p = 0.8), 40 seeds | 34 (6 accepted with error 0.5; 5 of 40 still at 100,000 samples) |
 
-A multi-chain check narrows silent failure but cannot rule it out.  All
-four chains can sit in the same mode (the starts are dispersed, but a
-posterior can have modes that none of them is near), or agree by
-accident while each is wrong; a spread under 0.1 is evidence the chains
-mixed, not proof.  The 0.1 tolerance the tests use (`GIBBS_TOL`) was
+A multi-chain check narrows silent failure but cannot rule it out, and
+the last two rows show it failing on ordinary CPTs (no entry below 0.1).
+All four chains can sit in the same mode: in the ternary hub, the
+all-first and all-last starts put every child at an end value and a
+uniform start puts two thirds there, which all pull the hub the same
+way.  Chains can also agree by accident while each is wrong; a spread
+under 0.1 is evidence the chains mixed, not proof.  The 0.1 tolerance the tests use (`GIBBS_TOL`) was
 measured on models of at most 12 variables and on the 6 x 6 grid, where
 any chain mixes in a few sweeps; it is not a property of the method.
 For an answer that must be right, raise the bounds and solve exactly.
