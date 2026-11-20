@@ -136,6 +136,27 @@ SELECT gaps.declare_attribute('nk', 'nk', 'x', ARRAY['a', 'b'], ARRAY['g']::name
 SELECT gaps.add_stripe('nk', 'x', 'nk', 'x');
 SELECT gaps.add_factor('nk', 'p', 'x', '{}', ARRAY[0.25, 0.75]);
 SELECT entity, value, round(probability::numeric, 12) AS p FROM gaps.marginals('nk') ORDER BY value;
+-- A NULL-keyed entity with a parent: y depends on x of the same entity by
+-- the default mapping, which matches keys as entities do, NULLs equal.
+-- The oracle for g NULL (x observed b): P(y = c | b) = 0.2.
+ALTER TABLE nk ADD COLUMN y text;
+SELECT gaps.declare_attribute('nk', 'nk', 'y', ARRAY['c', 'd'], ARRAY['g']::name[]);
+SELECT gaps.add_stripe('nk', 'y', 'nk', 'y');
+SELECT gaps.add_factor('nk', 'py', 'y', ARRAY['x'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT attname, entity, value, round(probability::numeric, 12) AS p
+FROM gaps.marginals('nk') WHERE attname = 'y' ORDER BY entity::text, value;
+-- The same through a parent stripe with a predicate, which joins rows.
+SELECT gaps.add_stripe('nk', 'xq', 'nk', 'x');
+SELECT gaps.add_stripe_qual('nk', 'xq', 'id', '<', '10');
+UPDATE gaps.factor_parent SET parent_stripe = s.stripe_id
+FROM gaps.stripe s WHERE s.name = 'xq'
+	AND factor_id = (SELECT factor_id FROM gaps.factor WHERE name = 'py')
+RETURNING s.name;
+SELECT attname, entity, value, round(probability::numeric, 12) AS p
+FROM gaps.marginals('nk') WHERE attname = 'y' ORDER BY entity::text, value;
+-- An explicit mapping compares with =, so a NULL maps to no parent.
+SELECT gaps.map_factor('nk', 'py', 1, 'g', 'g');
+SELECT * FROM gaps.marginals('nk');                          -- fail: maps to no parent
 SELECT gaps.drop_model('nk');
 DROP TABLE nk;
 

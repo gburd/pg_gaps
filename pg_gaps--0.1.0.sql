@@ -814,8 +814,23 @@ BEGIN
 				USING DETAIL = 'Only a parent on the same relation and entity keys '
 					'maps to the child entity by default.';
 		END IF;
-		SELECT string_agg(format(' AND c.%I = p.%I', k, k), '') INTO on_clause
-		FROM unnest(a.entity_keys) k;
+		-- The default mapping sends an entity to the parent attribute's
+		-- entity with the same key (the same shape, so the same tables).
+		-- With no parent predicate, that is a join of the two attributes'
+		-- entities on the key, and the user's table is not read again.
+		IF wp.clause = '' THEN
+			EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
+						   'SELECT $1, i.v, $2, coalesce(rp.v, 0) FROM pg_gaps_inst i '
+						   'JOIN pg_temp.%I rc ON rc.attribute_id = $3 AND rc.v = i.v '
+						   'LEFT JOIN pg_temp.%I rp ON rp.attribute_id = $4 AND rp.k = rc.k '
+						   'WHERE i.factor_id = $1 AND i.ord = 0',
+						   ct.etab, pt.etab)
+				USING fid, parent_ord, a.attribute_id, pa.attribute_id;
+			on_clause := NULL;
+		ELSE
+			on_clause := format(' AND %s = %s', gaps._key_row(a, 'c', ct.ktab),
+								gaps._key_row(pa, 'p', ct.ktab));
+		END IF;
 	END IF;
 
 	-- One pass: each child variable with the distinct parent variables its
@@ -824,17 +839,19 @@ BEGIN
 	-- and reported below.  Every row of the parent's relation belongs to an
 	-- entity of the parent attribute, so the inner join to the parent's
 	-- entities loses no row.
-	EXECUTE format(
-		'INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
-		'SELECT $2, rc.v, $3, CASE WHEN count(DISTINCT rp.v) = 1 THEN min(rp.v) '
-		'ELSE -count(DISTINCT rp.v) END '
-		'FROM %s c JOIN pg_temp.%I rc ON rc.attribute_id = $4 AND rc.k = %s '
-		'LEFT JOIN (%s p JOIN pg_temp.%I rp ON rp.attribute_id = $5 AND rp.k = %s) '
-		'ON TRUE%s%s WHERE TRUE%s GROUP BY rc.v',
-		a.rel, ct.etab, gaps._key_row(a, 'c', ct.ktab),
-		pa.rel, pt.etab, gaps._key_row(pa, 'p', pt.ktab),
-		on_clause, wp.clause, wclause)
-		USING wparams || wp.params, fid, parent_ord, a.attribute_id, pa.attribute_id;
+	IF on_clause IS NOT NULL THEN
+		EXECUTE format(
+			'INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
+			'SELECT $2, rc.v, $3, CASE WHEN count(DISTINCT rp.v) = 1 THEN min(rp.v) '
+			'ELSE -count(DISTINCT rp.v) END '
+			'FROM %s c JOIN pg_temp.%I rc ON rc.attribute_id = $4 AND rc.k = %s '
+			'LEFT JOIN (%s p JOIN pg_temp.%I rp ON rp.attribute_id = $5 AND rp.k = %s) '
+			'ON TRUE%s%s WHERE TRUE%s GROUP BY rc.v',
+			a.rel, ct.etab, gaps._key_row(a, 'c', ct.ktab),
+			pa.rel, pt.etab, gaps._key_row(pa, 'p', pt.ktab),
+			on_clause, wp.clause, wclause)
+			USING wparams || wp.params, fid, parent_ord, a.attribute_id, pa.attribute_id;
+	END IF;
 
 	SELECT i.v, i.pv INTO bad
 	FROM pg_gaps_inst i

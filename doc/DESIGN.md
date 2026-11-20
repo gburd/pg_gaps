@@ -336,6 +336,14 @@ it would make "which RV is this row" ambiguous.  The rows of one entity
 must agree on an observed value; disagreeing evidence is an error naming
 the entity.
 
+Entity identity follows the key columns' own equality, as `GROUP BY`
+does: each column's equality operator and collation decide which rows
+are one entity (under a nondeterministic collation, `'A'` and `'a'` can
+be one entity, named by either), and rows whose keys are NULL in the same
+columns, and equal elsewhere, are one entity.  Grounding carries a key as
+a composite of the key columns' types, whose record equality has exactly
+these semantics.
+
 **CPTs** are dense `float8[]` in row-major order over (parents..., child),
 the child varying fastest.  A trigger on `gaps.factor` checks every write:
 the right length for the declared domains, every entry finite and
@@ -361,6 +369,13 @@ relation and entity keys as the child maps entity to itself (a horizontal
 factor).  Grounding checks that every child entity maps to exactly one
 parent entity in the parent stripe, and fails naming a child entity that
 maps to none or to several.
+
+The default mapping matches keys as entities are identified, so a
+NULL-keyed child finds the parent entity with the same NULL key.  Explicit
+equalities are SQL `=`, so a NULL in a mapped column matches nothing, and
+a child whose mapped column is NULL maps to no parent: an error naming
+it, not a guess.  A user who wants NULLs to match can map from a column
+that encodes them.
 
 A missing value is SQL `NULL` in a declared probabilistic column.  `NULL`
 in a deterministic column is ordinary SQL `NULL`, as in [W11 3.2].
