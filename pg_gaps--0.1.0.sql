@@ -206,6 +206,11 @@ BEGIN
 		RAISE EXCEPTION 'probabilistic attribute %.% cannot be its own entity key',
 			NEW.relname, NEW.attname;
 	END IF;
+	IF (SELECT count(DISTINCT k) FROM unnest(NEW.entity_keys) k)
+		<> array_length(NEW.entity_keys, 1) THEN
+		RAISE EXCEPTION 'the entity keys of %.% name a column more than once: %',
+			NEW.relname, NEW.attname, NEW.entity_keys;
+	END IF;
 	FOR i IN 1 .. array_length(NEW.entity_keys, 1) LOOP
 		IF NOT EXISTS (SELECT 1 FROM pg_attribute a
 					   WHERE a.attrelid = NEW.rel AND a.attname = NEW.entity_keys[i]

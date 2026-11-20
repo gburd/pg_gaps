@@ -139,6 +139,14 @@ SELECT entity, value, round(probability::numeric, 12) AS p FROM gaps.marginals('
 SELECT gaps.drop_model('nk');
 DROP TABLE nk;
 
+-- Entity keys must not repeat a column.
+CREATE TABLE dk (id int PRIMARY KEY, g int, x text);
+SELECT gaps.create_model('dk');
+SELECT gaps.declare_attribute('dk', 'dk', 'x', ARRAY['a', 'b'],
+							  ARRAY['g', 'g']::name[]);               -- fail: g twice
+SELECT gaps.drop_model('dk');
+DROP TABLE dk;
+
 UPDATE reading SET status = 'down' WHERE (sid, t, k) = (1, 1, 2);
 SELECT * FROM gaps.marginals('c');                          -- fail: conflicting evidence
 UPDATE reading SET status = 'sideways' WHERE (sid, t) = (1, 1);

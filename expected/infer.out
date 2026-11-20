@@ -361,6 +361,24 @@ SELECT gaps.drop_model('nk');
 (1 row)
 
 DROP TABLE nk;
+-- Entity keys must not repeat a column.
+CREATE TABLE dk (id int PRIMARY KEY, g int, x text);
+SELECT gaps.create_model('dk');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('dk', 'dk', 'x', ARRAY['a', 'b'],
+							  ARRAY['g', 'g']::name[]);               -- fail: g twice
+ERROR:  the entity keys of public.dk.x name a column more than once: {g,g}
+SELECT gaps.drop_model('dk');
+ drop_model 
+------------
+ 
+(1 row)
+
+DROP TABLE dk;
 UPDATE reading SET status = 'down' WHERE (sid, t, k) = (1, 1, 2);
 SELECT * FROM gaps.marginals('c');                          -- fail: conflicting evidence
 ERROR:  rows of entity {"t": 1, "sid": 1} of public.reading.status disagree: {down,up}
