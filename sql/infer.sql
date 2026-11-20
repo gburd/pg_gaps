@@ -169,6 +169,40 @@ DO $$ BEGIN FOR i IN 1 .. 50 LOOP PERFORM count(*) FROM gaps.marginals('c'); END
 SELECT count(*) - :locks1 AS lock_growth FROM pg_locks WHERE pid = pg_backend_pid();
 COMMIT;
 
+-- Keys of the same types share one entity table whatever their columns
+-- are called, and each entity is still named by its own columns.  A
+-- model with more key shapes than the bound is refused, naming the count.
+CREATE TABLE sk1 (a int PRIMARY KEY, x text);
+CREATE TABLE sk2 (b int PRIMARY KEY, y text);
+INSERT INTO sk1 VALUES (1, NULL);
+INSERT INTO sk2 VALUES (2, NULL);
+SELECT gaps.create_model('sk');
+SELECT gaps.declare_attribute('sk', 'sk1', 'x', ARRAY['p', 'q']);
+SELECT gaps.declare_attribute('sk', 'sk2', 'y', ARRAY['p', 'q']);
+SELECT gaps.add_stripe('sk', 'x', 'sk1', 'x');
+SELECT gaps.add_stripe('sk', 'y', 'sk2', 'y');
+SELECT gaps.add_factor('sk', 'px', 'x', '{}', ARRAY[0.25, 0.75]);
+SELECT gaps.add_factor('sk', 'py', 'y', '{}', ARRAY[0.5, 0.5]);
+BEGIN;
+SELECT attname, entity, value, round(probability::numeric, 12) AS p
+FROM gaps.marginals('sk') ORDER BY 1, 3;
+SELECT count(*) AS entity_tables FROM pg_class
+WHERE relnamespace = pg_my_temp_schema() AND relname LIKE 'pg\_gaps\_e%' AND relkind = 'r';
+COMMIT;
+SELECT gaps.drop_model('sk');
+DROP TABLE sk1, sk2;
+SELECT gaps.create_model('many');
+DO $$
+BEGIN
+	FOR i IN 1 .. 101 LOOP
+		EXECUTE format('CREATE TABLE many%s (k numeric(%s) PRIMARY KEY, x text)', i, i);
+		PERFORM gaps.declare_attribute('many', format('many%s', i)::regclass, 'x', ARRAY['a']);
+	END LOOP;
+END $$;
+SELECT * FROM gaps.marginals('many');                        -- fail: 101 shapes
+SELECT gaps.drop_model('many');
+DO $$ BEGIN FOR i IN 1 .. 101 LOOP EXECUTE format('DROP TABLE many%s', i); END LOOP; END $$;
+
 -- Entity keys must not repeat a column.
 CREATE TABLE dk (id int PRIMARY KEY, g int, x text);
 SELECT gaps.create_model('dk');

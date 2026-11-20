@@ -543,15 +543,18 @@ LANGUAGE C STRICT VOLATILE;
 
 -- For each attribute of model m, the temp tables that hold its entities
 -- during a grounding: ktab, an empty table whose row type is the entity
--- key (the key columns with their names, types, typmods and collations),
--- and etab, the entities of every attribute whose key has that shape:
--- (attribute_id int, v int, k ktab, ev int), v the variable number and ev
--- the evidence code as in pg_gaps_rv.  The names are a hash of the shape,
--- so attributes with the same key share both tables, and a key column
--- whose type changes gets new ones.  NB: call gaps._resolve on every
--- attribute first; a missing key column would drop out of the hash.  Each
--- key column is looked up by name alone, one scalar subquery per column,
--- so that pg_attribute's index on (attrelid, attname) answers (a join was
+-- key (one field per key column, named k1, k2, ... in key order, with the
+-- column's type, typmod and collation), and etab, the entities of every
+-- attribute whose key has that shape: (attribute_id int, v int, k ktab,
+-- ev int), v the variable number and ev the evidence code as in
+-- pg_gaps_rv.  The names are a hash of the shape, the types, typmods and
+-- collations in key order but not the column names, so attributes whose
+-- keys have the same types share both tables whatever the columns are
+-- called (gaps._entity_json gives the names back), and a key column whose
+-- type changes gets new ones.  NB: call gaps._resolve on every attribute
+-- first; a missing key column would drop out of the hash.  Each key
+-- column is looked up by name alone, one scalar subquery per column, so
+-- that pg_attribute's index on (attrelid, attname) answers (a join was
 -- planned as a scan of every column of the relation per attribute); no
 -- user column shares a system column's name, so attnum > 0 adds nothing.
 CREATE FUNCTION gaps._key_tables(m int,
@@ -562,8 +565,7 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 	SELECT x.attribute_id, 'pg_gaps_k' || x.h, 'pg_gaps_e' || x.h
 	FROM (SELECT a.attribute_id, left(encode(sha256(convert_to(string_agg(
-				(SELECT format('%I %s %s', t.attname, format_type(t.atttypid, t.atttypmod),
-							   t.attcollation)
+				(SELECT format('%s %s %s', t.atttypid, t.atttypmod, t.attcollation)
 				 FROM pg_attribute t
 				 WHERE t.attrelid = a.rel AND t.attname = u.k AND NOT t.attisdropped),
 				', ' ORDER BY u.o), 'UTF8')), 'hex'), 32) AS h
@@ -587,6 +589,20 @@ AS $$
 	FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o)
 $$;
 
+-- The SQL expression that names an entity of an attribute with entity
+-- keys keys, as a jsonb object of its key columns, from the key k1, k2,
+-- ... of an entity table row aliased e: jsonb_build_object('col1',
+-- (e.k).k1) || ...  One object per column keeps clear of the limit on
+-- function arguments; to_jsonb converts each value as to_jsonb(record)
+-- would.
+CREATE FUNCTION gaps._entity_json(keys name[]) RETURNS text
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+	SELECT string_agg(format('jsonb_build_object(%L, (e.k).k%s)', k, o), ' || ' ORDER BY o)
+	FROM unnest(keys) WITH ORDINALITY u(k, o)
+$$;
+
 -- The entity of variable v of attribute id, as a jsonb object of its key
 -- columns.  NB: valid only after gaps._ground in the same transaction,
 -- for the variables that grounding numbered.
@@ -595,11 +611,14 @@ LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+	t record;
 	name jsonb;
 BEGIN
-	EXECUTE format('SELECT to_jsonb(e.k) FROM pg_temp.%I e '
-				   'WHERE e.attribute_id = $1 AND e.v = $2',
-				   (SELECT k.etab FROM pg_gaps_keys k WHERE k.attribute_id = id))
+	SELECT k.etab, a.entity_keys INTO t
+	FROM pg_gaps_keys k JOIN gaps.attribute a USING (attribute_id)
+	WHERE k.attribute_id = id;
+	EXECUTE format('SELECT %s FROM pg_temp.%I e WHERE e.attribute_id = $1 AND e.v = $2',
+				   gaps._entity_json(t.entity_keys), t.etab)
 		INTO name USING id, v;
 	RETURN name;
 END
@@ -609,7 +628,9 @@ $$;
 -- attribute and its entity as a jsonb object of the key columns.  NB:
 -- valid only after gaps._ground(m) in the same transaction.  Entity
 -- names are built here, for the variables a result reports, and nowhere
--- in grounding itself.
+-- in grounding itself.  One query per entity table and set of key column
+-- names, since attributes that share a table can name their keys
+-- differently.
 CREATE FUNCTION gaps._missing_names(m int,
 	OUT v int, OUT attribute_id int, OUT entity jsonb)
 RETURNS SETOF record
@@ -619,12 +640,13 @@ AS $$
 DECLARE
 	t record;
 BEGIN
-	FOR t IN SELECT k.etab, array_agg(k.attribute_id) AS ids
+	FOR t IN SELECT k.etab, a.entity_keys, array_agg(k.attribute_id) AS ids
 			 FROM pg_gaps_keys k JOIN gaps.attribute a ON a.attribute_id = k.attribute_id
-			 WHERE a.model_id = m GROUP BY k.etab LOOP
-		RETURN QUERY EXECUTE format('SELECT e.v, e.attribute_id, to_jsonb(e.k) '
+			 WHERE a.model_id = m GROUP BY k.etab, a.entity_keys LOOP
+		RETURN QUERY EXECUTE format('SELECT e.v, e.attribute_id, %s '
 									'FROM pg_temp.%I e WHERE e.ev = 0 '
-									'AND e.attribute_id = ANY ($1)', t.etab)
+									'AND e.attribute_id = ANY ($1)',
+									gaps._entity_json(t.entity_keys), t.etab)
 			USING t.ids;
 	END LOOP;
 END
@@ -643,9 +665,9 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
 	IF to_regclass('pg_temp.' || ktab) IS NULL THEN
-		EXECUTE format('CREATE TEMP TABLE %I ON COMMIT DROP AS SELECT %s FROM %s LIMIT 0',
+		EXECUTE format('CREATE TEMP TABLE %I ON COMMIT DROP AS SELECT %s FROM %s c LIMIT 0',
 					   ktab,
-					   (SELECT string_agg(format('%I', k), ', ' ORDER BY o)
+					   (SELECT string_agg(format('c.%I AS k%s', k, o), ', ' ORDER BY o)
 						FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o)),
 					   a.rel);
 	END IF;
@@ -738,6 +760,16 @@ BEGIN
 	TRUNCATE pg_gaps_keys;
 	INSERT INTO pg_gaps_keys SELECT * FROM gaps._key_tables(m);
 	ANALYZE pg_gaps_keys;
+	-- Each key shape holds about 16 locks until commit, in the lock table
+	-- every backend shares, so the number of shapes is bounded before any
+	-- table is made (doc/DESIGN.md, "Key shapes").
+	SELECT count(DISTINCT k.etab) INTO n FROM pg_gaps_keys k;
+	IF n > 100 THEN
+		RAISE EXCEPTION 'model has % distinct entity key shapes, more than 100', n
+			USING DETAIL = 'A shape is the types, typmods and collations of an '
+				'attribute''s entity keys; grounding makes temp tables for each.',
+				HINT = 'Give the model''s entity keys fewer distinct types.';
+	END IF;
 	FOR t IN SELECT DISTINCT ON (k.etab) at AS a, k.ktab, k.etab
 			 FROM pg_gaps_keys k JOIN gaps.attribute at USING (attribute_id)
 			 ORDER BY k.etab, k.attribute_id LOOP

@@ -344,6 +344,26 @@ columns, and equal elsewhere, are one entity.  Grounding carries a key as
 a composite of the key columns' types, whose record equality has exactly
 these semantics.
 
+**Key shapes.** Grounding keeps the entities of every attribute whose key
+columns have the same types, typmods and collations, in order, in one
+temp table for the transaction, with the key's fields named k1, k2, ...;
+the column names come back from each attribute's `entity_keys` when a
+result or an error names an entity.  So `customer(id int)` and
+`orders(order_id int)` share one table.  Each distinct shape costs a key
+table, an entity table, an index, and their types: about 16 locks, held
+until commit, in the lock table that every backend shares.  That table
+is sized for `max_locks_per_transaction` (default 64) times about
+`max_connections` (default 100) entries, 6,400 with the defaults, and one
+backend that fills it makes the others fail too.  (The table can borrow
+spare shared memory past that size, which is why a single test session
+can sometimes hold more, but nothing guarantees it.)  Grounding therefore
+refuses a model with more than 100 distinct key shapes, an `ERROR`
+naming the count, before it makes any table: at the limit one call holds
+about 1,650 locks, a quarter of the default table, which leaves the rest
+to other sessions.  A real model rarely has more than a handful of key
+types; the limit is a guard against an unbounded failure, not a tuning
+knob, so it is not a GUC.
+
 **CPTs** are dense `float8[]` in row-major order over (parents..., child),
 the child varying fastest.  A trigger on `gaps.factor` checks every write:
 the right length for the declared domains, every entry finite and
