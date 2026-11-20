@@ -21,7 +21,7 @@ Each has a recommendation.  None blocks Phase 0, which is done.
 | Q3 | How to store a probabilistic attribute's domain? | **`text[]` of the type's output form, plus the type as `regtype`**, converted with the type's input function once per query. | A user table cannot have an `anyarray` column. Requiring an enum type is cleaner but forces a schema change on the user's table, which defeats "point it at the table you have". Type OIDs do not survive dump and restore; a type name does. |
 | Q4 | Supported PostgreSQL majors? | **17, 18, 19** (as pg_fts). | 17 is the oldest still widely deployed with the APIs we need. `dev/regress.sh` needs 18 (`extension_control_path`); the flake gates 17. |
 | Q5 | Use pgmpy (Python) as an independent oracle in tests? | **Yes, as its own flake check**, never in `make installcheck`. | An oracle we wrote ourselves shares our misreadings of the math. pgmpy 1.1.2 is in nixpkgs. Keeping it out of PGXS keeps distro builds Python-free. |
-| Q6 | Where is the canonical repository? | **Ask.** pg_fts uses Codeberg with a GitHub mirror and runs CI only on GitHub (Codeberg has no shared runners). | Needed before the first push; nothing is pushed yet. |
+| Q6 | Where is the canonical repository? | **Codeberg** (gregburd/pg_gaps), mirrored to GitHub (gburd/pg_gaps). | Decided 2026-11-20.  CI: Woodpecker on Codeberg, Actions on GitHub, both through `ci/pgdg.sh`; releases and PGXN from the GitHub workflow. |
 | Q7 | Name, schema, license. | `pg_gaps`, schema `gaps`, PostgreSQL License. | Matches pg_fts. Schema is fixed (`relocatable = false`) because the catalog tables reference each other. |
 | Q8 | One call per whole query, or a derived-model handle so calls chain (`select_rows(...)` feeding a later `marginals(...)`)? | **One call per query for now.** | BayesStore operators return a relation _and_ a model, and the next operator needs both (DESIGN.md, Principle 1). Composing marginals in SQL silently assumes independence. A handle needs a lifetime, an owner and invalidation rules; design it when a user needs chaining, not before. |
 
@@ -54,8 +54,9 @@ constants (a catalog change) and the rest of the grounding cost (Phase
 6).  Gated on PG 17.12, 18.7 and 19.0 (nixpkgs with clang; PGDG on Fedora
 44 with gcc 16 and `-Werror`).  Exact inference handles vertical
 correlations (any component the size bounds allow); Gibbs sampling covers
-larger components when `gaps.samples` is set.  Packaged for PGXN, not yet
-published: there is no public repository (Q6).
+larger components when `gaps.samples` is set.  Public at
+codeberg.org/gregburd/pg_gaps (mirror github.com/gburd/pg_gaps); GitHub CI
+green on the first push.  Packaged for PGXN, not yet published.
 
 | phase | item | status |
 |---|---|---|
@@ -72,7 +73,7 @@ published: there is no public repository (Q6).
 | 2 | `SupportRequestRows` for the SRFs | done: catalog plus `stanullfrac` estimate, under the `pg_stats` visibility rule; ROWS fallback; no lock waits, none on a standby or under SERIALIZABLE; replans on ANALYZE (`sql/rows.sql`) |
 | 2 | grounding cost | **open**: entity keys are typed composites and temp tables are reused per transaction: `marginals` 2.0-2.6x faster on the hotel workload (10.3 s for 2M variables on EC2), 1.7x on a 900-attribute model, 3 ms slower on a 2-attribute one (`bench/RESULTS_GROUNDING_2026-11-20.md`); keys of the same types share tables whatever their names, so 300 and 2,000 relations keyed by differently named int columns hold main's lock count plus 12 and take 0.70-0.83x its time per call (local), and more than 100 key shapes is an `ERROR`; what remains is sorting integer instance rows (Phase 6) |
 | 3 | Gibbs sampling for components too large for exact | done: `gaps.samples` (per chain), `gaps.seed`; 4 chains from dispersed starts, refused (`ERROR`) when two chains' estimates differ by more than 0.1.  On models of at most 12 variables (20,000 random strictly positive cases) and the 6 x 6 grid, Rao-Blackwellized marginals are within 0.1 of exact at 4,000 samples (largest error 0.025) with no refusals; the review's multimodal grid and hub models are refused.  The check cannot see chains all stuck in one mode, so a sampled answer can still be wrong without an error (DESIGN.md "Gibbs sampling, as built").  Refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
-| 8 | PGXN packaging | done: `META.json` (`pgxn_meta` clean), `make dist`, `make check-meta` in the flake and CI, `.github/workflows/release.yml`; the zip builds and passes on PGDG 17, 18, 19 with gcc `-Werror`.  **Not published** (no remote; the workflow has never run) |
+| 8 | PGXN packaging | done: `META.json` (`pgxn_meta` clean), `make dist`, `make check-meta` in the flake and CI, `.github/workflows/release.yml`; the zip builds and passes on PGDG 17, 18, 19 with gcc `-Werror`.  **Not published**: the release workflow has not run |
 | 3 | full hotel workload with its vertical factors | done: runs exact, components of at most 4 variables (`bench/hotel.sql`, `bench/RESULTS_HOTEL_2026-11-20.md`) |
 
 ## Phase 1: model catalog and validation
