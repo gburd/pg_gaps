@@ -61,8 +61,8 @@ components too large to solve exactly.
 | 1 | catalog, triggers, row-level security, declaration functions | done (`sql/catalog.sql`) |
 | 1 | data-dependent validity: coverage, mappings total, evidence consistent, cycles | done (`sql/infer.sql`) |
 | 1 | the dependency-graph check before grounding [W11 3.3.2] | **open**: cycles are found on the ground network instead (gx_check), which is exact but needs the data |
-| 1 | `pg_dump` / restore TAP test | **open** |
-| 1 | dropped or altered table names the change | done for drop and type change via `_resolve`; no test yet, **open** |
+| 1 | `pg_dump` / restore test | done (`test/dump`; in the flake, CI and `dev/qualify-pgdg.sh`; fails if one config table is not registered) |
+| 1 | dropped or altered table names the change | done: rename, type change and drop each refused with the name (`test/dump`) |
 | 2 | engine: exact inference, bucket tree, log space, bounds, sharing | done; brute-force oracle, closed forms, allocation failure (`test/engine`); two independent reviews |
 | 2 | `marginals`, `impute`, `learn_cpts` | done (`sql/infer.sql`, `sql/learn.sql`) |
 | 2 | pgmpy cross-check | done: 2,647 to 2,762 marginals per run agree to 1e-9 (`test/pgmpy`, flake check `pgmpy`) |

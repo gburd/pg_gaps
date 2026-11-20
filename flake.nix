@@ -90,6 +90,8 @@
                 -o "-k $TMPDIR -c listen_addresses=" start
               make installcheck PG_CONFIG=${pg.pg_config}/bin/pg_config \
                 || { cat regression.diffs 2>/dev/null; cat "$TMPDIR/server.log"; exit 1; }
+              PGDATABASE=postgres bash test/dump/run.sh \
+                || { cat "$TMPDIR/server.log"; exit 1; }
               pg_ctl -D "$PGDATA" -w stop
               touch $out
               runHook postBuild

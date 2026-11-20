@@ -257,10 +257,14 @@ AS $$
 	WHERE s.stripe_id = stripe
 $$;
 
--- Check a factor's CPT against its child's and parents' domains.  Called
--- by the trigger on gaps.factor and again whenever a parent is added, since
--- adding a parent changes the length the CPT must have.
-CREATE FUNCTION gaps._cpt_check(f int) RETURNS void
+-- Check a factor's CPT.  Every entry finite and non-negative, every run of
+-- |child domain| entries a distribution: that much the factor row alone
+-- determines, and the trigger on gaps.factor checks it on every write.
+-- With with_parents, also check the length against the parents' domains; that
+-- needs the factor's gaps.factor_parent rows, which pg_restore loads in a
+-- later transaction than gaps.factor, so it is checked by the declaring
+-- functions and at every grounding, not by the trigger.
+CREATE FUNCTION gaps._cpt_check(f int, with_parents boolean) RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
@@ -279,11 +283,14 @@ BEGIN
 	SELECT rows * coalesce(exp(sum(ln(gaps._card(parent_stripe))))::bigint, 1) INTO rows
 	FROM gaps.factor_parent WHERE factor_id = f;
 	want := rows * k;
-	IF array_ndims(fr.cpt) <> 1 OR array_length(fr.cpt, 1) <> want THEN
+	IF array_ndims(fr.cpt) <> 1 OR array_length(fr.cpt, 1) % k <> 0
+	   OR (with_parents AND array_length(fr.cpt, 1) <> want) THEN
 		RAISE EXCEPTION 'CPT of factor "%" has % entries, needs %', fr.name,
-			coalesce(array_length(fr.cpt, 1), 0), want
+			coalesce(array_length(fr.cpt, 1), 0),
+			CASE WHEN with_parents THEN want::text ELSE format('a multiple of %s', k) END
 			USING DETAIL = format('%s parent combinations x %s child values', rows, k);
 	END IF;
+	rows := array_length(fr.cpt, 1) / k;
 	IF EXISTS (SELECT 1 FROM unnest(fr.cpt) v
 			   WHERE v IS NULL OR v < 0 OR v = 'Infinity'::float8 OR v = 'NaN'::float8) THEN
 		RAISE EXCEPTION 'CPT of factor "%" has a NULL, negative, infinite or NaN entry', fr.name;
@@ -305,13 +312,10 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
 	IF TG_TABLE_NAME = 'factor' THEN
-		PERFORM gaps._cpt_check(NEW.factor_id);
-	ELSE
-		IF EXISTS (SELECT 1 FROM gaps.factor f WHERE f.factor_id = NEW.factor_id
-				   AND f.child_stripe = NEW.parent_stripe) THEN
-			RAISE EXCEPTION 'a stripe cannot be a parent of itself';
-		END IF;
-		PERFORM gaps._cpt_check(NEW.factor_id);
+		PERFORM gaps._cpt_check(NEW.factor_id, false);
+	ELSIF EXISTS (SELECT 1 FROM gaps.factor f WHERE f.factor_id = NEW.factor_id
+				  AND f.child_stripe = NEW.parent_stripe) THEN
+		RAISE EXCEPTION 'a stripe cannot be a parent of itself';
 	END IF;
 	RETURN NULL;
 END
@@ -481,6 +485,7 @@ BEGIN
 		INSERT INTO gaps.factor_parent (factor_id, ord, parent_stripe)
 		VALUES (f, i, gaps._stripe_id(model, parents[i]));
 	END LOOP;
+	PERFORM gaps._cpt_check(f, true);
 END
 $$;
 
@@ -514,6 +519,8 @@ BEGIN
 	IF NOT FOUND THEN
 		RAISE EXCEPTION 'factor "%" does not exist in model "%"', factor, model;
 	END IF;
+	PERFORM gaps._cpt_check(x.factor_id, true) FROM gaps.factor x
+	WHERE x.model_id = gaps._model_id(model) AND x.name = set_cpt.factor;
 END
 $$;
 
@@ -659,6 +666,7 @@ BEGIN
 			RAISE EXCEPTION 'factor "%" has no CPT', f.name
 				USING HINT = 'Set one with gaps.set_cpt or learn one with gaps.learn_cpts.';
 		END IF;
+		PERFORM gaps._cpt_check(f.factor_id, true);
 		SELECT * INTO a FROM gaps.attribute WHERE attribute_id = f.cattr;
 		w := gaps._stripe_where(f.child_stripe, 'c', 1);
 

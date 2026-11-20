@@ -8,7 +8,8 @@
 # Usage: dev/qualify-pgdg.sh BINDIR...
 #   e.g. dev/qualify-pgdg.sh /usr/pgsql-17/bin /usr/pgsql-18/bin /usr/pgsql-19/bin
 #
-# Each BINDIR holds pg_config, initdb, pg_ctl and postgres for one major.
+# Each BINDIR holds pg_config, initdb, pg_ctl, postgres, psql, pg_dump and
+# pg_restore for one major.  Runs the regression suite and test/dump.
 # The extension is installed into a per-run DESTDIR that the server is
 # pointed at, so nothing is written into the server's prefix.  That needs
 # extension_control_path (PostgreSQL 18+); for 17 the script falls back to
@@ -66,6 +67,10 @@ EOF
 	"$bindir/pg_ctl" -D "$run/data" -l "$run/server.log" -w start >/dev/null
 	local rc=0
 	mk installcheck PGHOST="$run" PGUSER=postgres || rc=$?
+	if [ "$rc" -eq 0 ]; then
+		PATH="$bindir:$PATH" PGHOST="$run" PGUSER=postgres PGDATABASE=postgres \
+			bash "$src/test/dump/run.sh" >/dev/null || rc=$?
+	fi
 	"$bindir/pg_ctl" -D "$run/data" -w -m fast stop >/dev/null
 	if [ "$rc" -ne 0 ]; then
 		echo "  diffs: $build/regression.diffs  log: $run/server.log" >&2

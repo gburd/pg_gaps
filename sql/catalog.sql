@@ -55,6 +55,13 @@ SELECT gaps.set_cpt('sensors', 'learnme', ARRAY[0.9, 0.1, 0.1]);               -
 SELECT gaps.set_cpt('sensors', 'learnme', ARRAY[0.9, 0.1, 0.1, 0.9]);
 SELECT name, cpt FROM gaps.factor ORDER BY factor_id;
 
+-- Direct DML meets the per-row checks at once.  The length against the
+-- parents' domains needs gaps.factor_parent, which pg_restore loads in a
+-- later transaction, so a direct write is checked for it at the next
+-- grounding instead (sql/infer.sql); the functions check it at once.
+UPDATE gaps.factor SET cpt = ARRAY[0.5, 0.6, 0.5, 0.5] WHERE name = 'learnme';  -- fail: sum
+UPDATE gaps.factor SET cpt = ARRAY[0.5, 0.5, 0.5] WHERE name = 'learnme';       -- fail: not a multiple of 2
+
 -- Row-level security: another role sees no models and cannot add to one.
 CREATE ROLE gaps_other;
 GRANT SELECT ON sensor TO gaps_other;

@@ -139,6 +139,12 @@ SELECT gaps.map_factor('cyc', 'ba', 1, 'room', 'room');
 SELECT * FROM gaps.marginals('cyc');                         -- fail: cycle
 SELECT gaps.drop_model('cyc');
 
+-- A CPT written directly with a length that fits the child but not the
+-- parents is refused at grounding.
+UPDATE gaps.factor SET cpt = ARRAY[0.5, 0.5] WHERE name = 'copy';
+SELECT * FROM gaps.marginals('m');                           -- fail: CPT length
+UPDATE gaps.factor SET cpt = ARRAY[0.9, 0.1, 0.2, 0.8] WHERE name = 'copy';
+
 -- Evidence the model calls impossible.
 SELECT gaps.create_model('z');
 SELECT gaps.declare_attribute('z', 'sensor', 'temp', ARRAY['cold', 'hot']);
