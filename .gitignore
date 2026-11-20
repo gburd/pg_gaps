@@ -40,3 +40,6 @@ result-*
 # Papers kept beside the tree for reference.  They are publishers' copyright
 # and are not redistributed; doc/DESIGN.md cites them by URL.
 *.pdf
+
+# make dist output
+/pg_gaps-*.zip

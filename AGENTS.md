@@ -121,7 +121,9 @@ are specific to probabilistic inference.
 25. **A release renames the base install script** (`git mv
     pg_gaps--<old>.sql pg_gaps--<new>.sql`) and adds the
     `pg_gaps--<old>--<new>.sql` upgrade edge. The version lives in
-    `pg_gaps.control` only; the Makefile and flake read it from there.
+    `pg_gaps.control`; the Makefile and flake read it from there.
+    `META.json` (PGXN) repeats it and `make check-meta`, run by the flake
+    and CI, fails until the two agree.
 26. **Do not commit the papers.** They are the publishers' copyright;
     cite them by URL.
 

@@ -48,6 +48,7 @@
           fileset = lib.fileset.unions [
             ./Makefile
             ./pg_gaps.control
+            ./META.json
             (lib.fileset.fileFilter (f: lib.hasSuffix ".sql" f.name) ./.)
             ./src
             ./expected
@@ -147,7 +148,7 @@
             # The Makefile target is the one implementation of this rule.
             ascii = pkgs.runCommand "pg_gaps-check-ascii"
               { nativeBuildInputs = [ pkgs.gnumake devPg.pg_config ]; } ''
-              make -C ${src} check-ascii
+              make -C ${src} check-ascii check-meta
               touch $out
             '';
           };

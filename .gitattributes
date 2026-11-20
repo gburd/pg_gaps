@@ -1,0 +1,14 @@
+# Files left out of the source distribution (make dist, PGXN).  The zip
+# carries the buildable extension, its regression tests and the user docs.
+.gitattributes export-ignore
+.editorconfig export-ignore
+.envrc export-ignore
+.gitignore export-ignore
+.github export-ignore
+.agent export-ignore
+AGENTS.md export-ignore
+bench export-ignore
+dev export-ignore
+flake.nix export-ignore
+flake.lock export-ignore
+test export-ignore

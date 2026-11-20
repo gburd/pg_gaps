@@ -36,3 +36,9 @@ session settings.  A variable that is its own parent in the ground
 network is now reported as a directed cycle rather than a malformed
 network.  validate refuses a model with more than 100 factors or
 20000 parent slots, or whose stripe tests exceed a fixed budget.
+
+PGXN packaging: `META.json` (validated with `pgxn_meta`), `make dist`
+producing the PGXN source zip from `git archive`, `make check-meta`
+(run by the flake and CI) holding `META.json` to the control file's
+version, and a tag-triggered release workflow that tests the zip and
+uploads it to PGXN.

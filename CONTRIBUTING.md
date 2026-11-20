@@ -63,3 +63,21 @@ tested on its own; keep it that way.
 There is no CLA and no sign-off requirement.  By contributing you agree
 that your contribution is licensed under the PostgreSQL License
 (`LICENSE`).
+
+## Releasing
+
+1. Bump `default_version` in `pg_gaps.control` and both `"version"`
+   fields in `META.json` (`make check-meta` fails until they agree), and
+   rename the install script as AGENTS.md rule 25 says.
+2. Move `CHANGELOG.md`'s "Unreleased" section under the new version.
+   Change `META.json`'s `release_status` from `testing` to `stable` for a
+   release that should be PGXN's default.
+3. Tag `vX.Y.Z` and push the tag to GitHub.  `.github/workflows/release.yml`
+   builds `make dist` (a PGXN-layout `pg_gaps-X.Y.Z.zip` from `git
+   archive`; `.gitattributes` keeps development files out), builds and
+   tests the zip itself, attaches it to a GitHub Release, and uploads it to
+   PGXN with the `PGXN_USER` and `PGXN_PASSWORD` repository secrets
+   (skipped with a warning when they are not set).
+4. To republish an existing tag, run the workflow by hand
+   (`workflow_dispatch`) with the tag; do not re-tag.  PGXN answers 409 for
+   a version it already has.
