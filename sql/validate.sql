@@ -335,6 +335,24 @@ BEGIN
 END
 $$;
 SELECT * FROM gaps.validate('big');                          -- fail: too many factors
+-- Unit-domain parents leave the CPT length independent of the parent count.
+DO $$
+BEGIN
+	PERFORM gaps.create_model('wide');
+	PERFORM gaps.declare_attribute('wide', 'sensor1', 'tp', ARRAY['only']);
+	PERFORM gaps.add_stripe('wide', 'c', 'sensor1', 'tp');
+	PERFORM gaps.add_stripe('wide', 'p', 'sensor1', 'tp');
+	PERFORM gaps.add_factor('wide', 'f', 'c', '{}', ARRAY[1.0]);
+	INSERT INTO gaps.factor_parent (factor_id, ord, parent_stripe)
+	SELECT f.factor_id, j, s.stripe_id
+	FROM gaps.model m
+		JOIN gaps.factor f USING (model_id)
+		JOIN gaps.stripe s USING (model_id),
+		generate_series(1, 20001) j
+	WHERE m.name = 'wide' AND s.name = 'p';
+END
+$$;
+SELECT * FROM gaps.validate('wide');                         -- fail: too many parent slots
 SELECT * FROM gaps.validate('nosuch');                       -- fail: no model
 
 DROP TABLE sensor1, reading, soundness, inh, inh_c, dfr, imm;

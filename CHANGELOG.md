@@ -16,4 +16,5 @@ inheritance children makes each entity one row) whose type's comparison
 operators are a btree total order and whose input does not depend on
 session settings.  A variable that is its own parent in the ground
 network is now reported as a directed cycle rather than a malformed
-network.
+network.  validate refuses a model with more than 100 factors or
+20000 parent slots, or whose stripe tests exceed a fixed budget.

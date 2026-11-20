@@ -775,18 +775,23 @@ $$;
 -- other type's quals count as may share.
 --
 -- Cost: the attributes are resolved first, as grounding resolves them.
--- Then each distinct pair of a child stripe and a parent stripe on one
--- attribute is tested once (gaps._may_share_rvs, which looks only at the
--- columns the pair's quals name); a pair whose stripes have n1 and n2 quals
--- counts 10 + (n1 + n2)^2 (the test's fixed cost, then a bound on its
--- column tests and qual comparisons), and the sum over the pairs is limited
--- to 200000 before any test runs.  So validate makes at most 20000 pair
--- tests and 200000 qual comparisons, a few seconds either way (6.9 s for
--- 19900 pairs, 2.0 s for one pair of 444 quals, on the development host).
--- The cycle search makes at most F passes over at most F^2 edges for F
--- factors, so models are limited to 100 factors.  Grounding does not call
--- this: gx_check finds ground cycles exactly in time linear in the ground
--- network, so a structural proof saves it nothing.
+-- Before anything else, models are limited to 100 factors and 20000 parent
+-- slots (gaps.factor_parent rows), since a parent with a one-value domain
+-- leaves the slot count unbounded by the CPT.  Then each distinct pair of a
+-- child stripe and a parent stripe on one attribute is tested once
+-- (gaps._may_share_rvs, which looks only at the columns the pair's quals
+-- name); a pair whose stripes have n1 and n2 quals counts 10 + (n1 + n2)^2
+-- (the test's fixed cost, then a bound on its column tests and qual
+-- comparisons), and the sum over the pairs is limited to 200000 before any
+-- test runs.  So validate makes at most 20000 pair tests and 200000 qual
+-- comparisons.  Building the edges joins each pair to the factors over its
+-- stripes, at most F x slots = 2000000 rows.  The cycle search makes at
+-- most F passes over at most F^2 edges for F factors.  On the development
+-- host the worst models measured take under 7 s (6.9 s for 19900 pairs
+-- and 1990000 edge rows, 5.1 s for 100 factors sharing 20000 slots, 2.0 s
+-- for one pair of 444 quals).  Grounding does not call this: gx_check
+-- finds ground cycles exactly in time linear in the ground network, so a
+-- structural proof saves it nothing.
 CREATE FUNCTION gaps.validate(model text, OUT test text, OUT ok boolean, OUT detail text)
 RETURNS SETOF record
 LANGUAGE plpgsql STABLE
@@ -795,6 +800,7 @@ AS $$
 DECLARE
 	m int := gaps._model_id(model);
 	nf int;
+	np bigint;
 	ncmp bigint;
 	pc int[];
 	pp int[];
@@ -811,6 +817,13 @@ BEGIN
 	SELECT count(*) INTO nf FROM gaps.factor fa WHERE fa.model_id = m;
 	IF nf > 100 THEN
 		RAISE EXCEPTION 'model "%" has % factors; gaps.validate handles at most 100', model, nf
+			USING HINT = 'Grounding (gaps.marginals) still checks the ground network for cycles exactly.';
+	END IF;
+	SELECT count(*) INTO np FROM gaps.factor_parent fp JOIN gaps.factor fa USING (factor_id)
+	WHERE fa.model_id = m;
+	IF np > 20000 THEN
+		RAISE EXCEPTION 'model "%" has % parent slots; gaps.validate handles at most 20000',
+			model, np
 			USING HINT = 'Grounding (gaps.marginals) still checks the ground network for cycles exactly.';
 	END IF;
 
