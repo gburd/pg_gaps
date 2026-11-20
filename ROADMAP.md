@@ -60,7 +60,8 @@ components too large to solve exactly.
 |---|---|---|
 | 1 | catalog, triggers, row-level security, declaration functions | done (`sql/catalog.sql`) |
 | 1 | data-dependent validity: coverage, mappings total, evidence consistent, cycles | done (`sql/infer.sql`) |
-| 1 | the dependency-graph check before grounding [W11 3.3.2] | done: `gaps.validate`, sound from the predicates alone, no lineage trace; grounding keeps gx_check (`sql/validate.sql`, 300 random models) |
+| 1 | the dependency-graph check before grounding [W11 3.3.2] | done: `gaps.validate`, sound from the predicates alone, no lineage trace; grounding keeps gx_check (`sql/validate.sql`, 500 random models, row and coarse entities); one review, its 4 counterexamples fixed |
+| 1 | store `stripe_qual` constants in canonical form (cast to the column type and back at `add_stripe_qual`) | **open**: constants are text cast at use, so a model over `timestamptz`, `date`, `interval` or `money` columns means different things under different TimeZone, DateStyle, IntervalStyle or lc_monetary; `validate` refuses to reason about those types meanwhile. Catalog change |
 | 1 | `pg_dump` / restore test | done (`test/dump`; in the flake, CI and `dev/qualify-pgdg.sh`; fails if one config table is not registered) |
 | 1 | dropped or altered table names the change | done: rename, type change and drop each refused with the name (`test/dump`) |
 | 2 | engine: exact inference, bucket tree, log space, bounds, sharing | done; brute-force oracle, closed forms, allocation failure (`test/engine`); two independent reviews |

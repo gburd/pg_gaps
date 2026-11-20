@@ -143,17 +143,48 @@ Whether two stripes may share an RV is decided from their quals.  They
 cannot when they are on different attributes, or when two quals (from
 either stripe) contradict on a column fixed per entity: an entity key, or
 any column when the entity keys include the primary key, so each entity
-is one row.  A qual on another column selects rows, and rows of one
-coarse entity can fall on both sides.  Two quals contradict when one is
-`= c` and `c` fails the other, or a lower bound (`>`, `>=`) lies above an
-upper bound (`<`, `<=`), or they meet at one constant and either is
-strict, with constants compared as grounding compares them (cast to the
-column's type, in its collation).  These hold in any total order, so the
-test is sound; anything else counts as may share.  It is not complete:
-`<>` contradicts only `=`, and it does not see the gaps of a discrete
-type (`t > 1` and `t < 2` over `int`).  Grounding keeps the exact check
-(gx_check) and does not run validate.  `sql/validate.sql` checks
-soundness against grounding over 300 random models.
+is one row.  The primary key counts only when it is not deferrable and
+the relation has no inheritance children or partitions: grounding reads
+`FROM rel`, children included, and neither a parent's key nor a deferred
+one keeps two rows of one entity apart.  A qual on another column selects
+rows, and rows of one coarse entity can fall on both sides.  Two quals
+contradict when one is `= c` and `c` fails the other, or a lower bound
+(`>`, `>=`) lies above an upper bound (`<`, `<=`), or they meet at one
+constant and either is strict, with constants compared as grounding
+compares them (cast to the column's type, in its collation).  These rules
+need `=`, `<` and `>` to be a total order consistent with equality, so a
+column counts only when its type's `<`, `<=`, `=`, `>=` and `>` are the
+strategies of one btree operator family and `<>` negates that `=` (box
+has all six operators, but its `=` compares areas within a tolerance and
+is not transitive).  Under those conditions the test is sound; anything
+else counts as may share.  It is not complete: `<>` contradicts only
+`=`, it does not see the gaps of a discrete type (`t > 1` and `t < 2`
+over `int`), and a type with no comparison operators of its own
+(`varchar`, a domain) is not reasoned about.
+
+The constants are text, cast to the column type each time a model is
+used, so for types whose input depends on the session (`date`,
+`timestamp`, `timestamptz`, `time`, `timetz` and `interval` on TimeZone
+and DateStyle, `interval` also on IntervalStyle, `money` on
+lc_monetary, the `reg*` types on search_path) the model itself means
+different things in different sessions.  validate does not reason about
+a column whose type's input function is not immutable, which excludes
+all of these, so its verdict does not depend on the session; grounding
+still casts those constants under the caller's settings.  Storing the
+constants in canonical form is an open ROADMAP item.  A proof also
+assumes the catalogs as they were when validate ran: DDL afterwards (a
+child table added, a key made deferrable) can void it.  validate
+resolves the model's tables and columns first, as grounding does, and
+fails with the same messages.
+
+Grounding keeps the exact check (gx_check) and does not run validate.
+`sql/validate.sql` checks soundness against grounding over 500 random
+models: 300 whose entities are rows, and 200 over coarse entities with
+quals on a column outside the entity keys, which must never separate
+entities.  validate tests each distinct pair of child and parent stripe
+once and refuses, before testing any, a model whose pair tests and qual
+comparisons would exceed a fixed budget (200000 units; see the function's
+comment), so it takes seconds at most.
 
 Two more conditions are needed for `F` to be a distribution at all, and
 the thesis does not state them (my inference): every RV of a declared

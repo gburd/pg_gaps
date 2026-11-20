@@ -121,6 +121,12 @@ SELECT * FROM gaps.marginals('self');                        -- fail: cycle
 
 -- The overlap test, one stripe pair per row: whether the predicates alone
 -- leave room for a shared RV.  A false is a proof; a true is "may".
+CREATE FUNCTION pg_temp.share(model text, a text, b text) RETURNS boolean
+LANGUAGE sql AS $$
+	SELECT gaps._may_share_rvs(gaps._stripe_id(model, a), gaps._stripe_id(model, b),
+							   gaps._fixed_columns(s.attribute_id))
+	FROM gaps.stripe s WHERE s.stripe_id = gaps._stripe_id(model, a)
+$$;
 SELECT gaps.create_model('ops');
 SELECT gaps.declare_attribute('ops', 'sensor1', 'tp', ARRAY['cold', 'hot']);
 SELECT gaps.declare_attribute('ops', 'sensor1', 'l', ARRAY['dark', 'bright']);
@@ -145,8 +151,7 @@ SELECT pg_temp.stripe(n, a::name, q::text[]) FROM (VALUES
 	('loc_ab', 'tp', '{{loc},{>},{ab}}'), ('t1', 'tp', '{{t},{=},{1}}'),
 	('sid1_not_t1', 'tp', '{{sid,t},{=,<>},{1,1}}'), ('l_eq1', 'l', '{{sid},{=},{1}}'))
 	v(n, a, q);
-SELECT a, b, gaps._may_share_rvs(gaps._stripe_id('ops', a), gaps._stripe_id('ops', b))
-	AS may_share
+SELECT a, b, pg_temp.share('ops', a, b) AS may_share
 FROM (VALUES ('eq1', 'eq2'), ('eq1', 'eq1b'), ('eq1', 'ne1'), ('ne1', 'ne2'),
 			 ('lt1', 'ge1'), ('le1', 'ge1'), ('le1', 'gt1'), ('lt1', 'gt1'),
 			 ('eq3', 'le2'), ('eq2', 'le2'), ('eq1', 'gap'), ('gap', 'all'),
@@ -167,18 +172,80 @@ SELECT gaps.add_stripe_qual('coarse', 'k2', 'k', '=', '2');
 SELECT gaps.add_stripe('coarse', 'k2s2', 'reading', 'status');
 SELECT gaps.add_stripe_qual('coarse', 'k2s2', 'k', '=', '2');
 SELECT gaps.add_stripe_qual('coarse', 'k2s2', 'sid', '=', '2');
-SELECT gaps._may_share_rvs(gaps._stripe_id('coarse', 'k1'), gaps._stripe_id('coarse', 'k2'))
-	AS k1_k2,
-	   gaps._may_share_rvs(gaps._stripe_id('coarse', 'k1'), gaps._stripe_id('coarse', 'k2s2'))
-	AS k1_k2s2;
+SELECT pg_temp.share('coarse', 'k1', 'k2') AS k1_k2,
+	   pg_temp.share('coarse', 'k1', 'k2s2') AS k1_k2s2;
+
+-- A primary key makes each entity one row only where it is enforced on
+-- every statement and covers every row grounding reads.  An inheritance
+-- child is read with its parent and the parent's key does not cover it,
+-- and a deferrable key allows duplicates until commit, so in both a qual
+-- on a non-key column does not split entities.
+CREATE TABLE inh (id int PRIMARY KEY, loc text, tp text);
+CREATE TABLE inh_c () INHERITS (inh);
+CREATE TABLE dfr (id int PRIMARY KEY DEFERRABLE, loc text, tp text);
+CREATE TABLE imm (id int PRIMARY KEY, loc text, tp text);
+SELECT gaps.create_model('keys');
+SELECT gaps.declare_attribute('keys', r, 'tp', ARRAY['x', 'y']),
+	   gaps.add_stripe('keys', r || '_a', r, 'tp'),
+	   gaps.add_stripe_qual('keys', r || '_a', 'loc', '=', 'a'),
+	   gaps.add_stripe('keys', r || '_b', r, 'tp'),
+	   gaps.add_stripe_qual('keys', r || '_b', 'loc', '=', 'b')
+FROM unnest(ARRAY['inh', 'dfr', 'imm']) r;
+SELECT r, pg_temp.share('keys', r || '_a', r || '_b') AS may_share
+FROM unnest(ARRAY['inh', 'dfr', 'imm']) r;
+-- The inheritance case grounds to the cycle validate cannot rule out.
+INSERT INTO inh VALUES (1, 'a', NULL);
+INSERT INTO inh_c VALUES (1, 'b', NULL);
+SELECT gaps.create_model('inhcyc');
+SELECT gaps.declare_attribute('inhcyc', 'inh', 'tp', ARRAY['x', 'y']);
+SELECT gaps.add_stripe('inhcyc', 'a', 'inh', 'tp');
+SELECT gaps.add_stripe_qual('inhcyc', 'a', 'loc', '=', 'a');
+SELECT gaps.add_stripe('inhcyc', 'b', 'inh', 'tp');
+SELECT gaps.add_stripe_qual('inhcyc', 'b', 'loc', '=', 'b');
+SELECT gaps.add_factor('inhcyc', 'f', 'a', ARRAY['b'], ARRAY[0.5, 0.5, 0.5, 0.5]);
+SELECT * FROM gaps.validate('inhcyc');
+SELECT * FROM gaps.marginals('inhcyc');                      -- fail: cycle
+
+-- The contradiction rules need a total order consistent with =.  Box has
+-- all six operators, but its = compares areas within a tolerance, so two
+-- boxes that are not equal can both equal a third: may share.  The input of timestamptz
+-- depends on TimeZone (and date's on DateStyle), so a proof over its
+-- constants would hold only for this session: may share.  int and text
+-- prove disjoint.
+CREATE TABLE typed (id int, b box, ts timestamptz, d date, x text, tp text,
+					PRIMARY KEY (id));
+SELECT gaps.create_model('types');
+SELECT gaps.declare_attribute('types', 'typed', 'tp', ARRAY['x', 'y']);
+SELECT gaps.add_stripe('types', c || '_1', 'typed', 'tp'),
+	   gaps.add_stripe_qual('types', c || '_1', c, '=', v1),
+	   gaps.add_stripe('types', c || '_2', 'typed', 'tp'),
+	   gaps.add_stripe_qual('types', c || '_2', c, '=', v2)
+FROM (VALUES ('id', '1', '2'), ('b', '(0,0),(1,1)', '(0,0),(1,1.0000018)'),
+			 ('ts', '2020-01-01 00:00+00', '2020-01-02 00:00+00'),
+			 ('d', '2020-01-01', '2020-01-02'), ('x', 'a', 'b')) v(c, v1, v2);
+SELECT c, pg_temp.share('types', c || '_1', c || '_2') AS may_share
+FROM unnest(ARRAY['id', 'b', 'ts', 'd', 'x']) c;
+
+-- validate resolves the model's tables and columns as grounding does.
+ALTER TABLE typed DROP COLUMN b;
+SELECT * FROM gaps.validate('types');                        -- fail: column dropped
+DROP TABLE typed;
+SELECT * FROM gaps.validate('types');                        -- fail: table dropped
+SELECT gaps.drop_model('types');
 
 -- Soundness against grounding, over random models (AGENTS.md rule 13):
 -- whenever validate proves a model, grounding finds no cycle.  Each model
--- has a Tp factor per sid, with random parents among the sids at the same
+-- has a factor per sid, with random parents among the sids at the same
 -- time; each stripe's sid is written one of several ways, some of which
--- the overlap test cannot see through, so all three outcomes occur.
-CREATE TABLE soundness (proved boolean, ground_cycle boolean);
-DO $$
+-- the overlap test cannot see through, so all three outcomes occur.  The
+-- sensor arm is over sensor1, whose entities are rows.  The coarse arm is
+-- over reading, whose entities are (sid, t) and hold rows k = 1 and k = 2,
+-- and each stripe also selects a random k: those quals never separate
+-- entities, and a test that let them would prove cyclic models.
+CREATE TABLE soundness (arm text, proved boolean, ground_cycle boolean);
+CREATE FUNCTION pg_temp.soundness(arm text, rel text, att name, domain text[], n int)
+RETURNS void
+LANGUAGE plpgsql AS $$
 DECLARE
 	forms text[] := ARRAY['=', '><', '>=<=', '=<>'];
 	proved boolean;
@@ -187,17 +254,17 @@ DECLARE
 	ps text[];
 	qual text;
 BEGIN
-	PERFORM setseed(0.5);
-	DELETE FROM sensor1;
-	INSERT INTO sensor1 (t, r, sid, loc) SELECT t, 1, s, 'x'
-	FROM generate_series(1, 2) t, generate_series(1, 3) s;
-	FOR iter IN 1 .. 300 LOOP
+	FOR iter IN 1 .. n LOOP
 		PERFORM gaps.create_model('rnd');
-		PERFORM gaps.declare_attribute('rnd', 'sensor1', 'tp', ARRAY['cold', 'hot']);
+		IF arm = 'coarse' THEN
+			PERFORM gaps.declare_attribute('rnd', rel, att, domain, ARRAY['sid', 't']::name[]);
+		ELSE
+			PERFORM gaps.declare_attribute('rnd', rel, att, domain);
+		END IF;
 		-- Stripe "c<k>" is the child for sid k, "p<k>" a parent stripe for it.
 		FOR k IN 1 .. 3 LOOP
 			FOREACH qual IN ARRAY ARRAY['c', 'p'] LOOP
-				PERFORM gaps.add_stripe('rnd', qual || k, 'sensor1', 'tp');
+				PERFORM gaps.add_stripe('rnd', qual || k, rel, att);
 				CASE forms[1 + floor(random() * 4)::int]
 					WHEN '=' THEN
 						PERFORM gaps.add_stripe_qual('rnd', qual || k, 'sid', '=', k::text);
@@ -212,6 +279,10 @@ BEGIN
 						PERFORM gaps.add_stripe_qual('rnd', qual || k, 'sid', '<>',
 													 (1 + (k + floor(random() * 2)::int) % 3)::text);
 				END CASE;
+				IF arm = 'coarse' THEN
+					PERFORM gaps.add_stripe_qual('rnd', qual || k, 'k', '=',
+												 (1 + floor(random() * 2)::int)::text);
+				END IF;
 			END LOOP;
 		END LOOP;
 		FOR k IN 1 .. 3 LOOP
@@ -234,14 +305,23 @@ BEGIN
 			END IF;
 			cyc := true;
 		END;
-		INSERT INTO soundness VALUES (proved, cyc);
+		INSERT INTO soundness VALUES (arm, proved, cyc);
 		PERFORM gaps.drop_model('rnd');
 	END LOOP;
 END
 $$;
-SELECT proved, ground_cycle, count(*) > 0 AS seen FROM soundness
-GROUP BY 1, 2 ORDER BY 1, 2;
-SELECT count(*) AS unsound FROM soundness WHERE proved AND ground_cycle;
+SELECT setseed(0.5);
+DELETE FROM sensor1;
+INSERT INTO sensor1 (t, r, sid, loc) SELECT t, 1, s, 'x'
+FROM generate_series(1, 2) t, generate_series(1, 3) s;
+SELECT pg_temp.soundness('sensor', 'sensor1', 'tp', ARRAY['cold', 'hot'], 300);
+INSERT INTO reading (sid, t, k) SELECT s, t, k
+FROM generate_series(1, 3) s, generate_series(1, 2) t, generate_series(1, 2) k;
+SELECT pg_temp.soundness('coarse', 'reading', 'status', ARRAY['up', 'down'], 200);
+SELECT arm, proved, ground_cycle, count(*) > 0 AS seen FROM soundness
+GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+SELECT arm, count(*) FILTER (WHERE proved AND ground_cycle) AS unsound
+FROM soundness GROUP BY 1 ORDER BY 1;
 
 -- validate is bounded.
 DO $$
@@ -257,5 +337,5 @@ $$;
 SELECT * FROM gaps.validate('big');                          -- fail: too many factors
 SELECT * FROM gaps.validate('nosuch');                       -- fail: no model
 
-DROP TABLE sensor1, reading, soundness;
+DROP TABLE sensor1, reading, soundness, inh, inh_c, dfr, imm;
 SELECT gaps.drop_model(name) FROM gaps.model ORDER BY name;
