@@ -85,6 +85,37 @@ the inner join it replaced at T = 125, and 10,414 / 10,300 against
 10,411 / 10,394 ms at T = 1250 (interleaved, A/A); every arm returned
 the same marginals (md5).
 
+Many relations.  The tables were first named by the key columns' names
+as well as their types, so relations keyed by differently named columns
+of one type each made their own set, about 16 locks per relation.  The
+re-review's probe (one table per attribute, each keyed by its own int
+column, `rereview-gk/n4.sql`, extended with five timed calls outside a
+transaction) measured 4,850 locks against main's 646 at 300 relations,
+4.6x main's time per call, and "out of shared memory" at 2,000.  The
+names are now positional (k1, k2, ...) and only types, typmods and
+collations name the tables, so all of those relations share one set.
+Locally (floki, PG 18.7, load average 8-9; main here is f3dd11e, whose SQL is f7feab3's; the
+branch is 1360541 before the merge), medians of calls 2-5:
+
+| relations | main locks | branch locks | main ms/call | branch ms/call |
+|---|---|---|---|---|
+| 300 | 643 | 655 | 138.6, 137.1 (A/A) | 114.1, 116.2 (A/A) |
+| 2,000 | 4,043 | 4,055 | 1,074 | 747 |
+
+The branch now holds main's locks plus one set of tables, and is
+0.70-0.84x main's time per call.  More than 100 distinct key shapes is
+an error naming the count (doc/DESIGN.md, "Key shapes").
+
+The change does not touch the hotel workload, whose attributes all have
+the same (t, room, sid) or (t, sid) keys, except for building entity
+names from the catalog.  On this host, T = 125, the branch with and
+without the change (its SQL reverted), each with its own cluster and
+freshly created databases (gaps function md5s differ between arms),
+marginals identical (39,846 rows), interleaved old, new three times:
+`_ground` medians 1,181 / 1,188 / 1,185 ms against 1,186 / 1,182 /
+1,187 ms, `marginals` 1,253 / 1,253 / 1,259 against 1,277 / 1,248 /
+1,276 ms.  The difference is within each arm's spread.
+
 Unmeasured on EC2: PG 17 and 19, vertical factors and coarse entity
 sets at scale, keys of types other than int.
 
