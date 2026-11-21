@@ -12,10 +12,14 @@ factor)` returns a factor's cells as rows with their parent values, child
 value, probability and prior, in array order.  DESIGN.md states that CPT
 entries follow `gaps.attribute.domain` in declaration order.
 
-`gaps._expected_counts`: the E-step of EM over a ground network, the
-expected count of every cell of every first-order factor's CPT given the
-evidence, and log P(evidence).  Internal, for the EM mode of
-`learn_cpts` that follows.
+EM for CPTs with missing values: `gaps.learn_cpts(model, alpha, method
+=> 'em', max_iterations => 50, tol => 1e-6)` learns from entities whose
+child or parents are missing, starting from the complete-data estimate
+and using the factor's prior as in the default method; it is EM for the
+posterior mode under Dirichlet(pseudocount + 1), stopped when the log
+posterior gains less than `tol`.  `learn_cpts` gains the columns
+`method`, `iterations`, `loglik` and `converged` (NULL for 'counts').
+Exact inference only.  `gaps._expected_counts` is its E-step.
 
 Gibbs sampling for components too large for exact inference: set
 `gaps.samples` (default 0, never) and `gaps.seed`.  `marginals` and

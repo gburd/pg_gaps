@@ -1661,24 +1661,136 @@ BEGIN
 END
 $$;
 
--- Learn every factor's CPT from the data: for each combination of parent
--- values, the posterior mean under a Dirichlet prior, which is the counts
--- of the child's values among child entities whose child and parents are
--- all observed, plus each cell's pseudocount, normalized:
--- (count + prior) / (total + sum(prior)) per parent row.  The pseudocounts
--- are the factor's gaps.factor.prior when set (gaps.set_prior), and alpha
--- in every cell otherwise: alpha is ignored for a factor with a prior.
--- alpha > 0 is additive smoothing, which keeps every cell positive, so a
--- value never seen is improbable rather than impossible.  A parent row
--- whose counts and pseudocounts are all zero gets the uniform
--- distribution.  Counts are per entity, not per row, so a
--- coarse entity counts once.  Returns the number of complete entities used
--- per factor.
+-- Normalize pseudocounts n (one CPT's layout, k values of the child per
+-- parent row) into distributions: each row divided by its sum, or uniform
+-- when its sum is 0.  Rows must sum to 1 within the trigger's 1e-9;
+-- division can leave a last-bit error, so the last entry of each row takes
+-- up the slack.  When that entry should be 0 the slack can come out as
+-- -2e-16; clamp it, which moves the row sum by no more than the slack.
+CREATE FUNCTION gaps._normalize(n float8[], k int) RETURNS float8[]
+LANGUAGE sql IMMUTABLE STRICT
+SET search_path = pg_catalog
+AS $$
+	WITH c AS (
+		SELECT i - 1 AS cell, x FROM unnest(n) WITH ORDINALITY u(x, i)),
+	normed AS (
+		SELECT cell, CASE WHEN sum(x) OVER w = 0 THEN 1.0 / k
+						  ELSE x / sum(x) OVER w END AS p
+		FROM c WINDOW w AS (PARTITION BY cell / k)),
+	slack AS (
+		SELECT cell, p, sum(p) OVER (PARTITION BY cell / k ORDER BY cell
+									 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+						AS before
+		FROM normed)
+	SELECT array_agg(CASE WHEN cell % k = k - 1
+						  THEN greatest(0.0, 1.0 - coalesce(before, 0)) ELSE p END
+					 ORDER BY cell)
+	FROM slack
+$$;
+
+-- The EM loop of gaps.learn_cpts(method => 'em'), over the ground network
+-- in the arrays (gaps._ground) and the factors in pg_gaps_learn, which
+-- holds each factor's pseudocounts and its starting CPT and receives the
+-- learned one.  The CPT array the network needs is rebuilt from
+-- pg_gaps_learn in factor order every iteration, which is the order
+-- gaps._ground lays the CPTs out in, so its cpt_off values name the same
+-- factors.  Each iteration evaluates the objective (log P(evidence) plus
+-- the log prior) at the current CPTs, stops if it improved by less than
+-- tol, and otherwise does one M-step; so the returned loglik belongs to
+-- the returned CPTs, and iterations counts M-steps.
+CREATE FUNCTION gaps._em(card int[], evidence int[], child int[], parent_off int[],
+	parents int[], cpt_off int[], max_iterations int, tol float8,
+	OUT iterations int, OUT loglik float8, OUT converged boolean)
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	cpts float8[];
+	obj float8;
+	prev float8;
+BEGIN
+	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_ec (
+		cpt_off int, cell int, n float8, loglik float8) ON COMMIT DROP;
+	iterations := 0;
+	converged := false;
+	LOOP
+		-- E-step at the current CPTs.
+		SELECT array_agg(x ORDER BY l.factor_id, u.i) INTO cpts
+		FROM pg_gaps_learn l, unnest(l.cpt) WITH ORDINALITY u(x, i);
+		TRUNCATE pg_gaps_ec;
+		INSERT INTO pg_gaps_ec
+		SELECT * FROM gaps._expected_counts(card, evidence, child, parent_off,
+											 parents, cpt_off, cpts);
+		SELECT coalesce(max(e.loglik), 0) INTO loglik FROM pg_gaps_ec e;
+
+		-- The objective the update climbs: the log posterior under
+		-- Dirichlet(pseudocount + 1), up to its normalizing constant.  A cell
+		-- with a positive pseudocount is never 0 after an update.
+		SELECT loglik + coalesce(sum(a * ln(x)), 0) INTO obj
+		FROM pg_gaps_learn l, unnest(l.pseudo, l.cpt) u(a, x) WHERE a > 0;
+		IF prev IS NOT NULL AND obj - prev < tol THEN
+			converged := true;
+			EXIT;
+		END IF;
+		EXIT WHEN iterations = max_iterations;
+		prev := obj;
+
+		-- M-step: expected counts plus pseudocounts, normalized per row.  A
+		-- factor with no instances has no counts and keeps its prior's mean.
+		WITH o AS (
+			SELECT l.factor_id,
+				   1 + coalesce(sum(cardinality(l.cpt)) OVER (ORDER BY l.factor_id
+					   ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS off
+			FROM pg_gaps_learn l)
+		UPDATE pg_gaps_learn l
+		SET cpt = (SELECT gaps._normalize(array_agg(l.pseudo[c.i] + coalesce(e.n, 0)
+													ORDER BY c.i), l.k)
+				   FROM generate_subscripts(l.pseudo, 1) c(i)
+					   LEFT JOIN pg_gaps_ec e ON e.cpt_off = o.off AND e.cell = c.i)
+		FROM o WHERE o.factor_id = l.factor_id;
+		iterations := iterations + 1;
+	END LOOP;
+END
+$$;
+
+-- Learn every factor's CPT from the data.
+--
+-- method 'counts' (the default): for each combination of parent values,
+-- the posterior mean under a Dirichlet prior, which is the counts of the
+-- child's values among child entities whose child and parents are all
+-- observed, plus each cell's pseudocount, normalized: (count + prior) /
+-- (total + sum(prior)) per parent row.  The pseudocounts are the factor's
+-- gaps.factor.prior when set (gaps.set_prior), and alpha in every cell
+-- otherwise: alpha is ignored for a factor with a prior.  alpha > 0 is
+-- additive smoothing, which keeps every cell positive, so a value never
+-- seen is improbable rather than impossible.  A parent row whose counts
+-- and pseudocounts are all zero gets the uniform distribution.  Counts are
+-- per entity, not per row, so a coarse entity counts once.
+--
+-- method 'em': expectation maximization, which also learns from entities
+-- with missing values (doc/DESIGN.md, "Learning with missing values").
+-- It starts from the 'counts' estimate and repeats: the expected counts
+-- of every cell given the evidence under the current CPTs
+-- (gaps._expected_counts, exact inference), then the same update with
+-- expected counts in place of counts.  That is the MAP update under a
+-- Dirichlet(pseudocount + 1) prior, so it never decreases the log
+-- posterior, loglik + sum(pseudocount * ln(cell)); it stops when an
+-- iteration improves that by less than tol, or after max_iterations.  The
+-- model is grounded once.  A component too large for exact inference is
+-- an ERROR; nothing is sampled.
+--
+-- One row per factor: complete_entities, the entities complete for the
+-- factor; for 'em', iterations run, loglik (log P(evidence) under the
+-- returned CPTs) and converged (false when max_iterations stopped it),
+-- all NULL for 'counts'.
 --
 -- The CPTs are statistics of the rows the caller can read, and anyone who
 -- can read the model can read them (doc/DESIGN.md, "Security").
 CREATE FUNCTION gaps.learn_cpts(model text, alpha float8 DEFAULT 1.0,
-	OUT factor text, OUT complete_entities bigint)
+	OUT factor text, OUT complete_entities bigint,
+	INOUT method text DEFAULT 'counts', max_iterations int DEFAULT 50,
+	tol float8 DEFAULT 1e-6,
+	OUT iterations int, OUT loglik float8, OUT converged boolean)
 RETURNS SETOF record
 LANGUAGE plpgsql
 ROWS 10 SUPPORT gaps._rows_support
@@ -1692,9 +1804,20 @@ DECLARE
 	nrows bigint;
 	newcpt float8[];
 	used bigint;
+	pseudo float8[];
+	r record;
 BEGIN
 	IF alpha IS NULL OR alpha < 0 OR alpha = 'Infinity'::float8 OR alpha = 'NaN'::float8 THEN
 		RAISE EXCEPTION 'alpha must be a finite non-negative number, not %', alpha;
+	END IF;
+	IF method IS NULL OR method NOT IN ('counts', 'em') THEN
+		RAISE EXCEPTION 'method must be ''counts'' or ''em'', not %', coalesce(method, 'NULL');
+	END IF;
+	IF max_iterations IS NULL OR max_iterations < 1 THEN
+		RAISE EXCEPTION 'max_iterations must be at least 1, not %', max_iterations;
+	END IF;
+	IF tol IS NULL OR tol < 0 OR tol = 'Infinity'::float8 OR tol = 'NaN'::float8 THEN
+		RAISE EXCEPTION 'tol must be a finite non-negative number, not %', tol;
 	END IF;
 
 	-- Grounding needs a CPT on every factor, but only uses them to build
@@ -1709,6 +1832,12 @@ BEGIN
 	WHERE fa.model_id = m AND fa.cpt IS NULL;
 	g := gaps._ground(m);
 
+	-- Each factor's pseudocounts and the complete-data estimate; EM starts
+	-- from it.
+	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_learn (
+		factor_id int, name text, k int, pseudo float8[], used bigint,
+		cpt float8[]) ON COMMIT DROP;
+	TRUNCATE pg_gaps_learn;
 	FOR f IN SELECT fa.factor_id, fa.name, fa.child_stripe, fa.prior FROM gaps.factor fa
 			 WHERE fa.model_id = m ORDER BY fa.factor_id LOOP
 		k := gaps._card(f.child_stripe);
@@ -1734,28 +1863,28 @@ BEGIN
 			WHERE g.evidence[inst.v] > 0
 			  AND NOT EXISTS (SELECT 1 FROM unnest(inst.ps) p WHERE g.evidence[p] = 0)),
 		counts AS (
-			SELECT c AS cell, coalesce(f.prior[c::int + 1], alpha) + count(cells.cell) AS n
+			SELECT c AS cell, coalesce(f.prior[c::int + 1], alpha) AS a,
+				   count(cells.cell) AS n
 			FROM generate_series(0, nrows - 1) c LEFT JOIN cells ON cells.cell = c
-			GROUP BY c),
-		normed AS (
-			SELECT cell, CASE WHEN sum(n) OVER w = 0 THEN 1.0 / k
-							  ELSE n / sum(n) OVER w END AS p
-			FROM counts
-			WINDOW w AS (PARTITION BY cell / k))
-		SELECT array_agg(p ORDER BY cell), (SELECT count(*) FROM cells)
-		INTO newcpt, used FROM normed;
+			GROUP BY c)
+		SELECT gaps._normalize(array_agg(a + n ORDER BY cell), k),
+			   array_agg(a ORDER BY cell), (SELECT count(*) FROM cells)
+		INTO newcpt, pseudo, used FROM counts;
+		INSERT INTO pg_gaps_learn VALUES (f.factor_id, f.name, k, pseudo, used, newcpt);
+	END LOOP;
 
-		-- Rows must sum to 1 within the trigger's 1e-9; division can leave a
-		-- last-bit error, so the last entry of each row takes up the slack.
-		-- When that entry should be 0 the slack can come out as -2e-16;
-		-- clamp it, which moves the row sum by no more than the slack.
-		FOR r IN 0 .. nrows / k - 1 LOOP
-			newcpt[r * k + k] := greatest(0.0, 1.0 - (SELECT coalesce(sum(newcpt[r * k + i]), 0)
-													 FROM generate_series(1, k - 1) i));
-		END LOOP;
-		UPDATE gaps.factor x SET cpt = newcpt WHERE x.factor_id = f.factor_id;
+	IF method = 'em' THEN
+		SELECT * INTO r FROM gaps._em(g.card, g.evidence, g.child, g.parent_off, g.parents,
+									  g.cpt_off, max_iterations, tol);
+		iterations := r.iterations;
+		loglik := r.loglik;
+		converged := r.converged;
+	END IF;
+
+	FOR f IN SELECT * FROM pg_gaps_learn ORDER BY factor_id LOOP
+		UPDATE gaps.factor x SET cpt = f.cpt WHERE x.factor_id = f.factor_id;
 		factor := f.name;
-		complete_entities := used;
+		complete_entities := f.used;
 		RETURN NEXT;
 	END LOOP;
 END

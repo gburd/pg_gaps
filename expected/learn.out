@@ -54,10 +54,10 @@ SELECT gaps.add_factor('lm', 'pb', 'b', ARRAY['a']);
 
 -- Unsmoothed: exact frequencies; P(b | a = y) has one observation.
 SELECT * FROM gaps.learn_cpts('lm', 0) ORDER BY factor;
- factor | complete_entities 
---------+-------------------
- pa     |                 8
- pb     |                 5
+ factor | complete_entities | method | iterations | loglik | converged 
+--------+-------------------+--------+------------+--------+-----------
+ pa     |                 8 | counts |            |        | 
+ pb     |                 5 | counts |            |        | 
 (2 rows)
 
 SELECT name, cpt FROM gaps.factor ORDER BY name;
@@ -79,10 +79,10 @@ FROM gaps.factor f,
 
 -- Smoothed with alpha = 1: (count + 1) / (total + |domain|).
 SELECT * FROM gaps.learn_cpts('lm') ORDER BY factor;
- factor | complete_entities 
---------+-------------------
- pa     |                 8
- pb     |                 5
+ factor | complete_entities | method | iterations | loglik | converged 
+--------+-------------------+--------+------------+--------+-----------
+ pa     |                 8 | counts |            |        | 
+ pb     |                 5 | counts |            |        | 
 (2 rows)
 
 SELECT bool_and(abs(c - w) < 1e-12) AS smoothed
@@ -111,10 +111,10 @@ ERROR:  alpha must be a finite non-negative number, not NaN
 -- A parent combination never seen complete, with alpha 0: uniform.
 DELETE FROM p WHERE a = 'y';
 SELECT * FROM gaps.learn_cpts('lm', 0) ORDER BY factor;
- factor | complete_entities 
---------+-------------------
- pa     |                 6
- pb     |                 4
+ factor | complete_entities | method | iterations | loglik | converged 
+--------+-------------------+--------+------------+--------+-----------
+ pa     |                 6 | counts |            |        | 
+ pb     |                 4 | counts |            |        | 
 (2 rows)
 
 SELECT cpt FROM gaps.factor WHERE name = 'pb';
@@ -133,10 +133,10 @@ SELECT gaps.set_prior('lm', 'pb', ARRAY[1, 2, 3, 0.5, 0.5, 1]);
 (1 row)
 
 SELECT * FROM gaps.learn_cpts('lm', 5) ORDER BY factor;
- factor | complete_entities 
---------+-------------------
- pa     |                 6
- pb     |                 4
+ factor | complete_entities | method | iterations | loglik | converged 
+--------+-------------------+--------+------------+--------+-----------
+ pa     |                 6 | counts |            |        | 
+ pb     |                 4 | counts |            |        | 
 (2 rows)
 
 SELECT bool_and(abs(c - w) < 1e-12) AS prior_rows
@@ -177,10 +177,10 @@ SELECT gaps.set_prior('lm', 'pb', ARRAY[1, 1, 1, 0, 0, 0]);
 (1 row)
 
 SELECT * FROM gaps.learn_cpts('lm') ORDER BY factor;
- factor | complete_entities 
---------+-------------------
- pa     |                 6
- pb     |                 4
+ factor | complete_entities | method | iterations | loglik | converged 
+--------+-------------------+--------+------------+--------+-----------
+ pa     |                 6 | counts |            |        | 
+ pb     |                 4 | counts |            |        | 
 (2 rows)
 
 SELECT cpt[4:6] AS uniform FROM gaps.factor WHERE name = 'pb';
@@ -197,10 +197,10 @@ SELECT gaps.set_prior('lm', 'pb', NULL);
 (1 row)
 
 SELECT * FROM gaps.learn_cpts('lm') ORDER BY factor;
- factor | complete_entities 
---------+-------------------
- pa     |                 6
- pb     |                 4
+ factor | complete_entities | method | iterations | loglik | converged 
+--------+-------------------+--------+------------+--------+-----------
+ pa     |                 6 | counts |            |        | 
+ pb     |                 4 | counts |            |        | 
 (2 rows)
 
 SELECT bool_and(abs(c - w) < 1e-12) AS alpha_again
@@ -282,9 +282,9 @@ SELECT gaps.set_prior('hz', 'ev', ARRAY[8.70, 191.30]);
 (1 row)
 
 SELECT * FROM gaps.learn_cpts('hz', 100);
- factor | complete_entities 
---------+-------------------
- ev     |               200
+ factor | complete_entities | method | iterations | loglik | converged 
+--------+-------------------+--------+------------+--------+-----------
+ ev     |               200 | counts |            |        | 
 (1 row)
 
 SELECT abs(cpt[1] - (8.70 + 9) / (8.70 + 191.30 + 200)) < 1e-12 AS beta_mean,
@@ -439,9 +439,9 @@ SELECT gaps.add_factor('s4', 'pv', 'v');
 (1 row)
 
 SELECT * FROM gaps.learn_cpts('s4', 0);
- factor | complete_entities 
---------+-------------------
- pv     |                30
+ factor | complete_entities | method | iterations | loglik | converged 
+--------+-------------------+--------+------------+--------+-----------
+ pv     |                30 | counts |            |        | 
 (1 row)
 
 SELECT cpt[4] = 0 AS last_is_zero FROM gaps.factor WHERE name = 'pv';
