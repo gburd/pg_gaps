@@ -651,7 +651,15 @@ expected counts are computed and never read).  Fitting logistic weights or
 noisy-OR probabilities is deferred.  `cpt_rows` returns a parameterised
 factor's table computed with every parent missing, bounded by
 `gaps.max_factor_cells` like any other, so a factor over many parents is
-an `ERROR` naming its size there while it still grounds.
+an `ERROR` naming its size there while it still grounds.  For an
+aggregating slot it shows the table for one parent in the slot.
+`gaps.validate` reads only a factor's parents and mappings, so it treats
+every kind alike.
+
+Deferred: learning parameterised factors (logistic regression, noisy-OR
+EM; pg.ddx.io fits weights outside for now), continuous inputs to a
+logistic (inputs are binned attributes), and a combiner that is a parent
+of members' latents, which the members must declare themselves.
 
 **Learning with missing values.**  `learn_cpts(model, alpha, method =>
 'em', max_iterations => 50, tol => 1e-6)` runs expectation maximization,

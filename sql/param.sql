@@ -284,6 +284,33 @@ cnt AS (
 SELECT c.x, abs(f.cpt[CASE c.x WHEN 'a' THEN 2 ELSE 4 END] - (c.n_on + 1) / (c.n + 2)) < 1e-6
 		AS m_step_fixed_point
 FROM cnt c, gaps.factor f WHERE f.name = 'py' ORDER BY c.x;
+-- The same with pz a logistic: EM learns px and py around it.
+SELECT gaps.drop_model('lx');
+SELECT gaps.create_model('lx');
+SELECT gaps.declare_attribute('lx', 'lx', 'x', ARRAY['a', 'b']);
+SELECT gaps.declare_attribute('lx', 'lx', 'y', ARRAY['off', 'on']);
+SELECT gaps.declare_attribute('lx', 'lx', 'z', ARRAY['off', 'on']);
+SELECT gaps.add_stripe('lx', 'x', 'lx', 'x');
+SELECT gaps.add_stripe('lx', 'y', 'lx', 'y');
+SELECT gaps.add_stripe('lx', 'z', 'lx', 'z');
+SELECT gaps.add_factor('lx', 'px', 'x');
+SELECT gaps.add_factor('lx', 'py', 'y', ARRAY['x']);
+SELECT gaps.add_factor('lx', 'pz', 'z', ARRAY['y'], kind => 'logistic',
+	params => ARRAY[-1.0, -0.5, 2.0]);
+SELECT factor, complete_entities, method, converged
+FROM gaps.learn_cpts('lx', method => 'em', tol => 1e-12, max_iterations => 500)
+ORDER BY factor;
+WITH post AS (
+	SELECT (m.entity ->> 'id')::int AS id, m.probability AS p_on
+	FROM gaps.marginals('lx') m WHERE m.attname = 'y' AND m.value = 'on'),
+cnt AS (
+	SELECT l.x,
+		   sum(CASE WHEN l.y = 'on' THEN 1 WHEN l.y = 'off' THEN 0 ELSE p.p_on END) AS n_on,
+		   count(*) AS n
+	FROM lx l LEFT JOIN post p USING (id) GROUP BY l.x)
+SELECT c.x, abs(f.cpt[CASE c.x WHEN 'a' THEN 2 ELSE 4 END] - (c.n_on + 1) / (c.n + 2)) < 1e-6
+		AS m_step_fixed_point
+FROM cnt c, gaps.factor f WHERE f.name = 'py' ORDER BY c.x;
 SELECT gaps.drop_model('lx');
 DROP TABLE lx;
 
