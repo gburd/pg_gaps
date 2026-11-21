@@ -280,22 +280,47 @@ emit_instance(const gx_env *env, const gx_pfactor *f, const gx_pinst *in, pout *
  * child's.  parent_off has one more element than child, from 1; cpt_off
  * and parent_off are 1-based into the returned cpts and parents.
  */
+/*
+ * Read and check the factor's description, arguments 0 to 4 of
+ * gaps._param_cpts, into f; the arrays are palloc'd.
+ */
+static void
+read_factor(FunctionCallInfo fcinfo, gx_pfactor *f)
+{
+	char	   *kind = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int		   *slot_card;
+	unsigned char *slot_agg;
+	double	   *params;
+	int			ns,
+				nagg;
+
+	f->kind = strcmp(kind, "logistic") == 0 ? GX_LOGISTIC
+		: strcmp(kind, "noisy_or") == 0 ? GX_NOISY_OR : 0;
+	f->card = PG_GETARG_INT32(1);
+	ns = get_ints(fcinfo, 2, "slot_card", &slot_card);
+	nagg = get_bools(fcinfo, 3, "slot_agg", &slot_agg);
+	f->nparams = get_floats(fcinfo, 4, "params", &params);
+	if (nagg != ns)
+		bad_arg("slot_card and slot_agg must have the same length");
+	f->nslots = ns;
+	f->slot_card = slot_card;
+	f->slot_agg = slot_agg;
+	f->params = params;
+	if (gx_param_check(f) != GX_OK)
+		bad_arg("malformed parameterised factor (kind, domain sizes or parameters)");
+}
+
 Datum
 gaps_param_cpts(PG_FUNCTION_ARGS)
 {
 	gx_pfactor	f;
 	gx_env		env = {pg_alloc, pg_free, pg_interrupt, NULL, 0, 0, 0, 0, 0, 0};
-	char	   *kind;
-	int		   *slot_card,
-			   *ichild,
+	int		   *ichild,
 			   *ioff,
 			   *mvar,
 			   *mev,
 			   *mval;
-	unsigned char *slot_agg;
-	double	   *params;
 	int			ns,
-				nagg,
 				ninst,
 				noff,
 				nm,
@@ -314,22 +339,8 @@ gaps_param_cpts(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "gaps._param_cpts must return a record");
 
-	/* The factor. */
-	kind = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	f.kind = strcmp(kind, "logistic") == 0 ? GX_LOGISTIC
-		: strcmp(kind, "noisy_or") == 0 ? GX_NOISY_OR : 0;
-	f.card = PG_GETARG_INT32(1);
-	ns = get_ints(fcinfo, 2, "slot_card", &slot_card);
-	nagg = get_bools(fcinfo, 3, "slot_agg", &slot_agg);
-	f.nparams = get_floats(fcinfo, 4, "params", &params);
-	if (nagg != ns)
-		bad_arg("slot_card and slot_agg must have the same length");
-	f.nslots = ns;
-	f.slot_card = slot_card;
-	f.slot_agg = slot_agg;
-	f.params = params;
-	if (gx_param_check(&f) != GX_OK)
-		bad_arg("malformed parameterised factor (kind, domain sizes or parameters)");
+	read_factor(fcinfo, &f);
+	ns = f.nslots;
 
 	/* The instances: offsets in order and in range, members' evidence. */
 	first_aux = PG_GETARG_INT32(5);
