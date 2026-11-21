@@ -11,7 +11,8 @@
 # into a fresh database, and requires gaps.marginals to return the same
 # rows with the same probabilities in both.  Then checks that renaming
 # and dropping a column the model uses, and dropping its table, make
-# inference fail with an error naming what changed.
+# inference fail with an error naming what changed.  The factors' CPTs and
+# priors must also come back unchanged.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,11 +31,14 @@ done
 psql_q -d "$src_db" -f "$here/model.sql"
 psql_q -d "$src_db" -At -c "SELECT entity::text, attname, value, probability
 	FROM gaps.marginals('dump') ORDER BY 1, 2, 3" >"$work/before"
+factors_q="SELECT name, cpt, prior FROM gaps.factor ORDER BY name"
+psql_q -d "$src_db" -At -c "$factors_q" >"$work/factors_before"
 
 pg_dump -d "$src_db" -Fc -f "$work/dump"
 pg_restore -d "$dst_db" "$work/dump"
 psql_q -d "$dst_db" -At -c "SELECT entity::text, attname, value, probability
 	FROM gaps.marginals('dump') ORDER BY 1, 2, 3" >"$work/after"
+psql_q -d "$dst_db" -At -c "$factors_q" >"$work/factors_after"
 
 if [ ! -s "$work/before" ]; then
 	echo "FAIL: the model returned no marginals before the dump" >&2
@@ -46,6 +50,16 @@ if ! cmp -s "$work/before" "$work/after"; then
 	exit 1
 fi
 echo "dump: $(wc -l <"$work/before") marginals identical after pg_dump and restore"
+if ! grep -q '^light|.*|{2,0.5,0.25,3}$' "$work/factors_before"; then
+	echo "FAIL: factor light has no prior before the dump" >&2
+	exit 1
+fi
+if ! cmp -s "$work/factors_before" "$work/factors_after"; then
+	echo "FAIL: CPTs or priors differ after pg_dump and restore" >&2
+	diff "$work/factors_before" "$work/factors_after" >&2
+	exit 1
+fi
+echo "dump: $(wc -l <"$work/factors_before") factors' CPTs and priors identical after restore"
 
 # The restored model must still find its table by name, and refuse when the
 # table it was declared over has changed.

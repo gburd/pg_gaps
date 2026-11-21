@@ -12,8 +12,11 @@ sudo make install PG_CONFIG=/path/to/pg_config
 make installcheck PG_CONFIG=/path/to/pg_config   # against a running server
 ```
 
-The build also works out of tree, which keeps objects and test output out
-of the source directory:
+`make installcheck` writes its results into the directory it runs in,
+so it fails with "could not create directory" when the source tree is
+not writable by the user running it.  Use `dev/regress.sh`, or an
+out-of-tree (VPATH) build, which keeps objects and test output out of the
+source directory:
 
 ```sh
 mkdir -p /path/to/build && cd /path/to/build

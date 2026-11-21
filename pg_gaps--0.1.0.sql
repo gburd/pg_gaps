@@ -51,6 +51,7 @@ CREATE TABLE gaps.factor (
 	name		text NOT NULL,
 	child_stripe int NOT NULL REFERENCES gaps.stripe ON DELETE CASCADE,
 	cpt			float8[],			-- NULL until set or learned
+	prior		float8[],			-- Dirichlet pseudocounts; NULL: alpha
 	UNIQUE (model_id, name)
 );
 
@@ -276,13 +277,46 @@ AS $$
 	WHERE s.stripe_id = stripe
 $$;
 
--- Check a factor's CPT.  Every entry finite and non-negative, every run of
--- |child domain| entries a distribution: that much the factor row alone
--- determines, and the trigger on gaps.factor checks it on every write.
--- With with_parents, also check the length against the parents' domains; that
--- needs the factor's gaps.factor_parent rows, which pg_restore loads in a
--- later transaction than gaps.factor, so it is checked by the declaring
--- functions and at every grounding, not by the trigger.
+-- Check one of a factor's arrays (its CPT or its prior, named by what):
+-- one-dimensional and indexed from 1 (the layout and learn_cpts index from
+-- 1, so '[0:1]={...}' would shift every cell), every entry finite and
+-- non-negative, and a length that
+-- is a multiple of k, the child's domain size, or with with_parents exactly
+-- want.  rows is the number of parent combinations, for the message.
+CREATE FUNCTION gaps._cells_check(fname text, what text, a float8[], k int,
+	rows bigint, with_parents boolean) RETURNS void
+LANGUAGE plpgsql IMMUTABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+	IF coalesce(array_ndims(a), 0) = 1 AND array_lower(a, 1) <> 1 THEN
+		RAISE EXCEPTION '% of factor "%" must be indexed from 1, not %', what, fname,
+			array_lower(a, 1);
+	END IF;
+	IF coalesce(array_ndims(a), 0) <> 1 OR array_length(a, 1) % k <> 0
+	   OR (with_parents AND array_length(a, 1) <> rows * k) THEN
+		RAISE EXCEPTION '% of factor "%" has % entries, needs %', what, fname,
+			coalesce(array_length(a, 1), 0),
+			CASE WHEN with_parents THEN (rows * k)::text
+				ELSE format('a multiple of %s', k) END
+			USING DETAIL = format('%s parent combinations x %s child values', rows, k);
+	END IF;
+	IF EXISTS (SELECT 1 FROM unnest(a) v
+			   WHERE v IS NULL OR v < 0 OR v = 'Infinity'::float8 OR v = 'NaN'::float8) THEN
+		RAISE EXCEPTION '% of factor "%" has a NULL, negative, infinite or NaN entry',
+			what, fname;
+	END IF;
+END
+$$;
+
+-- Check a factor's CPT and prior.  Every entry finite and non-negative,
+-- every run of |child domain| entries of the CPT a distribution: that much
+-- the factor row alone determines, and the trigger on gaps.factor checks it
+-- on every write.  With with_parents, also check both lengths against the
+-- parents' domains; that needs the factor's gaps.factor_parent rows, which
+-- pg_restore loads in a later transaction than gaps.factor, so it is
+-- checked by the declaring functions and at every grounding, not by the
+-- trigger.
 CREATE FUNCTION gaps._cpt_check(f int, with_parents boolean) RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -290,31 +324,24 @@ AS $$
 DECLARE
 	fr gaps.factor;
 	k int;
-	rows bigint := 1;
-	want bigint;
+	rows bigint;
 	s float8;
 BEGIN
 	SELECT * INTO fr FROM gaps.factor WHERE factor_id = f;
-	IF fr.cpt IS NULL THEN
+	IF fr.cpt IS NULL AND fr.prior IS NULL THEN
 		RETURN;
 	END IF;
 	k := gaps._card(fr.child_stripe);
-	SELECT rows * coalesce(exp(sum(ln(gaps._card(parent_stripe))))::bigint, 1) INTO rows
+	SELECT coalesce(exp(sum(ln(gaps._card(parent_stripe))))::bigint, 1) INTO rows
 	FROM gaps.factor_parent WHERE factor_id = f;
-	want := rows * k;
-	IF array_ndims(fr.cpt) <> 1 OR array_length(fr.cpt, 1) % k <> 0
-	   OR (with_parents AND array_length(fr.cpt, 1) <> want) THEN
-		RAISE EXCEPTION 'CPT of factor "%" has % entries, needs %', fr.name,
-			coalesce(array_length(fr.cpt, 1), 0),
-			CASE WHEN with_parents THEN want::text ELSE format('a multiple of %s', k) END
-			USING DETAIL = format('%s parent combinations x %s child values', rows, k);
+	IF fr.prior IS NOT NULL THEN
+		PERFORM gaps._cells_check(fr.name, 'prior', fr.prior, k, rows, with_parents);
 	END IF;
-	rows := array_length(fr.cpt, 1) / k;
-	IF EXISTS (SELECT 1 FROM unnest(fr.cpt) v
-			   WHERE v IS NULL OR v < 0 OR v = 'Infinity'::float8 OR v = 'NaN'::float8) THEN
-		RAISE EXCEPTION 'CPT of factor "%" has a NULL, negative, infinite or NaN entry', fr.name;
+	IF fr.cpt IS NULL THEN
+		RETURN;
 	END IF;
-	FOR r IN 0 .. rows - 1 LOOP
+	PERFORM gaps._cells_check(fr.name, 'CPT', fr.cpt, k, rows, with_parents);
+	FOR r IN 0 .. array_length(fr.cpt, 1) / k - 1 LOOP
 		SELECT sum(fr.cpt[r * k + i]) INTO s FROM generate_series(1, k) i;
 		IF abs(s - 1.0) > 1e-9 THEN
 			RAISE EXCEPTION 'row % of the CPT of factor "%" sums to %, not 1', r + 1, fr.name, s
@@ -540,6 +567,81 @@ BEGIN
 	END IF;
 	PERFORM gaps._cpt_check(x.factor_id, true) FROM gaps.factor x
 	WHERE x.model_id = gaps._model_id(model) AND x.name = set_cpt.factor;
+END
+$$;
+
+-- Set a factor's Dirichlet prior for learn_cpts: one pseudocount per CPT
+-- cell, in the CPT's layout.  NULL clears it, so learn_cpts uses its alpha.
+CREATE FUNCTION gaps.set_prior(model text, factor text, prior float8[]) RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+	UPDATE gaps.factor x SET prior = set_prior.prior
+	WHERE x.model_id = gaps._model_id(model) AND x.name = set_prior.factor;
+	IF NOT FOUND THEN
+		RAISE EXCEPTION 'factor "%" does not exist in model "%"', factor, model;
+	END IF;
+	PERFORM gaps._cpt_check(x.factor_id, true) FROM gaps.factor x
+	WHERE x.model_id = gaps._model_id(model) AND x.name = set_prior.factor;
+END
+$$;
+
+-- A factor's CPT and prior as rows, one per cell, in the arrays' order:
+-- WITH ORDINALITY on the result gives each row's 1-based index into cpt
+-- and prior.  parents is a JSON array with one {"<stripe>": value} object
+-- per parent, in parent order; an array because the same stripe may be two
+-- parents of one factor.  probability and prior are NULL when the factor
+-- has no CPT or no prior, so the rows also lay out an array to set.
+CREATE FUNCTION gaps.cpt_rows(model text, factor text,
+	OUT parents jsonb, OUT value text, OUT probability float8, OUT prior float8)
+RETURNS SETOF record
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	fr gaps.factor;
+	dom text[];
+	k int;
+	n bigint;
+	lim int := coalesce(current_setting('gaps.max_factor_cells', true)::int, 1 << 20);
+BEGIN
+	SELECT * INTO fr FROM gaps.factor x
+	WHERE x.model_id = gaps._model_id(model) AND x.name = cpt_rows.factor;
+	IF NOT FOUND THEN
+		RAISE EXCEPTION 'factor "%" does not exist in model "%"', factor, model;
+	END IF;
+	PERFORM gaps._cpt_check(fr.factor_id, true);
+	SELECT a.domain INTO dom FROM gaps.stripe s JOIN gaps.attribute a USING (attribute_id)
+	WHERE s.stripe_id = fr.child_stripe;
+	k := array_length(dom, 1);
+	SELECT k * coalesce(exp(sum(ln(gaps._card(fp.parent_stripe))))::bigint, 1) INTO n
+	FROM gaps.factor_parent fp WHERE fp.factor_id = fr.factor_id;
+	IF n > lim THEN
+		RAISE EXCEPTION 'factor "%" has % cells, more than gaps.max_factor_cells (%)',
+			factor, n, lim;
+	END IF;
+
+	-- Cell c holds parent row c / k and child value c % k; within a parent
+	-- row, parent ord varies slowest, with stride the product of the domain
+	-- sizes of the parents after it.
+	RETURN QUERY
+	WITH par AS (
+		SELECT fp.ord, s.name, a.domain AS pdom, array_length(a.domain, 1) AS card
+		FROM gaps.factor_parent fp JOIN gaps.stripe s ON s.stripe_id = fp.parent_stripe
+			JOIN gaps.attribute a USING (attribute_id)
+		WHERE fp.factor_id = fr.factor_id),
+	strided AS (
+		SELECT p.*, coalesce((SELECT exp(sum(ln(q.card)))::int FROM par q
+							  WHERE q.ord > p.ord), 1) AS stride
+		FROM par p)
+	SELECT (SELECT coalesce(jsonb_agg(jsonb_build_object(st.name,
+									  st.pdom[(c / k / st.stride) % st.card + 1])
+									  ORDER BY st.ord), '[]'::jsonb)
+			FROM strided st),
+		   dom[c % k + 1], fr.cpt[c + 1], fr.prior[c + 1]
+	FROM generate_series(0, n::int - 1) c
+	ORDER BY c;
 END
 $$;
 
@@ -1560,12 +1662,16 @@ END
 $$;
 
 -- Learn every factor's CPT from the data: for each combination of parent
--- values, the observed frequencies of the child's values among child
--- entities whose child and parents are all observed, plus alpha in every
--- cell (additive smoothing; alpha > 0 keeps every cell positive, so a value
--- never seen is improbable rather than impossible).  A parent combination
--- with no complete entity gets the uniform distribution, which is also
--- what alpha alone gives it.  Counts are per entity, not per row, so a
+-- values, the posterior mean under a Dirichlet prior, which is the counts
+-- of the child's values among child entities whose child and parents are
+-- all observed, plus each cell's pseudocount, normalized:
+-- (count + prior) / (total + sum(prior)) per parent row.  The pseudocounts
+-- are the factor's gaps.factor.prior when set (gaps.set_prior), and alpha
+-- in every cell otherwise: alpha is ignored for a factor with a prior.
+-- alpha > 0 is additive smoothing, which keeps every cell positive, so a
+-- value never seen is improbable rather than impossible.  A parent row
+-- whose counts and pseudocounts are all zero gets the uniform
+-- distribution.  Counts are per entity, not per row, so a
 -- coarse entity counts once.  Returns the number of complete entities used
 -- per factor.
 --
@@ -1603,7 +1709,7 @@ BEGIN
 	WHERE fa.model_id = m AND fa.cpt IS NULL;
 	g := gaps._ground(m);
 
-	FOR f IN SELECT fa.factor_id, fa.name, fa.child_stripe FROM gaps.factor fa
+	FOR f IN SELECT fa.factor_id, fa.name, fa.child_stripe, fa.prior FROM gaps.factor fa
 			 WHERE fa.model_id = m ORDER BY fa.factor_id LOOP
 		k := gaps._card(f.child_stripe);
 		SELECT k * coalesce(exp(sum(ln(gaps._card(fp.parent_stripe))))::bigint, 1) INTO nrows
@@ -1628,7 +1734,7 @@ BEGIN
 			WHERE g.evidence[inst.v] > 0
 			  AND NOT EXISTS (SELECT 1 FROM unnest(inst.ps) p WHERE g.evidence[p] = 0)),
 		counts AS (
-			SELECT c AS cell, alpha + count(cells.cell) AS n
+			SELECT c AS cell, coalesce(f.prior[c::int + 1], alpha) + count(cells.cell) AS n
 			FROM generate_series(0, nrows - 1) c LEFT JOIN cells ON cells.cell = c
 			GROUP BY c),
 		normed AS (
@@ -1641,9 +1747,11 @@ BEGIN
 
 		-- Rows must sum to 1 within the trigger's 1e-9; division can leave a
 		-- last-bit error, so the last entry of each row takes up the slack.
+		-- When that entry should be 0 the slack can come out as -2e-16;
+		-- clamp it, which moves the row sum by no more than the slack.
 		FOR r IN 0 .. nrows / k - 1 LOOP
-			newcpt[r * k + k] := 1.0 - (SELECT coalesce(sum(newcpt[r * k + i]), 0)
-										FROM generate_series(1, k - 1) i);
+			newcpt[r * k + k] := greatest(0.0, 1.0 - (SELECT coalesce(sum(newcpt[r * k + i]), 0)
+													 FROM generate_series(1, k - 1) i));
 		END LOOP;
 		UPDATE gaps.factor x SET cpt = newcpt WHERE x.factor_id = f.factor_id;
 		factor := f.name;

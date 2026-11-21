@@ -429,12 +429,41 @@ to other sessions.  A real model rarely has more than a handful of key
 types; the limit is a guard against an unbounded failure, not a tuning
 knob, so it is not a GUC.
 
-**CPTs** are dense `float8[]` in row-major order over (parents..., child),
-the child varying fastest.  A trigger on `gaps.factor` checks every write:
-the right length for the declared domains, every entry finite and
-non-negative, every conditional distribution summing to 1 within 1e-9.  A
-CPT may be NULL until `learn_cpts` fills it; inference refuses a model
-with a NULL CPT.
+**CPTs** are dense `float8[]`, indexed from 1, in row-major order over
+(parents..., child), the child varying fastest.  Each variable's values are in
+`gaps.attribute.domain` order, which is the order passed to
+`declare_attribute`, not sorted: `ARRAY['1', '2', '10']` stays
+`{1,2,10}`.  Note that a domain built with `array_agg(DISTINCT col)` comes
+back sorted (`{1,10,2}` for text), so a CPT built in some other order
+puts its probabilities on the wrong values without any error.
+`gaps.cpt_rows(model, factor)` returns a factor's cells as rows (parent
+values, child value, probability, prior) in array order, so nobody needs
+to index the flat array by hand; `parents` is a JSON array of one
+`{"<stripe>": value}` object per parent, in parent order, keyed by stripe
+name because two parent stripes may share an attribute, and an array
+because one stripe may be two parents of a factor.  The trigger on
+`gaps.factor` checks every write: every entry finite and non-negative,
+the length a multiple of the child's domain size, and every conditional
+distribution summing to 1 within 1e-9.  The exact length for the
+parents' domains needs `gaps.factor_parent`, which `pg_restore` loads
+after `gaps.factor`, so the declaring functions and every grounding check
+it instead.  A CPT may be NULL until `learn_cpts` fills it; inference
+refuses a model with a NULL CPT.
+
+**Priors.**  `gaps.factor.prior`, set with `gaps.set_prior(model, factor,
+prior)`, holds a Dirichlet prior for `learn_cpts`: one non-negative
+pseudocount per CPT cell, in the CPT's layout, checked like the CPT
+except that its rows need not sum to anything.  `learn_cpts` sets each
+parent row to its posterior mean, (count + prior) / (row total +
+sum(prior row)) per cell, and a row whose counts and pseudocounts are all
+zero to the uniform distribution.  NULL, the default, means `alpha` in
+every cell, the symmetric Dirichlet(alpha); a factor with a prior ignores
+`alpha`.  The prior is part of the model, so it is dumped with the
+catalog, and inference never reads it.  A column rather than a
+`learn_cpts` argument, because the prior belongs to the factor (it lives
+as long as the factor, survives dump and restore, and is visible through
+`cpt_rows`), and an argument would make every caller pass the same
+arrays again.
 
 **Entity-set predicates** are a conjunction of `column op constant` terms
 stored as rows, with `op` one of `=`, `<>`, `<`, `<=`, `>`, `>=`.  Each use
@@ -485,7 +514,8 @@ SELECT gaps.create_model('sensors');
 SELECT gaps.declare_attribute('sensors', 'sensor1', 'temp', ARRAY['cold','hot']);
 SELECT gaps.add_stripe('sensors', ...);   -- attribute + entity set
 SELECT gaps.add_factor('sensors', child => ..., parents => ..., cpt => ...);
-SELECT gaps.learn_cpts('sensors');        -- MLE from complete rows, smoothed
+SELECT gaps.set_prior('sensors', ...);    -- optional Dirichlet pseudocounts per cell
+SELECT gaps.learn_cpts('sensors');        -- posterior mean from complete rows
 SELECT * FROM gaps.validate('sensors');   -- first-order acyclicity, no data read
 
 -- query
