@@ -352,7 +352,11 @@ hashes.  A column counts as holding no NULL only when it is NOT NULL in
 too) and no not-null constraint of theirs is NOT VALID: on PostgreSQL 18
 a NOT VALID constraint sets `attnotnull` over existing NULLs, and a
 parent made NOT NULL with `ALTER TABLE ONLY` or `NO INHERIT` can have
-children with NULLs.  Measured on 100,000 rows, 230 entities requested,
+children with NULLs.  A foreign table's NOT NULL never counts, since it
+is not enforced on the remote rows; but PostgreSQL assumes it holds (and
+19's planner folds `IS NULL` on such a column to false), so a foreign
+table whose rows break its declared NOT NULL gives wrong results to every
+query, pg_gaps' included: declare it nullable.  Measured on 100,000 rows, 230 entities requested,
 against 3.6 s for the full call (`bench/RESULTS_SUBSET_2026-11-21.md`):
 50 ms with an index on a nullable key, 360 ms with neither an index nor
 NOT NULL, about 50 ms on a NOT NULL primary key.  The mapping columns

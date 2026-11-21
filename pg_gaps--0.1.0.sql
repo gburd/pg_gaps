@@ -1245,8 +1245,11 @@ BEGIN
 			SELECT h.inhrelid FROM d JOIN pg_inherits h ON h.inhparent = d.oid)
 		SELECT array_agg(d.oid) INTO tabs FROM d;
 	END IF;
-	-- A foreign table's NOT NULL is not enforced on the remote rows
-	-- (postgres_fdw does not check it), so it proves nothing either.
+	-- A foreign table's NOT NULL is not enforced on the remote rows, so
+	-- it proves nothing here either.  Note that PostgreSQL itself assumes
+	-- it holds (CREATE FOREIGN TABLE), and from 19 the planner folds "IS
+	-- NULL" on such a column to false, so a foreign table that breaks its
+	-- declared NOT NULL gives wrong results to any query, this one too.
 	SELECT EXISTS (SELECT 1 FROM pg_constraint c
 				   WHERE c.conrelid = ANY (tabs) AND c.contype = 'n' AND NOT c.convalidated)
 		OR EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = ANY (tabs) AND c.relkind = 'f')
