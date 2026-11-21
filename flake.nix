@@ -119,6 +119,8 @@
                 -o "-k $TMPDIR -c listen_addresses=" start
               python3 test/pgmpy/check.py --models 300 \
                 || { cat "$TMPDIR/server.log"; exit 1; }
+              python3 test/pgmpy/em.py --models 200 \
+                || { cat "$TMPDIR/server.log"; exit 1; }
               pg_ctl -D "$PGDATA" -w stop
               touch $out
               runHook postBuild

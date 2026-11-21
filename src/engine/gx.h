@@ -149,4 +149,38 @@ extern int	gx_check(const gx_env *env, const gx_bn *bn, int *bad_var);
  */
 extern int	gx_infer(const gx_env *env, const gx_bn *bn, gx_result *out);
 
+/*
+ * Expected counts for EM.  Every CPT belongs to a group (its first-order
+ * factor), and every CPT of a group has group_size[g] cells.  The caller
+ * fills the first five fields; gx_expected_counts fills the rest.
+ */
+typedef struct gx_counts
+{
+	const int  *group;			/* per CPT (in bn->cpts order), 0..ngroups-1 */
+	int			ngroups;
+	const size_t *group_size;	/* cells per group */
+	double	   *counts;			/* caller's, sum of group_size doubles: group
+								 * g's cells follow group g - 1's */
+	double		loglik;			/* log P(all the evidence) */
+	long		cache_hits;		/* components answered from the cache */
+	int			bad_var;		/* on error, a variable involved, or -1 */
+	int			bad_size;		/* on error, the size of its component */
+} gx_counts;
+
+/*
+ * The E-step of EM: for every group g and cell x of its CPTs (row-major
+ * over parents then child, as in a CPT), counts[g][x] is the sum over the
+ * group's CPTs of P(family = x | evidence), the family being the CPT's
+ * child and parents together.  A CPT whose family is fully observed adds
+ * 1 to its observed cell, so with no missing values these are the plain
+ * counts.  loglik is log P(evidence), constant CPTs included.
+ *
+ * Family posteriors come from the bucket tree gx_infer uses, and
+ * components are shared through the same cache.  Nothing is sampled: a
+ * component too large for exact inference is GX_ETOOBIG whatever
+ * env->samples says.  bn must pass gx_check.  GX_EINVAL (with bad_var)
+ * if a group is out of range or a CPT's size differs from its group's.
+ */
+extern int	gx_expected_counts(const gx_env *env, const gx_bn *bn, gx_counts *ec);
+
 #endif							/* GX_H */

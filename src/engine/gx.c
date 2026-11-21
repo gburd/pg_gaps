@@ -59,6 +59,8 @@ typedef struct factor
 	int		   *vars;
 	size_t		ncells;
 	double	   *vals;
+	int			src;			/* a component factor's CPT, as an index into
+								 * the component's CPT list; survives sorting */
 } factor;
 
 typedef struct ctx
@@ -344,6 +346,7 @@ factor_init(ctx *c, factor *f, const int *card, const int *vars, int nv)
 	f->ncells = cells_bounded(card, vars, nv, c->env->max_cells);
 	f->vars = NULL;
 	f->vals = NULL;
+	f->src = -1;
 	if (f->ncells == SIZE_MAX)
 	{
 		c->err = GX_ETOOBIG;
@@ -1088,7 +1091,24 @@ typedef struct solver
 	factor	   *maxmsg;
 	size_t		used;			/* cells held, against max_total_cells */
 	double		logz;			/* log P(evidence), up to the CPT constants */
+	double	  **fam;			/* per base factor, its posterior, or NULL */
 } solver;
+
+/*
+ * What solve() computes for a component.  marg[t] receives variable t's
+ * marginal.  When fam is NULL, map and map_prob receive the MAP assignment
+ * and its posterior probability; otherwise fam[i] receives the posterior
+ * over factor i's variables (fs[i].ncells entries, in its cell order) and
+ * the MAP pass is skipped.  logz is always set.
+ */
+typedef struct solve_out
+{
+	double	  **marg;
+	int		   *map;
+	double	   *map_prob;
+	double	  **fam;
+	double		logz;
+} solve_out;
 
 static int
 solve_init(solver *sv)
@@ -1254,6 +1274,75 @@ solve_upward(solver *sv)
 }
 
 /*
+ * The posterior of base factor f's variables, into post[f->ncells]:
+ * bucket belief bel (the product of everything in f's bucket, over the
+ * bucket's cluster, which contains f's scope) summed onto f's variables in
+ * f's own order, and normalized.  This is EM's family posterior.
+ */
+static int
+solve_family(solver *sv, factor *bel, const factor *f, double *post)
+{
+	ctx		   *c = sv->c;
+	factor	   *one[1] = {bel};
+	factor		pf = {0};
+	double		ls,
+				s = 0.0;
+
+	if (product_project(c, sv->card, one, 1, f->vars, f->nv, 0, &pf, NULL, &ls,
+						sv->val, sv->inscope) != GX_OK)
+		return c->err;
+	for (size_t x = 0; x < pf.ncells; x++)
+		s += exp(pf.vals[x]);
+	if (!(s > 0.0))
+		c->err = GX_EZERO;
+	for (size_t x = 0; !c->err && x < pf.ncells; x++)
+		post[x] = exp(pf.vals[x]) / s;
+	factor_free(c, &pf);
+	return c->err;
+}
+
+/*
+ * After the downward pass, every base factor's posterior into sv->fam.
+ * Bucket k's belief is the product of its base factors, the message from
+ * its parent and every kid's message, over its cluster (its variable plus
+ * its up message's scope), which contains each base factor's scope.
+ */
+static int
+solve_families(solver *sv)
+{
+	ctx		   *c = sv->c;
+	bucket	   *b = sv->b;
+
+	for (int k = 0; k < sv->nloc; k++)
+	{
+		factor		bel = {0};
+		int			n = 0;
+		double		ls;
+
+		interrupt(c);
+		if (b[k].nbase == 0)
+			continue;
+		for (int i = 0; i < b[k].nbase; i++)
+			sv->work[n++] = b[k].base[i];
+		if (b[k].parent >= 0)
+			sv->work[n++] = &b[k].down;
+		for (int i = 0; i < b[k].nkids; i++)
+			sv->work[n++] = &b[b[k].kids[i]].up;
+		memcpy(sv->cvars, b[k].up.vars, sizeof(int) * (size_t) b[k].up.nv);
+		sv->cvars[b[k].up.nv] = sv->order[k];
+		if (product_project(c, sv->card, sv->work, n, sv->cvars, b[k].up.nv + 1, 0,
+							&bel, NULL, &ls, sv->val, sv->inscope) != GX_OK)
+			return c->err;
+		for (int i = 0; i < b[k].nbase && !c->err; i++)
+			solve_family(sv, &bel, b[k].base[i], sv->fam[b[k].base[i] - sv->fs]);
+		factor_free(c, &bel);
+		if (c->err)
+			return c->err;
+	}
+	return GX_OK;
+}
+
+/*
  * The downward pass for bucket k: its variable's marginal, and the message
  * from it to each kid.
  *
@@ -1412,12 +1501,11 @@ solve_map(solver *sv, int *map, double *map_prob)
 }
 
 /*
- * Solve one component: its marginals into marg[t] (card[t] doubles each),
- * and its MAP assignment and that assignment's posterior probability.
+ * Solve one component, whose factors are fs[0..nf), into so (see
+ * solve_out).
  */
 static int
-solve(ctx *c, int nloc, const int *card, factor *fs, int nf,
-	  double **marg, int *map, double *map_prob)
+solve(ctx *c, int nloc, const int *card, factor *fs, int nf, solve_out *so)
 {
 	solver		sv;
 
@@ -1427,6 +1515,7 @@ solve(ctx *c, int nloc, const int *card, factor *fs, int nf,
 	sv.card = card;
 	sv.fs = fs;
 	sv.nf = nf;
+	sv.fam = so->fam;
 	if (solve_init(&sv) == GX_OK &&
 		minfill_order(c, nloc, fs, nf, sv.order) == GX_OK)
 	{
@@ -1434,10 +1523,13 @@ solve(ctx *c, int nloc, const int *card, factor *fs, int nf,
 			sv.pos[sv.order[k]] = k;
 		if (solve_assign(&sv) == GX_OK && solve_upward(&sv) == GX_OK)
 		{
+			so->logz = sv.logz;
 			for (int k = nloc - 1; k >= 0 && !c->err; k--)
-				solve_down_bucket(&sv, k, marg[sv.order[k]]);
-			if (!c->err)
-				solve_map(&sv, map, map_prob);
+				solve_down_bucket(&sv, k, so->marg[sv.order[k]]);
+			if (!c->err && so->fam != NULL)
+				solve_families(&sv);
+			else if (!c->err)
+				solve_map(&sv, so->map, so->map_prob);
 		}
 	}
 	solve_free(&sv);
@@ -2017,6 +2109,9 @@ typedef struct centry
 	int		   *map;
 	double		map_prob;
 	int			samples;		/* Gibbs samples, 0 if solved exactly */
+	double	   *fam;			/* gx_expected_counts only: each factor's
+								 * posterior, in key order, concatenated */
+	double		logz;			/* gx_expected_counts only */
 } centry;
 
 #define NBUCKETS 1024
@@ -2035,6 +2130,7 @@ cache_free(ctx *c, centry **buckets)
 			xfree(c, e->key);
 			xfree(c, e->marg);
 			xfree(c, e->map);
+			xfree(c, e->fam);
 			xfree(c, e);
 			e = next;
 		}
@@ -2118,7 +2214,11 @@ cache_fill(ctx *c, int nloc, const int *lcard, factor *fs, int nf,
 		 * same limits.
 		 */
 		if (!(env->sample_always && env->samples > 0))
-			solve(c, nloc, lcard, fs, nf, marg, e->map, &e->map_prob);
+		{
+			solve_out	so = {marg, e->map, &e->map_prob, NULL, 0.0};
+
+			solve(c, nloc, lcard, fs, nf, &so);
+		}
 		if (env->samples > 0 &&
 			(env->sample_always || c->err == GX_ETOOBIG))
 		{
@@ -2151,34 +2251,42 @@ cache_fill(ctx *c, int nloc, const int *lcard, factor *fs, int nf,
 }
 
 /*
- * Solve component cid, whose missing variables are members[0..nloc) in
- * increasing global order and whose CPTs are cptlist[0..ncpt): build its
- * factors, consult the cache, and fill the result arrays.
+ * A component's reduced factors and canonical key, built by
+ * component_build and released by component_free.
+ */
+typedef struct compbuild
+{
+	int		   *lcard;			/* local cardinalities */
+	factor	   *fs;				/* reduced factors, in key order */
+	int			nf;
+	keybuf		key;
+	uint64_t	h;				/* the bucket hash */
+	uint64_t	keyhash;		/* the key's real hash, see cache_fill */
+} compbuild;
+
+/*
+ * Build the reduced factors and the cache key of the component whose
+ * missing variables are members[0..nloc) in increasing global order and
+ * whose CPTs are cptlist[0..ncpt).  Factor i's src is its CPT's index in
+ * cptlist, which survives the key's sort.  extra cells per factor cell
+ * are charged to max_total_cells on top of the factors and the key, for a
+ * caller that holds that much more for the whole component.
  */
 static int
-do_component(ctx *c, int cid, const int *members, int nloc,
-			 const int *cptlist, int ncpt,
-			 int *loc, int *gval, centry **buckets, gx_result *out)
+component_build(ctx *c, const int *members, int nloc, const int *cptlist,
+				int ncpt, int *loc, int *gval, size_t extra, compbuild *cb)
 {
 	const gx_bn *bn = c->bn;
-	int		   *lcard;
-	factor	   *fs;
-	int			nf = 0;
-	keybuf		key = {0};
-	uint64_t	h,
-				keyhash;
-	centry	   *e;
 	size_t		held = 0;
-	size_t		off = 0;
 
-	lcard = xalloc(c, sizeof(int) * (size_t) nloc);
-	fs = xalloc(c, sizeof(factor) * (size_t) (ncpt ? ncpt : 1));
+	cb->lcard = xalloc(c, sizeof(int) * (size_t) nloc);
+	cb->fs = xalloc(c, sizeof(factor) * (size_t) (ncpt ? ncpt : 1));
 	if (c->err)
-		goto done;
+		return c->err;
 	for (int t = 0; t < nloc; t++)
 	{
 		loc[members[t]] = t;
-		lcard[t] = bn->card[members[t]];
+		cb->lcard[t] = bn->card[members[t]];
 	}
 
 	/*
@@ -2188,35 +2296,69 @@ do_component(ctx *c, int cid, const int *members, int nloc,
 	 */
 	for (int i = 0; i < ncpt; i++)
 	{
+		factor	   *f = &cb->fs[cb->nf];
+
 		interrupt(c);
-		if (reduce_cpt(c, &bn->cpts[cptlist[i]], loc, lcard, &fs[nf], gval) != GX_OK)
-			goto done;
-		held += 2 * fs[nf].ncells + (size_t) fs[nf].nv;
-		nf++;
+		if (reduce_cpt(c, &bn->cpts[cptlist[i]], loc, cb->lcard, f, gval) != GX_OK)
+			return c->err;
+		f->src = i;
+		cb->nf++;
+		held += (2 + extra) * f->ncells + (size_t) f->nv;
 		if (held > c->env->max_total_cells)
 		{
 			c->err = GX_ETOOBIG;
-			goto done;
+			return c->err;
 		}
 	}
 	c->held = held;
 
-	if (build_key(c, nloc, lcard, fs, nf, &key) != GX_OK)
-		goto done;
-	keyhash = h = hash_bytes(c, key.b, key.len);
+	if (build_key(c, nloc, cb->lcard, cb->fs, cb->nf, &cb->key) != GX_OK)
+		return c->err;
+	cb->keyhash = cb->h = hash_bytes(c, cb->key.b, cb->key.len);
 #ifdef GX_TEST_HASH_COLLIDE
-	h = 0;						/* test build: every key collides */
+	cb->h = 0;					/* test build: every key collides */
 #endif
-	e = c->env->no_sharing ? NULL : cache_find(c, buckets, h, &key);
+	return GX_OK;
+}
+
+static void
+component_free(ctx *c, compbuild *cb)
+{
+	if (cb->fs)
+		for (int i = 0; i < cb->nf; i++)
+			factor_free(c, &cb->fs[i]);
+	xfree(c, cb->fs);
+	xfree(c, cb->lcard);
+	xfree(c, cb->key.b);
+}
+
+/*
+ * Solve component cid, whose missing variables are members[0..nloc) in
+ * increasing global order and whose CPTs are cptlist[0..ncpt): build its
+ * factors, consult the cache, and fill the result arrays.
+ */
+static int
+do_component(ctx *c, int cid, const int *members, int nloc,
+			 const int *cptlist, int ncpt,
+			 int *loc, int *gval, centry **buckets, gx_result *out)
+{
+	compbuild	cb;
+	centry	   *e;
+	size_t		off = 0;
+
+	memset(&cb, 0, sizeof(cb));
+	if (component_build(c, members, nloc, cptlist, ncpt, loc, gval, 0, &cb) != GX_OK)
+		goto done;
+	e = c->env->no_sharing ? NULL : cache_find(c, buckets, cb.h, &cb.key);
 	if (e)
 		out->cache_hits++;
 	else
 	{
-		e = cache_fill(c, nloc, lcard, fs, nf, h, keyhash, &key);
+		e = cache_fill(c, nloc, cb.lcard, cb.fs, cb.nf, cb.h, cb.keyhash, &cb.key);
 		if (e == NULL)
 			goto done;
-		e->next = buckets[h % NBUCKETS];
-		buckets[h % NBUCKETS] = e;
+		e->next = buckets[cb.h % NBUCKETS];
+		buckets[cb.h % NBUCKETS] = e;
 	}
 
 	/* Copy the (possibly shared) answer out to the component's variables. */
@@ -2225,20 +2367,15 @@ do_component(ctx *c, int cid, const int *members, int nloc,
 		int			g = members[t];
 
 		memcpy(out->marg + out->marg_off[g], e->marg + off,
-			   sizeof(double) * (size_t) lcard[t]);
-		off += (size_t) lcard[t];
+			   sizeof(double) * (size_t) cb.lcard[t]);
+		off += (size_t) cb.lcard[t];
 		out->map[g] = e->map[t];
 	}
 	out->comp_map_prob[cid] = e->map_prob;
 	out->comp_samples[cid] = e->samples;
 
 done:
-	if (fs)
-		for (int i = 0; i < nf; i++)
-			factor_free(c, &fs[i]);
-	xfree(c, fs);
-	xfree(c, lcard);
-	xfree(c, key.b);
+	component_free(c, &cb);
 	return c->err;
 }
 
@@ -2411,31 +2548,60 @@ result_init(ctx *c, gx_result *out)
 	return c->err;
 }
 
+/*
+ * Allocate gx_infer's working arrays, and those of steps 1 and its
+ * grouping, into w and out.  Returns c->err.
+ */
+static int
+work_init(ctx *c, inferwork *w, gx_result *out)
+{
+	const gx_bn *bn = c->bn;
+	size_t		nv = (size_t) (bn->nvars ? bn->nvars : 1);
+
+	memset(out, 0, sizeof(*out));
+	memset(w, 0, sizeof(*w));
+	out->bad_var = -1;
+	w->uf = xalloc(c, sizeof(int) * nv);
+	w->cursor = xalloc(c, sizeof(int) * nv);
+	w->cptcomp = xalloc(c, sizeof(int) * (size_t) (bn->ncpts ? bn->ncpts : 1));
+	w->members = xalloc(c, sizeof(int) * nv);
+	w->start = xalloc(c, sizeof(int) * (nv + 1));
+	w->loc = xalloc(c, sizeof(int) * nv);
+	w->gval = xalloc(c, sizeof(int) * nv);
+	w->buckets = xalloc(c, sizeof(centry *) * NBUCKETS);
+	if (w->buckets)
+		memset(w->buckets, 0, sizeof(centry *) * NBUCKETS);
+	if (!c->err && result_init(c, out) == GX_OK &&
+		find_components(c, w, out) == GX_OK)
+		group_components(c, w, out);
+	return c->err;
+}
+
+static void
+work_free(ctx *c, inferwork *w)
+{
+	if (w->buckets)
+		cache_free(c, w->buckets);
+	xfree(c, w->uf);
+	xfree(c, w->cursor);
+	xfree(c, w->cptcomp);
+	xfree(c, w->members);
+	xfree(c, w->start);
+	xfree(c, w->loc);
+	xfree(c, w->gval);
+	xfree(c, w->buckets);
+	xfree(c, w->cstart);
+	xfree(c, w->cptsorted);
+}
+
 int
 gx_infer(const gx_env *env, const gx_bn *bn, gx_result *out)
 {
 	ctx			c = {env, bn, GX_OK, 0, 0, 0.0};
-	size_t		nv = (size_t) (bn->nvars ? bn->nvars : 1);
 	inferwork	w;
 
-	memset(out, 0, sizeof(*out));
-	memset(&w, 0, sizeof(w));
-	out->bad_var = -1;
-	w.uf = xalloc(&c, sizeof(int) * nv);
-	w.cursor = xalloc(&c, sizeof(int) * nv);
-	w.cptcomp = xalloc(&c, sizeof(int) * (size_t) (bn->ncpts ? bn->ncpts : 1));
-	w.members = xalloc(&c, sizeof(int) * nv);
-	w.start = xalloc(&c, sizeof(int) * (nv + 1));
-	w.loc = xalloc(&c, sizeof(int) * nv);
-	w.gval = xalloc(&c, sizeof(int) * nv);
-	w.buckets = xalloc(&c, sizeof(centry *) * NBUCKETS);
-	if (w.buckets)
-		memset(w.buckets, 0, sizeof(centry *) * NBUCKETS);
-
 	/* Steps 2-4 (doc at the top of this file), one component at a time. */
-	if (!c.err && result_init(&c, out) == GX_OK &&
-		find_components(&c, &w, out) == GX_OK &&
-		group_components(&c, &w, out) == GX_OK)
+	if (work_init(&c, &w, out) == GX_OK)
 	{
 		for (int k = 0; k < out->ncomp; k++)
 		{
@@ -2453,18 +2619,7 @@ gx_infer(const gx_env *env, const gx_bn *bn, gx_result *out)
 	}
 
 	out->peak_cells = c.peak;
-	if (w.buckets)
-		cache_free(&c, w.buckets);
-	xfree(&c, w.uf);
-	xfree(&c, w.cursor);
-	xfree(&c, w.cptcomp);
-	xfree(&c, w.members);
-	xfree(&c, w.start);
-	xfree(&c, w.loc);
-	xfree(&c, w.gval);
-	xfree(&c, w.buckets);
-	xfree(&c, w.cstart);
-	xfree(&c, w.cptsorted);
+	work_free(&c, &w);
 	if (c.err)
 	{
 		int			bad = out->bad_var;
@@ -2472,5 +2627,269 @@ gx_infer(const gx_env *env, const gx_bn *bn, gx_result *out)
 		result_free(&c, out);
 		out->bad_var = bad;
 	}
+	return c.err;
+}
+
+/* ----------------------------------------------------------------
+ * Expected counts, the E-step of EM
+ * ----------------------------------------------------------------
+ *
+ * The same components, reduced factors, key and cache as gx_infer; on a
+ * miss, solve() is run with family posteriors requested, which reads each
+ * base factor's posterior off its bucket's belief in the downward pass
+ * (solve_family).  A reduced factor's variables are its CPT's missing
+ * variables in CPT order, so its cells map onto the CPT's cells by
+ * filling in the observed variables, as reduce_cpt does.
+ */
+
+/*
+ * Solve a component that missed the counts cache, and return a new entry
+ * holding each factor's posterior, in key order, and log Z; NULL on error.
+ * Takes ownership of the key.  Exact only: GX_ETOOBIG stands.
+ */
+static centry *
+counts_fill(ctx *c, compbuild *cb, int nloc)
+{
+	size_t		total = 0,
+				ftotal = 0;
+	double	  **marg = xalloc(c, sizeof(double *) * (size_t) nloc);
+	double	  **fam = xalloc(c, sizeof(double *) * (size_t) cb->nf);
+	centry	   *e = xalloc(c, sizeof(centry));
+
+	if (e)
+		memset(e, 0, sizeof(*e));
+	for (int t = 0; t < nloc; t++)
+		total += (size_t) cb->lcard[t];
+	for (int i = 0; i < cb->nf; i++)
+		ftotal += cb->fs[i].ncells;
+	if (e)
+	{
+		e->marg = xalloc(c, sizeof(double) * total);
+		e->fam = xalloc(c, sizeof(double) * ftotal);
+		e->map = xalloc(c, sizeof(int));	/* unused; cache_free frees it */
+	}
+	if (!c->err)
+	{
+		solve_out	so = {marg, NULL, NULL, fam, 0.0};
+
+		total = ftotal = 0;
+		for (int t = 0; t < nloc; t++)
+		{
+			marg[t] = e->marg + total;
+			total += (size_t) cb->lcard[t];
+		}
+		for (int i = 0; i < cb->nf; i++)
+		{
+			fam[i] = e->fam + ftotal;
+			ftotal += cb->fs[i].ncells;
+		}
+		if (solve(c, nloc, cb->lcard, cb->fs, cb->nf, &so) == GX_OK)
+			e->logz = so.logz;
+	}
+	xfree(c, marg);
+	xfree(c, fam);
+	if (c->err)
+	{
+		if (e)
+		{
+			xfree(c, e->marg);
+			xfree(c, e->fam);
+			xfree(c, e->map);
+		}
+		xfree(c, e);
+		return NULL;
+	}
+	e->nloc = nloc;
+	e->hash = cb->h;
+	e->key = cb->key.b;
+	e->keylen = cb->key.len;
+	cb->key.b = NULL;
+	return e;
+}
+
+/*
+ * Add posterior post[], over the missing variables of CPT cpt in CPT
+ * order, onto counts[] (that CPT's cells), the observed variables held at
+ * their values.  gval is scratch indexed by global variable.
+ */
+static void
+counts_add(const gx_bn *bn, const gx_cpt *cpt, const double *post, size_t ncells,
+		   double *counts, int *gval)
+{
+	int			nall = cpt->nparents + 1;
+
+	for (int j = 0; j < nall; j++)
+	{
+		int			g = j < cpt->nparents ? cpt->parents[j] : cpt->child;
+
+		gval[g] = bn->evidence[g] >= 0 ? bn->evidence[g] : 0;
+	}
+	for (size_t cell = 0; cell < ncells; cell++)
+	{
+		size_t		idx = 0;
+
+		for (int j = 0; j < nall; j++)
+		{
+			int			g = j < cpt->nparents ? cpt->parents[j] : cpt->child;
+
+			idx = idx * (size_t) bn->card[g] + (size_t) gval[g];
+		}
+		counts[idx] += post[cell];
+
+		/* Next cell: the missing variables, last fastest. */
+		for (int j = nall - 1; j >= 0; j--)
+		{
+			int			g = j < cpt->nparents ? cpt->parents[j] : cpt->child;
+
+			if (bn->evidence[g] >= 0)
+				continue;
+			if (++gval[g] < bn->card[g])
+				break;
+			gval[g] = 0;
+		}
+	}
+}
+
+/*
+ * One component's share of the counts: build it, find or fill its cache
+ * entry, and add each factor's posterior to its CPT's group.  goff[g] is
+ * the offset of group g in ec->counts.
+ */
+static int
+counts_component(ctx *c, const inferwork *w, int k, int nloc, const size_t *goff,
+				 gx_counts *ec)
+{
+	const gx_bn *bn = c->bn;
+	const int  *cptlist = w->cptsorted + w->cstart[k];
+	compbuild	cb;
+	centry	   *e;
+	size_t		off = 0;
+
+	memset(&cb, 0, sizeof(cb));
+	if (component_build(c, w->members + w->start[k], nloc, cptlist,
+						w->cstart[k + 1] - w->cstart[k], w->loc, w->gval, 1,
+						&cb) != GX_OK)
+		goto done;
+	e = c->env->no_sharing ? NULL : cache_find(c, w->buckets, cb.h, &cb.key);
+	if (e)
+		ec->cache_hits++;
+	else
+	{
+		e = counts_fill(c, &cb, nloc);
+		if (e == NULL)
+			goto done;
+		e->next = w->buckets[cb.h % NBUCKETS];
+		w->buckets[cb.h % NBUCKETS] = e;
+	}
+
+	/*
+	 * Factor i of this component is in key order, and so is the entry's
+	 * posterior i, whichever component filled the entry: equal keys have
+	 * equal factors in equal order.  src names this component's CPT.
+	 */
+	ec->loglik += e->logz;
+	for (int i = 0; i < cb.nf; i++)
+	{
+		int			j = cptlist[cb.fs[i].src];
+
+		counts_add(bn, &bn->cpts[j], e->fam + off, cb.fs[i].ncells,
+				   ec->counts + goff[ec->group[j]], w->gval);
+		off += cb.fs[i].ncells;
+	}
+
+done:
+	component_free(c, &cb);
+	return c->err;
+}
+
+/*
+ * Check ec's groups against bn, and set goff[g], group g's offset into
+ * ec->counts.  GX_EINVAL with ec->bad_var set to the CPT's child on a
+ * group out of range or a CPT whose size is not its group's.
+ */
+static int
+counts_groups(const gx_bn *bn, gx_counts *ec, size_t *goff)
+{
+	size_t		total = 0;
+
+	for (int g = 0; g < ec->ngroups; g++)
+	{
+		goff[g] = total;
+		total += ec->group_size[g];
+	}
+	for (int i = 0; i < bn->ncpts; i++)
+	{
+		const gx_cpt *cpt = &bn->cpts[i];
+		size_t		n = (size_t) bn->card[cpt->child];
+
+		for (int j = 0; j < cpt->nparents; j++)
+			n *= (size_t) bn->card[cpt->parents[j]];
+		if (ec->group[i] < 0 || ec->group[i] >= ec->ngroups ||
+			ec->group_size[ec->group[i]] != n)
+		{
+			ec->bad_var = cpt->child;
+			return GX_EINVAL;
+		}
+	}
+	for (size_t x = 0; x < total; x++)
+		ec->counts[x] = 0.0;
+	return GX_OK;
+}
+
+int
+gx_expected_counts(const gx_env *env, const gx_bn *bn, gx_counts *ec)
+{
+	ctx			c = {env, bn, GX_OK, 0, 0, 0.0};
+	inferwork	w;
+	gx_result	r;
+	size_t	   *goff;
+
+	ec->loglik = 0.0;
+	ec->cache_hits = 0;
+	ec->bad_var = -1;
+	ec->bad_size = 0;
+	goff = xalloc(&c, sizeof(size_t) * (size_t) (ec->ngroups > 0 ? ec->ngroups : 1));
+	if (c.err)
+		return c.err;
+	if (ec->ngroups < 0 || (c.err = counts_groups(bn, ec, goff)) != GX_OK)
+	{
+		xfree(&c, goff);
+		return c.err ? c.err : GX_EINVAL;
+	}
+
+	if (work_init(&c, &w, &r) == GX_OK)
+	{
+		/*
+		 * A CPT with no missing variable is a constant: its observed cell
+		 * counts 1 and its value multiplies P(evidence).  find_components
+		 * has already refused a zero there.
+		 */
+		for (int i = 0; i < bn->ncpts; i++)
+			if (w.cptcomp[i] < 0)
+			{
+				const double one = 1.0;
+
+				if ((i & 1023) == 0)
+					interrupt(&c);
+				counts_add(bn, &bn->cpts[i], &one, 1,
+						   ec->counts + goff[ec->group[i]], w.gval);
+				ec->loglik += log(observed_value(bn, &bn->cpts[i]));
+			}
+		for (int k = 0; k < r.ncomp; k++)
+		{
+			interrupt(&c);
+			if (counts_component(&c, &w, k, r.comp_size[k], goff, ec) != GX_OK)
+			{
+				ec->bad_var = w.members[w.start[k]];
+				ec->bad_size = r.comp_size[k];
+				break;
+			}
+		}
+	}
+	if (c.err == GX_EZERO && ec->bad_var < 0)
+		ec->bad_var = r.bad_var;
+	work_free(&c, &w);
+	result_free(&c, &r);
+	xfree(&c, goff);
 	return c.err;
 }

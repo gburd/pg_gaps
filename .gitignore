@@ -43,3 +43,6 @@ result-*
 
 # make dist output
 /pg_gaps-*.zip
+
+# Python bytecode (test/pgmpy)
+__pycache__/

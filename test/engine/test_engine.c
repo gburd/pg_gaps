@@ -14,7 +14,10 @@
  *     two missing variables in different components;
  *   - evidence of probability zero is reported as GX_EZERO.
  * It also runs fixed cases for the error paths and the size bound, and
- * checks Gibbs sampling against exact inference (check_gibbs_case).
+ * checks Gibbs sampling against exact inference (check_gibbs_case), and
+ * the expected counts of gx_expected_counts against enumeration, on each
+ * random network and on a first-order network built from it
+ * (check_counts_case, check_counts_firstorder).
  * Exits non-zero on the first failure and prints the case's seed.
  */
 #include "engine/gx.h"
@@ -1215,6 +1218,318 @@ check_gibbs_fallback(void)
 	nchecks += 3;
 }
 
+/* ----------------------------------------------------------------
+ * Expected counts (gx_expected_counts) against brute force
+ * ----------------------------------------------------------------
+ */
+
+#define MAXG MAXV
+#define MAXCELLS (MAXG * 8 * 8 * 8 * 8)
+
+/* What the random counts cases covered, so a vacuous pass shows. */
+static long counts_multi_missing,
+			counts_cache_hits;
+
+/*
+ * Run gx_expected_counts on bn with sharing on and off, require the two to
+ * agree bit for bit, and compare them with the oracle: every count to
+ * 1e-12 (relative above 1), loglik to 1e-10, every count non-negative and
+ * each group's counts summing to its number of CPTs.  Evidence of
+ * probability zero must be GX_EZERO.
+ */
+static void
+check_counts(const gx_bn *bn, const int *group, int ngroups, const size_t *gsize,
+			 uint64_t cseed)
+{
+	static double ocounts[MAXCELLS],
+				counts[MAXCELLS],
+				counts2[MAXCELLS];
+	size_t		goff[MAXG],
+				total = 0;
+	int			ninst[MAXG] = {0};
+	gx_env		ns = env;
+	gx_counts	ec = {group, ngroups, gsize, counts, 0, 0, 0, 0};
+	gx_counts	ec2 = {group, ngroups, gsize, counts2, 0, 0, 0, 0};
+	double		z;
+	int			orc,
+				rc,
+				rc2;
+
+	for (int g = 0; g < ngroups; g++)
+	{
+		goff[g] = total;
+		total += gsize[g];
+	}
+	for (int i = 0; i < bn->ncpts; i++)
+		ninst[group[i]]++;
+	memset(ocounts, 0, sizeof(double) * total);
+	if ((orc = oracle_counts(bn, group, goff, ocounts, total, &z)) < 0)
+		FAIL("counts oracle: too many missing");
+	rc = gx_expected_counts(&env, bn, &ec);
+	ns.no_sharing = 1;
+	rc2 = gx_expected_counts(&ns, bn, &ec2);
+	nchecks++;
+	if (rc2 != rc)
+		FAIL("counts: sharing off returned %d, on returned %d", rc2, rc);
+	if (orc == 1)
+	{
+		if (rc != GX_EZERO)
+			FAIL("counts: evidence has probability 0 but returned %d", rc);
+		return;
+	}
+	if (rc != GX_OK)
+		FAIL("gx_expected_counts returned %d", rc);
+	counts_cache_hits += ec.cache_hits;
+	for (int i = 0; i < bn->ncpts; i++)
+	{
+		int			nm = bn->evidence[bn->cpts[i].child] < 0;
+
+		for (int j = 0; j < bn->cpts[i].nparents; j++)
+			nm += bn->evidence[bn->cpts[i].parents[j]] < 0;
+		counts_multi_missing += nm >= 2;
+	}
+	if (ec.loglik != ec2.loglik)
+		FAIL("counts: loglik differs with sharing off");
+	if (fabs(ec.loglik - log(z)) > 1e-10)
+		FAIL("counts: loglik %.17g, oracle %.17g", ec.loglik, log(z));
+	for (int g = 0; g < ngroups; g++)
+	{
+		double		sum = 0;
+
+		for (size_t x = goff[g]; x < goff[g] + gsize[g]; x++)
+		{
+			if (counts[x] != counts2[x])
+				FAIL("counts: group %d cell %zu differs with sharing off", g, x - goff[g]);
+			if (counts[x] < 0)
+				FAIL("counts: group %d cell %zu negative", g, x - goff[g]);
+			if (fabs(counts[x] - ocounts[x]) > TOL * fmax(1.0, ocounts[x]))
+				FAIL("counts: group %d cell %zu engine %.17g oracle %.17g",
+					 g, x - goff[g], counts[x], ocounts[x]);
+			sum += counts[x];
+		}
+		if (fabs(sum - ninst[g]) > TOL * fmax(1.0, ninst[g]))
+			FAIL("counts: group %d sums to %.17g, has %d CPTs", g, sum, ninst[g]);
+	}
+}
+
+/* A gen() network with every CPT its own group. */
+static void
+check_counts_case(net *n, uint64_t cseed)
+{
+	int			group[MAXV];
+	size_t		gsize[MAXV];
+
+	for (int i = 0; i < n->nvars; i++)
+	{
+		const gx_cpt *c = &n->cpts[i];
+
+		group[i] = i;
+		gsize[i] = (size_t) n->card[c->child];
+		for (int j = 0; j < c->nparents; j++)
+			gsize[i] *= (size_t) n->card[c->parents[j]];
+	}
+	check_counts(&n->bn, group, n->nvars, gsize, cseed);
+}
+
+/*
+ * A first-order shape: a template of T variables (from gen()) copied R
+ * times, every copy of a template variable in one group with the same
+ * CPT.  With vertical edges, template variable t of copy r > 0 also has
+ * t of copy r - 1 as its last parent (one group for those copies, another
+ * for copy 0), which ties the copies into one component.  Evidence is
+ * drawn per copy from two patterns, so equal copies are shared.  The CPT
+ * order is shuffled.
+ */
+static void
+check_counts_firstorder(uint64_t cseed)
+{
+	static double vvals[4][8 * 8 * 8 * 8 * 4];
+	net			t;
+	int			T,
+				R = 1 + rnd(3),
+				vert = rnd(2),
+				nv;
+	int			card[MAXV],
+				ev[MAXV],
+				par[MAXV][4],
+				group[MAXV],
+				order[MAXV],
+				pat[2][4];
+	size_t		gsize[2 * 4];
+	gx_cpt		cpts[MAXV];
+	gx_bn		bn;
+
+	do
+		gen(&t, rnd(4) == 0 ? 0.3 : 0.0, 0.0);
+	while (t.nvars > 4);
+	T = t.nvars;
+	nv = T * R;
+	for (int p = 0; p < 2; p++)
+		for (int v = 0; v < T; v++)
+			pat[p][v] = rnd(2) ? rnd(t.card[v]) : -1;
+
+	/* Vertical CPTs: one random distribution per previous-copy value. */
+	for (int v = 0; v < T; v++)
+	{
+		size_t		rows = (size_t) t.card[v];
+
+		for (int j = 0; j < t.npar[v]; j++)
+			rows *= (size_t) t.card[t.par[v][j]];
+		for (size_t r = 0; r < rows; r++)
+		{
+			double		s = 0;
+			double	   *row = &vvals[v][r * (size_t) t.card[v]];
+
+			for (int x = 0; x < t.card[v]; x++)
+				s += row[x] = 0.01 + rnd(1000) / 1000.0;
+			for (int x = 0; x < t.card[v]; x++)
+				row[x] /= s;
+		}
+		gsize[v] = (size_t) t.card[v];
+		for (int j = 0; j < t.npar[v]; j++)
+			gsize[v] *= (size_t) t.card[t.par[v][j]];
+		gsize[T + v] = gsize[v] * (size_t) t.card[v];
+	}
+
+	for (int r = 0; r < R; r++)
+	{
+		int			p = rnd(2);
+
+		for (int v = 0; v < T; v++)
+		{
+			int			g = r * T + v,
+						np = t.npar[v];
+
+			card[g] = t.card[v];
+			ev[g] = pat[p][v];
+			for (int j = 0; j < np; j++)
+				par[g][j] = r * T + t.par[v][j];
+			if (vert && r > 0)
+				par[g][np++] = (r - 1) * T + v;
+			cpts[g] = (gx_cpt)
+			{
+				g, np, par[g], (vert && r > 0) ? vvals[v] : t.vals[v]
+			};
+			group[g] = (vert && r > 0) ? T + v : v;
+		}
+	}
+
+	/* Shuffle the CPTs, keeping each CPT's group with it. */
+	for (int i = 0; i < nv; i++)
+		order[i] = i;
+	for (int i = nv - 1; i > 0; i--)
+	{
+		int			j = rnd(i + 1),
+					tmp = order[i];
+
+		order[i] = order[j];
+		order[j] = tmp;
+	}
+	{
+		gx_cpt		sc[MAXV];
+		int			sg[MAXV];
+
+		for (int i = 0; i < nv; i++)
+		{
+			sc[i] = cpts[order[i]];
+			sg[i] = group[order[i]];
+		}
+		memcpy(cpts, sc, sizeof(sc));
+		memcpy(group, sg, sizeof(sg));
+	}
+	bn = (gx_bn)
+	{
+		nv, card, ev, nv, cpts
+	};
+	if (gx_check(&env, &bn, &nv) != GX_OK)
+		FAIL("first-order counts: gx_check rejected the network");
+	check_counts(&bn, group, 2 * T, gsize, cseed);
+}
+
+/*
+ * Fixed cases: complete data gives indicator counts; identical components
+ * come from the cache and are counted once per instance; the size bound is
+ * GX_ETOOBIG even with sampling on; a group of the wrong size is GX_EINVAL.
+ */
+static void
+check_counts_fixed(void)
+{
+	uint64_t	cseed = 0;
+	enum
+	{
+		K = 50
+	};
+	int			card[2 * K],
+				ev[2 * K],
+				par[2 * K],
+				group[2 * K];
+	double		prior[2] = {0.3, 0.7};
+	double		cond[4] = {0.9, 0.1, 0.2, 0.8};
+	size_t		gsize[2] = {2, 4};
+	double		counts[6];
+	gx_cpt		cpts[2 * K];
+	gx_bn		bn = {2 * K, card, ev, 2 * K, cpts};
+	gx_counts	ec = {group, 2, gsize, counts, 0, 0, 0, 0};
+	gx_env		small = env;
+	int			rc;
+
+	/* K copies of x -> y; x missing, y observed 0 for even k, 1 for odd. */
+	for (int k = 0; k < K; k++)
+	{
+		card[2 * k] = card[2 * k + 1] = 2;
+		ev[2 * k] = -1;
+		ev[2 * k + 1] = k % 2;
+		par[2 * k + 1] = 2 * k;
+		cpts[2 * k] = (gx_cpt) {2 * k, 0, NULL, prior};
+		cpts[2 * k + 1] = (gx_cpt) {2 * k + 1, 1, &par[2 * k + 1], cond};
+		group[2 * k] = 0;
+		group[2 * k + 1] = 1;
+	}
+	if (gx_expected_counts(&env, &bn, &ec) != GX_OK || ec.cache_hits != K - 2)
+		FAIL("counts sharing: cache hits %ld, want %d", ec.cache_hits, K - 2);
+
+	/*
+	 * P(x=1 | y=0) = 0.14 / 0.41 and P(x=1 | y=1) = 0.56 / 0.59, K / 2 times
+	 * each; the y cells: (x, y) row-major.
+	 */
+	{
+		double		a = 0.14 / 0.41,
+					b = 0.56 / 0.59,
+					want[6] = {K / 2 * (2 - a - b), K / 2 * (a + b),
+				K / 2 * (1 - a), K / 2 * (1 - b), K / 2 * a, K / 2 * b};
+
+		for (int x = 0; x < 6; x++)
+			if (fabs(counts[x] - want[x]) > 1e-12 * (double) K)
+				FAIL("counts sharing: cell %d is %.17g, want %.17g", x, counts[x], want[x]);
+		if (fabs(ec.loglik - K / 2 * (log(0.41) + log(0.59))) > 1e-10)
+			FAIL("counts sharing: loglik %.17g", ec.loglik);
+	}
+
+	/* Complete data: indicators, and log of the product of the entries. */
+	for (int k = 0; k < K; k++)
+		ev[2 * k] = 1;
+	if (gx_expected_counts(&env, &bn, &ec) != GX_OK ||
+		counts[0] != 0 || counts[1] != (double) K || counts[4] != K / 2 || counts[5] != K / 2 ||
+		counts[2] != 0 || counts[3] != 0 ||
+		fabs(ec.loglik - ((double) K * log(0.7) + K / 2 * (log(0.2) + log(0.8)))) > 1e-10)
+		FAIL("counts on complete data are not indicators");
+
+	/* A wrong group size. */
+	gsize[1] = 3;
+	if (gx_expected_counts(&env, &bn, &ec) != GX_EINVAL || ec.bad_var != 1)
+		FAIL("counts: a group of the wrong size was not GX_EINVAL");
+	gsize[1] = 4;
+
+	/* Too big for exact: GX_ETOOBIG, not sampled. */
+	for (int k = 0; k < K; k++)
+		ev[2 * k] = -1;
+	small.max_cells = 1;
+	small.samples = 1000;
+	if ((rc = gx_expected_counts(&small, &bn, &ec)) != GX_ETOOBIG || ec.bad_size != 1)
+		FAIL("counts: over the bound returned %d, want GX_ETOOBIG", rc);
+	nchecks += 4;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1237,6 +1552,7 @@ main(int argc, char **argv)
 	check_gibbs_fallback();
 	check_gibbs_seed();
 	check_gibbs_nomix();
+	check_counts_fixed();
 	for (long i = 0; i < cases; i++)
 	{
 		net			n;
@@ -1247,10 +1563,21 @@ main(int argc, char **argv)
 		rng = cseed;
 		gen(&n, zero, evf);
 		check_case(&n, cseed);
+		check_counts_case(&n, cseed);
+		check_counts_firstorder(cseed);
 		if (i % 10 == 0)
 			check_gibbs_case(&n, cseed);
 	}
 	check_gibbs_refusals(seed);
+	if (cases >= 100 && (counts_multi_missing == 0 || counts_cache_hits == 0))
+	{
+		uint64_t	cseed = seed;
+
+		FAIL("counts cases had %ld families with two missing variables and %ld "
+			 "cache hits; both must be positive", counts_multi_missing, counts_cache_hits);
+	}
+	printf("engine: expected counts: %ld families with two or more missing, %ld cache hits\n",
+		   counts_multi_missing, counts_cache_hits);
 	printf("engine: %ld checks passed (seed %llu, %ld random cases)\n",
 		   nchecks, (unsigned long long) seed, cases);
 	return 0;

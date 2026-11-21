@@ -25,6 +25,15 @@ typedef struct oracle_out
 /* Returns 0 on success, -1 if too many missing variables. */
 int			oracle_run(const gx_bn *bn, oracle_out *out);
 
+/*
+ * Expected family counts: counts[goff[group[i]] + x] += P(family of CPT i
+ * = x | evidence) for every CPT i and cell x, and *z = P(evidence).
+ * counts[0..ncounts) must be zeroed by the caller.  Returns -1 if too
+ * many missing variables, 1 if P(evidence) is 0.
+ */
+int			oracle_counts(const gx_bn *bn, const int *group, const size_t *goff,
+						  double *counts, size_t ncounts, double *z);
+
 /* Joint probability of a complete assignment (evidence filled in). */
 double		oracle_joint(const gx_bn *bn, const int *assign);
 

@@ -37,6 +37,7 @@
 #include "pg_gaps.h"
 
 PG_FUNCTION_INFO_V1(gaps_infer);
+PG_FUNCTION_INFO_V1(gaps_expected_counts);
 
 /* GUCs, registered in _PG_init. */
 int			gaps_max_factor_cells = 1 << 20;
@@ -148,11 +149,12 @@ bad_arg(const char *fmt, int a, int b)
  */
 /*
  * Read and check gaps._infer's arrays and build the engine's network from
- * them, in the engine's 0-based form.  Everything is palloc'd in the
+ * them, in the engine's 0-based form, and set *cpt_off to the checked
+ * cpt_off array (1-based, one per CPT).  Everything is palloc'd in the
  * current context.
  */
 static void
-build_network(FunctionCallInfo fcinfo, gx_bn *bn)
+build_network(FunctionCallInfo fcinfo, gx_bn *bn, const int **cpt_off)
 {
 	int		   *card,
 			   *evid,
@@ -231,6 +233,7 @@ build_network(FunctionCallInfo fcinfo, gx_bn *bn)
 	bn->evidence = evid;
 	bn->ncpts = n;
 	bn->cpts = cpts;
+	*cpt_off = coff;
 }
 
 /*
@@ -292,6 +295,22 @@ report(int rc, int bad, const gx_result *res)
 		elog(ERROR, "inference engine failed with code %d", rc);
 }
 
+/* The engine's services and bounds, from the GUCs. */
+static void
+make_env(gx_env *env)
+{
+	env->alloc = pg_alloc;
+	env->free = pg_free;
+	env->interrupt = pg_interrupt;
+	env->arg = NULL;
+	env->max_cells = (size_t) gaps_max_factor_cells;
+	env->max_total_cells = (size_t) gaps_max_total_cells;
+	env->no_sharing = !gaps_share_components;
+	env->samples = gaps_samples;
+	env->seed = (uint64_t) gaps_seed;
+	env->sample_always = 0;
+}
+
 Datum
 gaps_infer(PG_FUNCTION_ARGS)
 {
@@ -299,6 +318,7 @@ gaps_infer(PG_FUNCTION_ARGS)
 	gx_bn		bn;
 	gx_env		env;
 	gx_result	res;
+	const int  *coff;
 	int			bad;
 	int			rc;
 	MemoryContext work,
@@ -321,17 +341,8 @@ gaps_infer(PG_FUNCTION_ARGS)
 								 ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(work);
 
-	build_network(fcinfo, &bn);
-	env.alloc = pg_alloc;
-	env.free = pg_free;
-	env.interrupt = pg_interrupt;
-	env.arg = NULL;
-	env.max_cells = (size_t) gaps_max_factor_cells;
-	env.max_total_cells = (size_t) gaps_max_total_cells;
-	env.no_sharing = !gaps_share_components;
-	env.samples = gaps_samples;
-	env.seed = (uint64_t) gaps_seed;
-	env.sample_always = 0;
+	build_network(fcinfo, &bn, &coff);
+	make_env(&env);
 
 	/*
 	 * The engine call must finish before bad or res is read: C does not
@@ -365,6 +376,151 @@ gaps_infer(PG_FUNCTION_ARGS)
 			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 		}
 	}
+	MemoryContextDelete(work);
+	PG_RETURN_NULL();
+}
+
+static int
+int_cmp(const void *a, const void *b)
+{
+	int			x = *(const int *) a,
+				y = *(const int *) b;
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * The groups of gaps._expected_counts: one per distinct cpt_off, numbered
+ * in increasing offset, into group[] (per CPT) and *goffs (the offsets,
+ * ascending).  Each group's size is its first CPT's; the engine refuses a
+ * CPT of another size.  Errors if all the groups' cells together exceed
+ * gaps.max_total_cells.  Returns the number of groups.
+ */
+static int
+derive_groups(const gx_bn *bn, const int *coff, int *group, int **goffs,
+			  size_t **gsize)
+{
+	int		   *u = palloc(sizeof(int) * (bn->ncpts ? bn->ncpts : 1));
+	int			ng = 0;
+	size_t		total = 0;
+
+	memcpy(u, coff, sizeof(int) * bn->ncpts);
+	qsort(u, bn->ncpts, sizeof(int), int_cmp);
+	for (int i = 0; i < bn->ncpts; i++)
+		if (ng == 0 || u[ng - 1] != u[i])
+			u[ng++] = u[i];
+	*gsize = palloc0(sizeof(size_t) * (ng ? ng : 1));
+	for (int i = 0; i < bn->ncpts; i++)
+	{
+		const gx_cpt *c = &bn->cpts[i];
+		int		   *hit = bsearch(&coff[i], u, ng, sizeof(int), int_cmp);
+		size_t		n = (size_t) bn->card[c->child];
+
+		group[i] = (int) (hit - u);
+		if ((*gsize)[group[i]] != 0)
+			continue;
+		/* build_network bounded each CPT by gaps.max_factor_cells. */
+		for (int j = 0; j < c->nparents; j++)
+			n *= (size_t) bn->card[c->parents[j]];
+		(*gsize)[group[i]] = n;
+		total += n;
+		if (total > (size_t) gaps_max_total_cells)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("the CPTs together have more than gaps.max_total_cells (%d) cells",
+							gaps_max_total_cells)));
+	}
+	*goffs = u;
+	return ng;
+}
+
+/*
+ * gaps._expected_counts(card int[], evidence int[], child int[],
+ *						 parent_off int[], parents int[], cpt_off int[],
+ *						 cpts float8[])
+ * RETURNS TABLE (cpt_off int, cell int, n float8, loglik float8)
+ *
+ * The E-step of EM over the ground network gaps._infer takes (same
+ * arguments, same checks).  CPTs that share a cpt_off are instances of
+ * one first-order factor.  For each such offset and each cell (1-based,
+ * in the CPT's own order), n is the sum over its instances of the
+ * posterior probability that the instance's child and parents take that
+ * cell's values, given the evidence; an instance with all of them
+ * observed adds 1 to its cell.  loglik, the same on every row, is log
+ * P(evidence) under the given CPTs.  Exact inference only: a component
+ * too large for it is an ERROR whatever gaps.samples says.
+ */
+Datum
+gaps_expected_counts(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	gx_bn		bn;
+	gx_env		env;
+	gx_counts	ec;
+	const int  *coff;
+	int		   *group,
+			   *goffs;
+	size_t	   *gsize;
+	size_t		off = 0;
+	int			bad;
+	int			rc;
+	MemoryContext work,
+				old;
+
+	for (int i = 0; i < 7; i++)
+		if (PG_ARGISNULL(i))
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("gaps._expected_counts arguments must not be NULL")));
+
+	InitMaterializedSRF(fcinfo, 0);
+	work = AllocSetContextCreate(CurrentMemoryContext, "pg_gaps expected counts",
+								 ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(work);
+
+	build_network(fcinfo, &bn, &coff);
+	make_env(&env);
+	group = palloc(sizeof(int) * (bn.ncpts ? bn.ncpts : 1));
+	memset(&ec, 0, sizeof(ec));
+	ec.group = group;
+	ec.ngroups = derive_groups(&bn, coff, group, &goffs, &gsize);
+	ec.group_size = gsize;
+	for (int g = 0; g < ec.ngroups; g++)
+		off += gsize[g];
+	ec.counts = palloc(sizeof(double) * (off ? off : 1));
+
+	rc = gx_check(&env, &bn, &bad);
+	report(rc, bad, NULL);
+	rc = gx_expected_counts(&env, &bn, &ec);
+	if (rc == GX_EINVAL)
+		bad_arg("CPTs sharing a cpt_off must have the same size (CPT of variable %d)",
+				ec.bad_var + 1, 0);
+	if (rc == GX_ETOOBIG)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("expected counts need a factor larger than gaps.max_factor_cells (%d) "
+						"or more than gaps.max_total_cells (%d)",
+						gaps_max_factor_cells, gaps_max_total_cells),
+				 errdetail("The component of %d variables containing variable %d is too "
+						   "large for exact inference, and expected counts are not sampled.",
+						   ec.bad_size, ec.bad_var + 1),
+				 errhint("Raise the limits.")));
+	report(rc, ec.bad_var, NULL);
+
+	MemoryContextSwitchTo(old);
+	off = 0;
+	for (int g = 0; g < ec.ngroups; g++)
+		for (size_t x = 0; x < gsize[g]; x++)
+		{
+			Datum		values[4];
+			bool		nulls[4] = {0};
+
+			values[0] = Int32GetDatum(goffs[g]);
+			values[1] = Int32GetDatum((int) x + 1);
+			values[2] = Float8GetDatum(ec.counts[off++]);
+			values[3] = Float8GetDatum(ec.loglik);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		}
 	MemoryContextDelete(work);
 	PG_RETURN_NULL();
 }

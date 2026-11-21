@@ -465,6 +465,61 @@ as long as the factor, survives dump and restore, and is visible through
 `cpt_rows`), and an argument would make every caller pass the same
 arrays again.
 
+**Learning with missing values.**  `learn_cpts(model, alpha, method =>
+'em', max_iterations => 50, tol => 1e-6)` runs expectation maximization,
+so an entity with a missing child or parent still informs the factor
+(pg.ddx.io's case: a latent author per email, a few hundred labelled and
+hundreds of thousands not).  It starts from the `'counts'` estimate,
+grounds the model once (grounding does not depend on the CPTs, so each
+iteration only swaps the CPT array), and repeats: the E-step
+`gaps._expected_counts` (exact, "Expected counts" under "Inference
+engine"), then the counting update with expected counts, (E[count] +
+pseudocount) / (row total + sum of pseudocounts).
+
+That update is not EM for the posterior mean.  It is EM for the
+posterior mode under Dirichlet(pseudocount + 1), whose log density is
+sum(pseudocount * ln(cell)) up to a constant, so the quantity it never
+decreases is loglik + sum(pseudocount * ln(cell)) (a cell with pseudocount 0 adds 0
+ln(cell) = 0, even at 0), and that is what the stopping rule watches.
+The tolerance is relative: the loop ends when an iteration changes the
+objective by at most `tol` * max(1, |objective|).  An absolute rule would
+fire on rounding noise at pg.ddx.io's scale, where loglik is about -1e6
+and the summed log Z carries about 1e-10 relative error (`sql/em.sql`
+checks the climb on t5's model at pseudocounts 0.5, 1, 3 and 50).  On
+complete data the E-step returns the counts, so 'em' gives the 'counts'
+answer after one iteration.  Treating the prior as a posterior-mean
+prior over EM would need a variational or sampling E-step; a mode under
+a prior one larger is what the counting rule already computes, and it
+keeps one meaning of the pseudocounts in both methods.  Pseudocounts of
+zero allow a cell to reach 0, and with a positive one a cell stays
+positive.
+
+EM finds a local maximum.  The start decides which one.  It is the
+complete-data estimate, except where that estimate makes the evidence
+impossible: with a pseudocount of 0, a value that no complete row shows
+gets probability 0, and an incomplete row that has it then has
+probability 0 under every CPT EM can reach (a cell at 0 stays 0).  That
+is pg.ddx.io's shape, a child value that no labelled email shows for
+some author state.  Then EM starts instead from the counts plus
+max(pseudocount, 1), the add-one estimate, for the start only: every
+cell of it is positive, so the evidence is possible, and the iterations
+use the caller's pseudocounts as before (`sql/em.sql` has t5's shape and
+a latent-class one).  learn_cpts says so with a WARNING and in its
+output, whose method is then 'em (add-one start)', because the start
+decides which fixed point EM reaches.  Smoothing
+the start only when it is needed keeps the documented start, and the
+'counts' answer on complete data, everywhere else.  Any positive
+smoothing makes the evidence possible; add-one is the conventional one
+(Laplace's rule), and the choice moves the start, so it can change which
+local maximum EM reaches and how fast.  A factor whose child is never
+observed together with its parents starts uniform, which is a saddle
+when the latent variable's values are interchangeable; nothing here
+breaks that symmetry, so such a factor needs a prior or a few labelled
+rows.  The output says `method` 'em', `iterations` (M-steps, 0 for
+'counts'), `loglik` (log P(evidence) under the returned CPTs) and
+`converged` (false when `max_iterations` stopped it).  A component too
+large for exact inference is an `ERROR`; there is no sampled E-step.
+
 **Entity-set predicates** are a conjunction of `column op constant` terms
 stored as rows, with `op` one of `=`, `<>`, `<`, `<=`, `>`, `>=`.  Each use
 builds the query from catalog-resolved, quoted identifiers and passes the
@@ -516,6 +571,7 @@ SELECT gaps.add_stripe('sensors', ...);   -- attribute + entity set
 SELECT gaps.add_factor('sensors', child => ..., parents => ..., cpt => ...);
 SELECT gaps.set_prior('sensors', ...);    -- optional Dirichlet pseudocounts per cell
 SELECT gaps.learn_cpts('sensors');        -- posterior mean from complete rows
+SELECT gaps.learn_cpts('sensors', method => 'em');   -- uses incomplete rows too
 SELECT * FROM gaps.validate('sensors');   -- first-order acyclicity, no data read
 
 -- query
@@ -607,6 +663,25 @@ component sits in the network.  The key hashes native `int` and
 `double` bytes, and draws go through `exp()`, which C does not require
 to be correctly rounded, so bit-identical results are promised on one
 platform, not across byte orders or C libraries.
+
+**Expected counts.**  `gx_expected_counts` is EM's E-step.  For each
+grounded CPT it needs the posterior over the CPT's whole family (child
+and parents), not the product of per-variable marginals, which ignores
+their correlation.  Every reduced CPT is a base factor of the bucket of
+its first-eliminated variable, and that bucket's cluster contains its
+scope; after the downward pass the bucket's belief (its base factors,
+its parent's message and every kid's message) is the joint posterior
+over the cluster, and summing it onto the CPT's variables gives the
+family posterior.  Summed over the instances of a first-order factor,
+these are its expected counts; an instance with its family observed adds
+1 to its cell, so on complete data they are `learn_cpts`' counts.  The
+same call returns log P(evidence), the sum of each component's log Z and
+the logs of the fully observed CPTs, which an EM loop needs for its
+convergence test.  Shared components reuse the cached family posteriors:
+the cache key orders a component's factors canonically, the entry stores
+the posteriors in that order, and each component maps them back to its
+own CPTs through the factor's source index.  Only exact inference is
+used; the engine does not sample an E-step.
 
 `impute` on a sampled component returns each variable's most probable
 pooled value (method 'gibbs-marginal-argmax') with a NULL probability.
