@@ -68,6 +68,7 @@ green on the first push.  Packaged for PGXN, not yet published.
 | 1 | dropped or altered table names the change | done: rename, type change and drop each refused with the name (`test/dump`) |
 | 2 | engine: exact inference, bucket tree, log space, bounds, sharing | done; brute-force oracle, closed forms, allocation failure (`test/engine`); two independent reviews |
 | 2 | `marginals`, `impute`, `learn_cpts` | done (`sql/infer.sql`, `sql/learn.sql`) |
+| 2 | per-cell Dirichlet priors for `learn_cpts`, `cpt_rows` | done: `gaps.factor.prior`, `set_prior`; posterior mean per parent row, exact to 1e-12 against the closed form including pg.ddx.io's Beta(8.70, 191.30) cell; validated in the trigger and at grounding; kept by dump and restore (`sql/learn.sql`, `test/dump`) |
 | 2 | pgmpy cross-check | done: 2,647 to 2,762 marginals per run agree to 1e-9 (`test/pgmpy`, flake check `pgmpy`) |
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
 | 2 | `SupportRequestRows` for the SRFs | done: catalog plus `stanullfrac` estimate, under the `pg_stats` visibility rule; ROWS fallback; no lock waits, none on a standby or under SERIALIZABLE; replans on ANALYZE (`sql/rows.sql`) |

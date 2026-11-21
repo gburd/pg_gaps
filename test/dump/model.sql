@@ -1,6 +1,6 @@
 -- The model test/dump/run.sh dumps and restores.  It exercises every
 -- catalog table: stripe predicates, a vertical factor with a mapping, a
--- horizontal factor, a coarse entity set and a learned CPT.
+-- horizontal factor, a coarse entity set, a prior and learned CPTs.
 SET client_min_messages = warning;
 CREATE EXTENSION pg_gaps;
 
@@ -31,4 +31,5 @@ SELECT gaps.map_factor('dump', 'copy', 1, 't', 't');
 SELECT gaps.map_factor('dump', 'copy', 1, 'room', 'room');
 SELECT gaps.add_factor('dump', 'light', 'l', ARRAY['tp']);
 SELECT gaps.add_factor('dump', 'occ', 'occ', '{}');
+SELECT gaps.set_prior('dump', 'light', ARRAY[2, 0.5, 0.25, 3]);
 SELECT * FROM gaps.learn_cpts('dump');
