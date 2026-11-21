@@ -45,6 +45,20 @@ SELECT plan_rows($$SELECT * FROM gaps.marginals('rm')$$) AS marginals_est,
 	   (SELECT count(*) FROM gaps.impute('rm')) AS impute_actual,
 	   plan_rows($$SELECT * FROM gaps.learn_cpts('rm')$$) AS learn_est;
 
+-- A restricted call: the entities times the rows per entity of rel's
+-- attributes, 800 / 1000 for marginals and 350 / 1000 for impute, so 4.0
+-- and 1.75 for five entities.  No estimate (ROWS) when entities is not a
+-- constant, or is given without rel.
+SELECT plan_rows($$SELECT * FROM gaps.marginals('rm', 't',
+	'[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 8}]')$$) AS marginals_est,
+	   (SELECT count(*) FROM gaps.marginals('rm', 't',
+		   '[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 8}]')) AS marginals_actual,
+	   plan_rows($$SELECT * FROM gaps.impute('rm', 't',
+	'[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 8}]')$$) AS impute_est,
+	   plan_rows($$SELECT * FROM gaps.marginals('rm', 't',
+	(SELECT jsonb_agg(jsonb_build_object('id', id)) FROM t WHERE id < 6))$$) AS subquery,
+	   plan_rows($$SELECT * FROM gaps.marginals('rm', NULL, '[{"id": 1}]')$$) AS no_rel;
+
 -- A parameter: a custom plan sees the bound value, a generic plan does not
 -- and falls back to ROWS.
 PREPARE pm(text) AS SELECT * FROM gaps.marginals($1);

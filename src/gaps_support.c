@@ -13,6 +13,11 @@
  *	 impute:	 sum over attributes of reltuples * null_frac
  *	 learn_cpts: the number of factors
  *
+ * A restricted call (rel and entities given) to marginals or impute gets
+ * the number of requested entities times the same sum over rel's
+ * attributes alone, the rows its requested entities return on average,
+ * when both are constants; otherwise no estimate.
+ *
  * It runs during planning, so it must neither fail nor be slow.  The model
  * argument must be a constant (after estimate_expression_value, so a bound
  * parameter of a custom plan counts); anything else, a model the caller
@@ -143,7 +148,7 @@ missing_values(PlannerGlobal *glob, Oid rel, const char *attname,
  * connected to SPI and catches errors.
  */
 static bool
-estimate_rows(GapsSrf srf, Datum model, PlannerGlobal *glob, double *rows)
+estimate_rows(GapsSrf srf, Datum *args, PlannerGlobal *glob, double *rows)
 {
 	static const char *const factors_sql =
 		"SELECT (SELECT pg_catalog.count(*) FROM gaps.factor f "
@@ -156,13 +161,24 @@ estimate_rows(GapsSrf srf, Datum model, PlannerGlobal *glob, double *rows)
 		"FROM gaps.model m LEFT JOIN gaps.attribute a "
 		"ON a.model_id OPERATOR(pg_catalog.=) m.model_id "
 		"WHERE m.name OPERATOR(pg_catalog.=) $1";
-	Oid			argtype = TEXTOID;
-	const char *sql = srf == SRF_LEARN_CPTS ? factors_sql : attributes_sql;
+	static const char *const restricted_sql =
+		"SELECT a.rel::pg_catalog.oid, a.attname::pg_catalog.text, "
+		"pg_catalog.cardinality(a.domain)::pg_catalog.float8, "
+		"pg_catalog.jsonb_array_length($3)::pg_catalog.float8 "
+		"FROM gaps.model m LEFT JOIN gaps.attribute a "
+		"ON a.model_id OPERATOR(pg_catalog.=) m.model_id "
+		"AND a.rel OPERATOR(pg_catalog.=) $2 "
+		"WHERE m.name OPERATOR(pg_catalog.=) $1";
+	Oid			argtypes[3] = {TEXTOID, REGCLASSOID, JSONBOID};
+	bool		restricted = args[2] != (Datum) 0;
+	const char *sql = srf == SRF_LEARN_CPTS ? factors_sql :
+		restricted ? restricted_sql : attributes_sql;
 	TupleDesc	desc;
 	bool		isnull;
+	double		nentities = 1;
 
-	if (SPI_execute_with_args(sql, 1, &argtype, &model, NULL, true, 0) !=
-		SPI_OK_SELECT || SPI_processed == 0)
+	if (SPI_execute_with_args(sql, restricted ? 3 : 1, argtypes, args, NULL,
+							  true, 0) != SPI_OK_SELECT || SPI_processed == 0)
 		return false;
 	desc = SPI_tuptable->tupdesc;
 
@@ -174,8 +190,16 @@ estimate_rows(GapsSrf srf, Datum model, PlannerGlobal *glob, double *rows)
 	}
 
 	/*
+	 * jsonb_array_length fails on a non-array, which the caller turns into
+	 * no estimate, as the call itself will fail.
+	 */
+	if (restricted)
+		nentities = DatumGetFloat8(SPI_getbinval(SPI_tuptable->vals[0], desc,
+												 4, &isnull));
+
+	/*
 	 * One row per attribute, or one row of NULLs for a model with no
-	 * attributes.  Every attribute's random variables are all of its
+	 * attributes (of rel, for a restricted call).  Every attribute's random variables are all of its
 	 * entities, whatever its stripes, so stripe predicates do not enter.
 	 */
 	*rows = 0;
@@ -194,6 +218,25 @@ estimate_rows(GapsSrf srf, Datum model, PlannerGlobal *glob, double *rows)
 		if (!missing_values(glob, rel, SPI_getvalue(tup, desc, 2), &missing))
 			return false;
 		*rows += srf == SRF_MARGINALS ? missing * card : missing;
+	}
+
+	/*
+	 * Each requested entity is one of rel's, so it has, on average, the
+	 * missing values of rel's attributes divided by its row count.
+	 */
+	if (restricted)
+	{
+		double		reltuples = 0;
+		HeapTuple	tup = SearchSysCache1(RELOID, args[1]);
+
+		if (HeapTupleIsValid(tup))
+		{
+			reltuples = ((Form_pg_class) GETSTRUCT(tup))->reltuples;
+			ReleaseSysCache(tup);
+		}
+		if (reltuples <= 0)
+			return false;
+		*rows = *rows / reltuples * nentities;
 	}
 	return true;
 }
@@ -272,7 +315,7 @@ lock_catalog_table(Oid nsp, const char *relname, PlannerGlobal *glob)
  * statement unkillable for the duration.
  */
 static bool
-estimate_rows_safely(GapsSrf srf, Datum model, PlannerGlobal *glob,
+estimate_rows_safely(GapsSrf srf, Datum *args, PlannerGlobal *glob,
 					 double *rows)
 {
 	MemoryContext oldcontext = CurrentMemoryContext;
@@ -285,7 +328,7 @@ estimate_rows_safely(GapsSrf srf, Datum model, PlannerGlobal *glob,
 	{
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed");
-		ok = estimate_rows(srf, model, glob, rows);
+		ok = estimate_rows(srf, args, glob, rows);
 		SPI_finish();
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcontext);
@@ -311,9 +354,38 @@ estimate_rows_safely(GapsSrf srf, Datum model, PlannerGlobal *glob,
 }
 
 /*
+ * Argument n of the call as a constant of type typid, after
+ * estimate_expression_value.  Returns false if it is not one; sets *isnull
+ * and, when not null, *value.  An argument the call does not have counts as
+ * NULL.
+ */
+static bool
+const_arg(SupportRequestRows *req, int n, Oid typid, Datum *value, bool *isnull)
+{
+	List	   *args = ((FuncExpr *) req->node)->args;
+	Node	   *arg;
+
+	if (list_length(args) <= n)
+	{
+		/* The planner expands defaults, but a missing one is NULL. */
+		*isnull = true;
+		return true;
+	}
+	arg = list_nth(args, n);
+	if (req->root != NULL)
+		arg = estimate_expression_value(req->root, arg);
+	if (!IsA(arg, Const) || ((Const *) arg)->consttype != typid)
+		return false;
+	*isnull = ((Const *) arg)->constisnull;
+	*value = ((Const *) arg)->constvalue;
+	return true;
+}
+
+/*
  * The support function.  Answers SupportRequestRows for a call whose first
- * argument, the model name, is a non-NULL constant; returns NULL (no
- * answer) for every other request.
+ * argument, the model name, is a non-NULL constant, and whose rel and
+ * entities arguments, if it has them, are constants, both NULL or both
+ * not; returns NULL (no answer) for every other request.
  */
 Datum
 gaps_rows_support(PG_FUNCTION_ARGS)
@@ -322,10 +394,13 @@ gaps_rows_support(PG_FUNCTION_ARGS)
 	SupportRequestRows *req;
 	char	   *fname;
 	GapsSrf		srf;
-	Node	   *arg;
 	PlannerGlobal *glob;
 	Oid			nsp;
 	double		rows;
+	Datum		args[3] = {0, 0, 0};
+	bool		isnull;
+	bool		relnull = true;
+	bool		entnull = true;
 
 	/*
 	 * No estimate in parallel mode: the worker has no use for one, the
@@ -358,12 +433,15 @@ gaps_rows_support(PG_FUNCTION_ARGS)
 	else
 		PG_RETURN_POINTER(NULL);
 
-	arg = linitial(((FuncExpr *) req->node)->args);
-	if (req->root != NULL)
-		arg = estimate_expression_value(req->root, arg);
-	if (!IsA(arg, Const) || ((Const *) arg)->constisnull ||
-		((Const *) arg)->consttype != TEXTOID)
+	if (!const_arg(req, 0, TEXTOID, &args[0], &isnull) || isnull)
 		PG_RETURN_POINTER(NULL);
+	if (srf != SRF_LEARN_CPTS &&
+		(!const_arg(req, 1, REGCLASSOID, &args[1], &relnull) ||
+		 !const_arg(req, 2, JSONBOID, &args[2], &entnull) ||
+		 relnull != entnull))
+		PG_RETURN_POINTER(NULL);
+	if (entnull)
+		args[1] = args[2] = (Datum) 0;
 
 	/*
 	 * Row-level security makes the answer depend on the role, so a cached
@@ -385,7 +463,7 @@ gaps_rows_support(PG_FUNCTION_ARGS)
 							"attribute", glob))
 		PG_RETURN_POINTER(NULL);
 
-	if (!estimate_rows_safely(srf, ((Const *) arg)->constvalue, glob, &rows))
+	if (!estimate_rows_safely(srf, args, glob, &rows))
 		PG_RETURN_POINTER(NULL);
 	req->rows = rows;
 	PG_RETURN_POINTER(req);
