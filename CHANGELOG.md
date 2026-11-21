@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+`gaps.marginals` and `gaps.impute` take optional `rel` and `entities`
+arguments: given a jsonb array of entity keys of `rel` (the form the
+`entity` column returns), they ground only the components holding those
+entities and return only their variables, with the probabilities of the
+whole-model call.  Cost follows the entities requested when their
+components are small and the mapping columns are indexed (a nullable
+entity key wants an index too): 230 of 318,000 emails in 110 ms against
+33 s.  A long chain of vertical factors costs one closure round per step,
+so past a size measured against the model the call grounds the whole
+model instead, with the same answers.  A restricted call checks the
+model's validity only for the components it grounds.  Malformed keys, a
+relation not in the model, or one argument without the other are errors;
+a key matching no row returns nothing.
+
 Dirichlet priors per CPT cell: `gaps.factor.prior` (NULL by default) and
 `gaps.set_prior(model, factor, prior)`.  `learn_cpts` sets each parent row
 to (count + prior) / (row total + sum(prior row)), so a Beta(8.70, 191.30)

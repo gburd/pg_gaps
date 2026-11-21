@@ -302,6 +302,102 @@ Its text says 5-10x (T3551), and its Table 4.11 gives 5-14x
 (T3504-3508).  It also notes that the overhead can outweigh the gain
 (T3555-3557), which is why it wanted an optimizer to choose.
 
+**Restricted calls.**  `gaps.marginals(model, rel, entities)` and
+`gaps.impute(model, rel, entities)` answer for some entities of one
+relation rather than the whole model.  `entities` is a jsonb array of
+entity keys in the form the `entity` column returns, so a caller can pass
+back what it got; `rel` names their relation.  For each object the call
+returns the rows of the attributes of `rel` whose entity keys are the
+object's keys (a `{"id": ...}` object gets the attributes keyed by `id`,
+not a coarse attribute of the same rows keyed by `grp`), and nothing of
+the rest of their components.  The interface is two optional
+arguments rather than a predicate, a view or a new function: a key list
+is what the pg.ddx.io nightly job has (the ids of new rows), it needs no
+predicate language (Phase 4 brings one for selection, which is a
+different operation: it conditions on `Exist`, where this only chooses
+which posteriors to report), and both NULL is the old call.
+
+An entity's posterior depends on its whole ground component (Principle
+1; vertical factors, coarse entities and one-to-many mappings correlate
+rows), so the call grounds exactly the components that hold a requested
+variable.  `gaps._ground_closure` computes them over the ground graph in
+rounds of set-at-a-time SQL: from the requested entities, each round
+adds, along every factor's every parent, the parents of the entities the
+last round added and their children, through the same mapping and
+stripe predicates grounding uses, until a round adds nothing.  Grounding
+then runs on that entity set: entities, factor instances, coverage,
+mapping totality and evidence checks are the same code restricted to
+it, and because the set is closed (every factor instance has all of its
+variables in it or none), each grounded component equals the
+unrestricted one.  The probabilities are therefore the unrestricted
+call's, bit for bit; component numbers differ.  `sql/subset.sql` checks
+this on fixed models of each shape and 150 random ones.
+
+The closure ignores evidence, so it can hold more than a component in
+the engine's sense (observed variables separate components there).  That
+over-grounds, never under-grounds.  Pruning by d-separation (observed
+separators, barren children) could shrink it; it is not done, because
+the measured workload has one entity per component, where it cannot
+help.
+
+What a round costs depends on indexes.  Each round, and each grounding
+step of a restricted call, joins the frontier to the user's table on the
+entity key columns and the mapping columns.  A key column that holds no
+NULL compares with `=`.  One that may hold a NULL must also match two
+NULLs: an `OR` that an index on the column answers with a probe per side
+and that otherwise leaves only a nested loop over the table, so without
+such an index the key is compared a second time as a record, which
+hashes.  A column counts as holding no NULL only when it is NOT NULL in
+`rel` and in every inheritance child and partition (a scan reads them
+too) and no not-null constraint of theirs is NOT VALID: on PostgreSQL 18
+a NOT VALID constraint sets `attnotnull` over existing NULLs, and a
+parent made NOT NULL with `ALTER TABLE ONLY` or `NO INHERIT` can have
+children with NULLs.  A foreign table's NOT NULL never counts, since it
+is not enforced on the remote rows; but PostgreSQL assumes it holds (and
+19's planner folds `IS NULL` on such a column to false), so a foreign
+table whose rows break its declared NOT NULL gives wrong results to every
+query, pg_gaps' included: declare it nullable.  Measured on 100,000 rows, 230 entities requested,
+against 3.6 s for the full call (`bench/RESULTS_SUBSET_2026-11-21.md`):
+50 ms with an index on a nullable key, 360 ms with neither an index nor
+NOT NULL, about 50 ms on a NOT NULL primary key.  The mapping columns
+are joined with `=`, so an index on them is what keeps a round in
+proportion to its frontier; without one a round is a hash join over the
+table.
+
+A round costs about one statement per factor edge and direction, whatever
+its frontier, so a long chain of vertical factors pays one round per
+step: a 2,000-row chain took 1.8 s restricted against 39 ms for the
+whole model.  The closure therefore gives up when its statements so far,
+less an allowance of 100, times 25 (the measured cost of a statement in
+rows of a whole-model grounding) exceed the model's size (the sum of its
+attributes' relations' `reltuples`; never without statistics).  The call
+then grounds the whole model and reports the requested entities only,
+which gives the same probabilities by construction; the 2,000-row chain
+then takes 105 ms and a 10,001-row one 320 ms (the full call: 31 and
+134 ms).  The fallback is a cost rule, not a proof: a model can still
+make a restricted call a few times slower than the full one, never the
+45x of a closure that runs to the end.  The closure is bounded at
+10,000,000 entities, the requested ones included and each insert limited
+to the entities left, and at 10,000 rounds (AGENTS.md rule 16), with an
+`ERROR` naming the limit that was hit and a hint to call without
+entities; the inference bounds (`gaps.max_total_cells`) still apply to
+each component.
+
+A restricted call checks validity (coverage, one parent per child per
+parent stripe, evidence agreement, CPTs set) only for the entities it
+grounds.  The answer it gives is the right posterior for those
+components under the model, but a clean restricted call does not show
+that the model is valid: a defect in a component it does not touch (a
+child with no parent row, rows that disagree) is reported only by a
+call that grounds it, such as the unrestricted one or a restricted call
+that gave up its closure.  Running the checks over the whole model would
+cost the full grounding this exists to avoid; `gaps.validate` is the
+place for a model-wide check.
+
+At the nightly shape (318,000 emails, 230 requested) a restricted call
+takes 110 ms against 33 s.  `learn_cpts` is not restricted: it learns
+from all the data.
+
 ### The CRF instance [W11 3.4, 5, 6]
 
 For information extraction, BayesStore stores text as a token table
@@ -574,9 +670,12 @@ SELECT gaps.learn_cpts('sensors');        -- posterior mean from complete rows
 SELECT gaps.learn_cpts('sensors', method => 'em');   -- uses incomplete rows too
 SELECT * FROM gaps.validate('sensors');   -- first-order acyclicity, no data read
 
--- query
-SELECT * FROM gaps.marginals('sensors', 'sensor1'::regclass);
-SELECT * FROM gaps.impute('sensors', 'sensor1'::regclass);   -- MAP completion
+-- query (built: the whole model, or the components of some entities)
+SELECT * FROM gaps.marginals('sensors');
+SELECT * FROM gaps.marginals('sensors', 'sensor1'::regclass,
+                             '[{"t": 1, "room": 2, "sid": 1}]');
+SELECT * FROM gaps.impute('sensors');                        -- MAP completion
+-- proposed
 SELECT * FROM gaps.select_rows('sensors', 'sensor1'::regclass,
                                $$ light = 'dark' $$);        -- rows + P(exist)
 -- Phase 5 adds the join form: two relations and a join predicate.
@@ -701,7 +800,13 @@ planner statistics, never user data:
   `reltuples * null_frac * |domain|`, one row per (missing value, domain
   value);
 - `impute`: the same sum without `|domain|`, one row per missing value;
-- `learn_cpts`: the number of factors.
+- `learn_cpts`: the number of factors;
+- a restricted `marginals` or `impute` (rel and entities constants): the
+  number of elements of the entities array (duplicates and coarse
+  entities counted as one row's worth each) times the same sum over `rel`'s
+  attributes alone divided by `rel`'s `reltuples`, the rows an average
+  entity of `rel` returns.  With `entities` not a constant (a subquery),
+  or only one of the two given, there is no estimate.
 
 `null_frac` is the column's `pg_statistic.stanullfrac`.  On a table that
 ANALYZE samples completely the estimate is exact; otherwise it is as good
