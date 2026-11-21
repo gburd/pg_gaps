@@ -1395,16 +1395,6 @@ BEGIN
 END
 $$;
 
--- The SQL to select one attribute's entities and their evidence:
--- SELECT n (1, 2, ... in key order), k (the key, gaps._key_row), ev text[]
--- (the distinct non-NULL values of the attribute among the entity's rows)
--- FROM rel GROUP BY the entity keys.  A binned attribute's values are its
--- bins' labels (gaps._value_sql).  With closure, the name of the
--- attribute's closure table (gaps._ground_closure), only the entities
--- whose keys are there are read, through gaps._key_match so that an index
--- on the key columns answers; the query then takes the attribute's id as
--- $1.  Identifiers come from the catalog
--- and are quoted; nothing from callers is interpolated.
 -- The SQL expression for attribute a's value as text, over the rows of
 -- table alias c: NULL where the value is missing.  A categorical
 -- attribute's value is the column's text form.  A binned attribute's
@@ -1428,6 +1418,16 @@ AS $$
 					   gaps._bin_type(a.typname)) END
 $$;
 
+-- The SQL to select one attribute's entities and their evidence:
+-- SELECT n (1, 2, ... in key order), k (the key, gaps._key_row), ev text[]
+-- (the distinct non-NULL values of the attribute among the entity's rows)
+-- FROM rel GROUP BY the entity keys.  A binned attribute's values are its
+-- bins' labels (gaps._value_sql).  With closure, the name of the
+-- attribute's closure table (gaps._ground_closure), only the entities
+-- whose keys are there are read, through gaps._key_match so that an index
+-- on the key columns answers; the query then takes the attribute's id as
+-- $1.  Identifiers come from the catalog and are quoted; nothing from
+-- callers is interpolated.
 CREATE FUNCTION gaps._entities_sql(a gaps.attribute, ktab text, closure text DEFAULT NULL)
 RETURNS text
 LANGUAGE sql STABLE
