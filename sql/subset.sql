@@ -199,6 +199,24 @@ SELECT * FROM same('n', 'np', '[{"id": 1}, {"id": 2}]');
 -- Entity 1's x has two observed children, one through each NULL key.
 SELECT value, probability FROM gaps.marginals('n', 'np', '[{"id": 1}]') ORDER BY value;
 
+-- A foreign table's NOT NULL is not enforced on the rows it returns: a
+-- NULL key in a file read through file_fdw is still an entity.
+CREATE EXTENSION file_fdw;
+CREATE SERVER files FOREIGN DATA WRAPPER file_fdw;
+CREATE TABLE fp (id int PRIMARY KEY, x text);
+INSERT INTO fp VALUES (1, NULL), (2, NULL);
+CREATE FOREIGN TABLE fc (a int, b int NOT NULL, y text) SERVER files
+	OPTIONS (program 'printf "1,,q\n2,5,q\n"', format 'csv');
+SELECT gaps.create_model('ft');
+SELECT gaps.declare_attribute('ft', 'fp', 'x', ARRAY['p', 'q']);
+SELECT gaps.declare_attribute('ft', 'fc', 'y', ARRAY['p', 'q'], ARRAY['a', 'b']::name[]);
+SELECT gaps.add_stripe('ft', 'x', 'fp', 'x');
+SELECT gaps.add_stripe('ft', 'y', 'fc', 'y');
+SELECT gaps.add_factor('ft', 'x', 'x', '{}', ARRAY[0.5, 0.5]);
+SELECT gaps.add_factor('ft', 'y', 'y', ARRAY['x'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT gaps.map_factor('ft', 'y', 1, 'a', 'id');
+SELECT * FROM same('ft', 'fp', '[{"id": 1}, {"id": 2}]');
+
 -- Key names in mixed case: matched whatever the database's collation.
 CREATE TABLE mc ("B" int, a int, y text, PRIMARY KEY ("B", a));
 INSERT INTO mc VALUES (1, 1, NULL), (1, 2, 'p');
