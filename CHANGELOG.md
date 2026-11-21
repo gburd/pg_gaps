@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+Dirichlet priors per CPT cell: `gaps.factor.prior` (NULL by default) and
+`gaps.set_prior(model, factor, prior)`.  `learn_cpts` sets each parent row
+to (count + prior) / (row total + sum(prior row)), so a Beta(8.70, 191.30)
+prior with 9 events in 200 gives 0.04425; a factor without a prior still
+uses `alpha` in every cell.  Priors are validated like CPTs and survive
+pg_dump and restore (`test/dump` compares them).  `gaps.cpt_rows(model,
+factor)` returns a factor's cells as rows with their parent values, child
+value, probability and prior, in array order.  DESIGN.md states that CPT
+entries follow `gaps.attribute.domain` in declaration order.
+
 Gibbs sampling for components too large for exact inference: set
 `gaps.samples` (default 0, never) and `gaps.seed`.  `marginals` and
 `impute` gain a `samples` column (NULL for exact) and report method
