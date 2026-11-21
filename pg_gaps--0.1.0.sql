@@ -1542,6 +1542,10 @@ BEGIN
 		END LOOP;
 	END LOOP;
 
+	-- The steps below and gaps.learn_cpts join pg_gaps_inst; without
+	-- statistics the planner can rescan it once per instance.
+	ANALYZE pg_gaps_inst;
+
 	-- Coverage: every RV is the child of exactly one factor.
 	SELECT r.v, r.attribute_id, at.relname, at.attname, count(DISTINCT i.factor_id) AS n
 	INTO bad
@@ -1735,22 +1739,75 @@ BEGIN
 		EXIT WHEN iterations = max_iterations;
 		prev := obj;
 
-		-- M-step: expected counts plus pseudocounts, normalized per row.  A
-		-- factor with no instances has no counts and keeps its prior's mean.
+		-- M-step: expected counts plus pseudocounts, normalized per row.
+		-- gaps._expected_counts gives every cell of every factor with
+		-- instances, so each factor's counts are one array in cell order; a
+		-- factor with no instances has none and keeps its prior's mean.
 		WITH o AS (
 			SELECT l.factor_id,
 				   1 + coalesce(sum(cardinality(l.cpt)) OVER (ORDER BY l.factor_id
 					   ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS off
-			FROM pg_gaps_learn l)
+			FROM pg_gaps_learn l),
+		e AS (
+			SELECT e.cpt_off, array_agg(e.n ORDER BY e.cell) AS n
+			FROM pg_gaps_ec e GROUP BY e.cpt_off),
+		x AS (
+			SELECT o.factor_id, e.n FROM o LEFT JOIN e ON e.cpt_off = o.off)
 		UPDATE pg_gaps_learn l
-		SET cpt = (SELECT gaps._normalize(array_agg(l.pseudo[c.i] + coalesce(e.n, 0)
-													ORDER BY c.i), l.k)
-				   FROM generate_subscripts(l.pseudo, 1) c(i)
-					   LEFT JOIN pg_gaps_ec e ON e.cpt_off = o.off AND e.cell = c.i)
-		FROM o WHERE o.factor_id = l.factor_id;
+		SET cpt = gaps._normalize((SELECT array_agg(u.a + coalesce(u.n, 0) ORDER BY u.i)
+								   FROM unnest(l.pseudo, x.n) WITH ORDINALITY u(a, n, i)),
+								  l.k)
+		FROM x WHERE x.factor_id = l.factor_id;
 		iterations := iterations + 1;
 	END LOOP;
 END
+$$;
+
+-- A step of gaps.learn_cpts: factor fid's complete-data estimate, from
+-- the grounding in pg_gaps_inst and the arrays card and evidence of
+-- gaps._ground.  prior is the factor's gaps.factor.prior (NULL: alpha in
+-- every cell), k the child's domain size and nrows the CPT's cells.
+-- Returns the pseudocount of every cell, the estimate (count +
+-- pseudocount, normalized per parent row), and used, the number of
+-- instances whose child and parents are all observed.
+--
+-- Every row of pg_gaps_inst for the factor belongs to the instance of its
+-- child variable v (ord 0 the child, ord 1.. its parents), so one GROUP BY
+-- v gathers each instance's parents.  A self-join on (factor_id, v) would
+-- do the same work, but the planner, without statistics on the join's
+-- selectivity, ran it as a nested loop that rescanned the table once per
+-- instance, which is quadratic (bench/RESULTS_LEARN_2026-11-21.md).
+CREATE FUNCTION gaps._count_cells(fid int, prior float8[], alpha float8, k int,
+	nrows bigint, card int[], evidence int[],
+	OUT pseudo float8[], OUT cpt float8[], OUT used bigint)
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+	-- Index of each complete instance's cell: parents then child, child
+	-- fastest, all values 1-based in evidence.
+	WITH inst AS (
+		SELECT i.v, array_agg(i.pv ORDER BY i.ord) FILTER (WHERE i.ord > 0) AS ps
+		FROM pg_gaps_inst i
+		WHERE i.factor_id = fid
+		GROUP BY i.v),
+	cells AS (
+		SELECT (SELECT coalesce(sum((evidence[p] - 1)
+					* coalesce((SELECT exp(sum(ln(card[q])))::bigint
+								FROM unnest(inst.ps[o + 1:]) q), 1)), 0)
+				FROM unnest(inst.ps) WITH ORDINALITY u(p, o)) * k
+			   + evidence[inst.v] - 1 AS cell
+		FROM inst
+		WHERE evidence[inst.v] > 0
+		  AND NOT EXISTS (SELECT 1 FROM unnest(inst.ps) p WHERE evidence[p] = 0)),
+	counts AS (
+		SELECT c AS cell, coalesce(pr.a, alpha) AS a, count(cells.cell) AS n
+		FROM generate_series(0, nrows - 1) c
+			LEFT JOIN unnest(prior) WITH ORDINALITY pr(a, i) ON pr.i = c + 1
+			LEFT JOIN cells ON cells.cell = c
+		GROUP BY c, pr.a)
+	SELECT array_agg(a ORDER BY cell), gaps._normalize(array_agg(a + n ORDER BY cell), k),
+		   (SELECT count(*) FROM cells)
+	FROM counts
 $$;
 
 -- Learn every factor's CPT from the data.
@@ -1802,9 +1859,7 @@ DECLARE
 	g record;
 	k int;
 	nrows bigint;
-	newcpt float8[];
-	used bigint;
-	pseudo float8[];
+	c record;
 	r record;
 BEGIN
 	IF alpha IS NULL OR alpha < 0 OR alpha = 'Infinity'::float8 OR alpha = 'NaN'::float8 THEN
@@ -1844,33 +1899,9 @@ BEGIN
 		SELECT k * coalesce(exp(sum(ln(gaps._card(fp.parent_stripe))))::bigint, 1) INTO nrows
 		FROM gaps.factor_parent fp WHERE fp.factor_id = f.factor_id;
 
-		-- Index of each complete instance's cell: parents then child, child
-		-- fastest, all values 1-based in g.evidence.
-		WITH inst AS (
-			SELECT i.v,
-				   array_agg(i2.pv ORDER BY i2.ord) FILTER (WHERE i2.ord > 0) AS ps
-			FROM pg_gaps_inst i
-				LEFT JOIN pg_gaps_inst i2 ON i2.factor_id = i.factor_id AND i2.v = i.v
-			WHERE i.factor_id = f.factor_id AND i.ord = 0
-			GROUP BY i.v),
-		cells AS (
-			SELECT (SELECT coalesce(sum((g.evidence[p] - 1)
-						* coalesce((SELECT exp(sum(ln(g.card[q])))::bigint
-									FROM unnest(inst.ps[o + 1:]) q), 1)), 0)
-					FROM unnest(inst.ps) WITH ORDINALITY u(p, o)) * k
-				   + g.evidence[inst.v] - 1 AS cell
-			FROM inst
-			WHERE g.evidence[inst.v] > 0
-			  AND NOT EXISTS (SELECT 1 FROM unnest(inst.ps) p WHERE g.evidence[p] = 0)),
-		counts AS (
-			SELECT c AS cell, coalesce(f.prior[c::int + 1], alpha) AS a,
-				   count(cells.cell) AS n
-			FROM generate_series(0, nrows - 1) c LEFT JOIN cells ON cells.cell = c
-			GROUP BY c)
-		SELECT gaps._normalize(array_agg(a + n ORDER BY cell), k),
-			   array_agg(a ORDER BY cell), (SELECT count(*) FROM cells)
-		INTO newcpt, pseudo, used FROM counts;
-		INSERT INTO pg_gaps_learn VALUES (f.factor_id, f.name, k, pseudo, used, newcpt);
+		SELECT * INTO c FROM gaps._count_cells(f.factor_id, f.prior, alpha, k, nrows,
+											  g.card, g.evidence);
+		INSERT INTO pg_gaps_learn VALUES (f.factor_id, f.name, k, c.pseudo, c.used, c.cpt);
 	END LOOP;
 
 	IF method = 'em' THEN
