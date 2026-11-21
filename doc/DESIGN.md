@@ -468,7 +468,7 @@ transactional, dumpable (each table and sequence is registered with
 ```
 gaps.model          (model_id, name, owner regrole)
 gaps.attribute      (attribute_id, model_id, rel regclass, relname, attname,
-                     typname, entity_keys name[], domain text[])
+                     typname, entity_keys name[], domain text[], edges float8[])
 gaps.stripe         (stripe_id, model_id, name, attribute_id)
 gaps.stripe_qual    (stripe_id, ord, attname, op, value)   -- ANDed, on Ad
 gaps.factor         (factor_id, model_id, name, child_stripe, cpt float8[])
@@ -484,6 +484,24 @@ the column's name and its type's name, and every use re-resolves them
 and fails, naming what changed, if the OID's current name differs, the
 column is gone, or its type changed.  Attribute numbers and type OIDs are
 not stored at all.
+
+**Relations.** An attribute may be declared over a table, a
+partitioned table, a materialized view, a view or a foreign table
+(relkinds r, p, m, v and f); `declare_attribute` refuses anything else,
+such as a sequence, an index or a composite type.  Grounding reads the
+relation with plain `SELECT`s and uses no system column, so a relation
+without `ctid` grounds like a table: where a `LEFT JOIN` must tell a
+parent row that was found from its NULLs, the parent side carries a
+marker column of its own (`true AS present`).  A view, a materialized
+view or a foreign table has no primary key, so its `entity_keys` must be
+given, and nothing checks that they are unique: rows with equal keys are
+one entity, and when they disagree on an observed value grounding fails
+saying the keys are not unique in the relation.  A view's columns carry
+no `NOT NULL`, so a restricted call treats its key columns as nullable
+(slower, never wrong), and it has no statistics, so the row estimate
+falls back to the declared `ROWS` and a restricted call never gives up
+its closure for the whole model.  A view is read afresh by every
+statement of a grounding; see "Snapshots".
 
 **Entities.** A probabilistic attribute's random variables are its
 entities: the distinct values of its `entity_keys` (by default the
@@ -616,6 +634,44 @@ rows.  The output says `method` 'em', `iterations` (M-steps, 0 for
 `converged` (false when `max_iterations` stopped it).  A component too
 large for exact inference is an `ERROR`; there is no sampled E-step.
 
+**Binned attributes.**  `declare_attribute(..., edges => ARRAY[e1, ...,
+en])` declares a numeric column whose values pg_gaps discretises on
+read, so the bin edges live in the model and no scorer bins by hand
+(pg.ddx.io Gap 6).  `gaps.attribute.edges` is NULL for a categorical
+attribute.  The n edges must be finite and strictly increasing, and make
+n + 1 bins: (-inf, e1), [e1, e2), ..., [en, inf), which is
+`width_bucket(x, edges) + 1`, so a value equal to an edge goes to the bin
+above it, and -Infinity and Infinity go to the outer bins.  The column
+must be smallint, integer, bigint, numeric, real or double precision;
+the trigger checks it when the attribute is written, and a later type
+change fails grounding like any other ("Identity of user objects").
+
+The caller labels the bins: `domain` must have exactly n + 1 entries, the
+first for values below e1, and the labels are what `marginals`, `impute`
+and `cpt_rows` return and what CPTs index, like any domain.  Generated
+labels such as '[1,2.5)' would have to print float8 edges, which reads
+badly for edges like 0.1, and a caller who already names the bins ('low',
+'high') would have to translate them back; letting the caller name them
+keeps `domain` meaning what it means for every attribute, the list of
+values.
+
+Grounding computes the label in its evidence step (`gaps._value_sql`, used
+by `gaps._entities_sql`), so learning, EM, restricted calls and the
+evidence-consistency check see bins and need nothing of their own.  NaN
+is in no bin, and `width_bucket` would put it in the last, so a NaN is
+treated as missing, like NULL.  The column is compared with the edges in
+real for a real column and double precision for a double precision one,
+so a value stored equal to an edge is on it (a real 0.7 cast to float8 is
+0.699999988, below a float8 edge 0.7), and in numeric for the integer
+types and numeric, which holds their values exactly: a bigint beyond 2^53
+or a numeric with more digits than float8 keeps its exact position
+against an edge.  The edges themselves are float8, read as their
+shortest decimal form, so an edge cannot be finer than float8; for a real
+column the trigger also requires them to stay strictly increasing once
+cast to real, since two edges that differ only past real's precision
+would make an empty bin.  The row estimate (`SupportRequestRows`) counts
+NULLs only, so it does not count NaNs as missing.
+
 **Entity-set predicates** are a conjunction of `column op constant` terms
 stored as rows, with `op` one of `=`, `<>`, `<`, `<=`, `>`, `>=`.  Each use
 builds the query from catalog-resolved, quoted identifiers and passes the
@@ -653,6 +709,16 @@ in ways that leave every row an entity.  For one consistent view, run the
 call in a REPEATABLE READ (or SERIALIZABLE) transaction, where every
 statement shares the transaction's snapshot.  Grounding under one snapshot
 whatever the isolation level needs C (Phase 6).
+
+A view must return the same rows to every statement of one grounding.
+A snapshot makes a view over tables do so, but not a view over volatile
+functions (pg.ddx.io's view over `mentat.q`, a Datalog query), which may
+answer each statement differently even in one transaction.  The check
+above then fires when a mapped parent row has no entity; other
+differences go unseen, as with concurrent changes.  For such a view, run
+the call in a REPEATABLE READ transaction if the function reads only
+through the transaction's snapshot, and otherwise declare the model over
+a materialized view of it.
 
 A missing value is SQL `NULL` in a declared probabilistic column.  `NULL`
 in a deterministic column is ordinary SQL `NULL`, as in [W11 3.2].
