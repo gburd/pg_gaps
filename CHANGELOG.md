@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+Binned attributes: `gaps.declare_attribute(..., edges => float8[])`
+declares a numeric column (smallint, integer, bigint, numeric, real or
+double precision) that pg_gaps discretises on read.  n strictly
+increasing finite edges make n + 1 bins, (-inf, e1), [e1, e2), ...,
+[en, inf), labelled in order by the `domain`, which must have n + 1
+entries; a value on an edge goes to the bin above, and NaN counts as
+missing.  Learning, EM, restricted calls, `cpt_rows` and the results all
+use the labels.  `gaps.attribute.edges` holds the edges and survives
+pg_dump and restore.
+
 A model may be declared over a view or a foreign table, not only a table
 or a materialized view: grounding no longer reads `ctid`, which failed
 on the first `marginals` call over a view.  `declare_attribute` refuses

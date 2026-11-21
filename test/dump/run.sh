@@ -12,7 +12,7 @@
 # rows with the same probabilities in both.  Then checks that renaming
 # and dropping a column the model uses, and dropping its table, make
 # inference fail with an error naming what changed.  The factors' CPTs and
-# priors must also come back unchanged.
+# priors, and the attributes' bin edges, must also come back unchanged.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,13 +32,16 @@ psql_q -d "$src_db" -f "$here/model.sql"
 psql_q -d "$src_db" -At -c "SELECT entity::text, attname, value, probability
 	FROM gaps.marginals('dump') ORDER BY 1, 2, 3" >"$work/before"
 factors_q="SELECT name, cpt, prior FROM gaps.factor ORDER BY name"
+edges_q="SELECT relname, attname, domain, edges FROM gaps.attribute ORDER BY 1, 2"
 psql_q -d "$src_db" -At -c "$factors_q" >"$work/factors_before"
+psql_q -d "$src_db" -At -c "$edges_q" >"$work/edges_before"
 
 pg_dump -d "$src_db" -Fc -f "$work/dump"
 pg_restore -d "$dst_db" "$work/dump"
 psql_q -d "$dst_db" -At -c "SELECT entity::text, attname, value, probability
 	FROM gaps.marginals('dump') ORDER BY 1, 2, 3" >"$work/after"
 psql_q -d "$dst_db" -At -c "$factors_q" >"$work/factors_after"
+psql_q -d "$dst_db" -At -c "$edges_q" >"$work/edges_after"
 
 if [ ! -s "$work/before" ]; then
 	echo "FAIL: the model returned no marginals before the dump" >&2
@@ -60,6 +63,21 @@ if ! cmp -s "$work/factors_before" "$work/factors_after"; then
 	exit 1
 fi
 echo "dump: $(wc -l <"$work/factors_before") factors' CPTs and priors identical after restore"
+if ! grep -q '^public.reading|lux|{dim,lit,bright}|{10,100}$' "$work/edges_before"; then
+	echo "FAIL: attribute lux has no bin edges before the dump" >&2
+	exit 1
+fi
+if ! grep -q '^lux|{0.3333333333333333,0.3333333333333333,0.3333333333333333}|$' \
+	"$work/factors_before"; then
+	echo "FAIL: factor lux did not learn one entity per bin" >&2
+	exit 1
+fi
+if ! cmp -s "$work/edges_before" "$work/edges_after"; then
+	echo "FAIL: attributes' domains or bin edges differ after pg_dump and restore" >&2
+	diff "$work/edges_before" "$work/edges_after" >&2
+	exit 1
+fi
+echo "dump: $(wc -l <"$work/edges_before") attributes' domains and bin edges identical after restore"
 
 # The restored model must still find its table by name, and refuse when the
 # table it was declared over has changed.

@@ -468,7 +468,7 @@ transactional, dumpable (each table and sequence is registered with
 ```
 gaps.model          (model_id, name, owner regrole)
 gaps.attribute      (attribute_id, model_id, rel regclass, relname, attname,
-                     typname, entity_keys name[], domain text[])
+                     typname, entity_keys name[], domain text[], edges float8[])
 gaps.stripe         (stripe_id, model_id, name, attribute_id)
 gaps.stripe_qual    (stripe_id, ord, attname, op, value)   -- ANDed, on Ad
 gaps.factor         (factor_id, model_id, name, child_stripe, cpt float8[])
@@ -633,6 +633,44 @@ rows.  The output says `method` 'em', `iterations` (M-steps, 0 for
 'counts'), `loglik` (log P(evidence) under the returned CPTs) and
 `converged` (false when `max_iterations` stopped it).  A component too
 large for exact inference is an `ERROR`; there is no sampled E-step.
+
+**Binned attributes.**  `declare_attribute(..., edges => ARRAY[e1, ...,
+en])` declares a numeric column whose values pg_gaps discretises on
+read, so the bin edges live in the model and no scorer bins by hand
+(pg.ddx.io Gap 6).  `gaps.attribute.edges` is NULL for a categorical
+attribute.  The n edges must be finite and strictly increasing, and make
+n + 1 bins: (-inf, e1), [e1, e2), ..., [en, inf), which is
+`width_bucket(x, edges) + 1`, so a value equal to an edge goes to the bin
+above it, and -Infinity and Infinity go to the outer bins.  The column
+must be smallint, integer, bigint, numeric, real or double precision;
+the trigger checks it when the attribute is written, and a later type
+change fails grounding like any other ("Identity of user objects").
+
+The caller labels the bins: `domain` must have exactly n + 1 entries, the
+first for values below e1, and the labels are what `marginals`, `impute`
+and `cpt_rows` return and what CPTs index, like any domain.  Generated
+labels such as '[1,2.5)' would have to print float8 edges, which reads
+badly for edges like 0.1, and a caller who already names the bins ('low',
+'high') would have to translate them back; letting the caller name them
+keeps `domain` meaning what it means for every attribute, the list of
+values.
+
+Grounding computes the label in its evidence step (`gaps._value_sql`, used
+by `gaps._entities_sql`), so learning, EM, restricted calls and the
+evidence-consistency check see bins and need nothing of their own.  NaN
+is in no bin, and `width_bucket` would put it in the last, so a NaN is
+treated as missing, like NULL.  The column is compared with the edges in
+real for a real column and double precision for a double precision one,
+so a value stored equal to an edge is on it (a real 0.7 cast to float8 is
+0.699999988, below a float8 edge 0.7), and in numeric for the integer
+types and numeric, which holds their values exactly: a bigint beyond 2^53
+or a numeric with more digits than float8 keeps its exact position
+against an edge.  The edges themselves are float8, read as their
+shortest decimal form, so an edge cannot be finer than float8; for a real
+column the trigger also requires them to stay strictly increasing once
+cast to real, since two edges that differ only past real's precision
+would make an empty bin.  The row estimate (`SupportRequestRows`) counts
+NULLs only, so it does not count NaNs as missing.
 
 **Entity-set predicates** are a conjunction of `column op constant` terms
 stored as rows, with `op` one of `=`, `<>`, `<`, `<=`, `>`, `>=`.  Each use

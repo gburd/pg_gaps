@@ -25,6 +25,7 @@ CREATE TABLE gaps.attribute (
 	typname		text NOT NULL,		-- format_type() when declared
 	entity_keys name[] NOT NULL,
 	domain		text[] NOT NULL,
+	edges		float8[],			-- bin edges of a numeric column; NULL: categorical
 	UNIQUE (model_id, rel, attname)
 );
 
@@ -185,6 +186,71 @@ BEGIN
 END
 $$;
 
+-- The type in which a binned column of type typname (format_type) is
+-- compared with its edges: its own for real and double precision, so a
+-- value equal to an edge as stored is on the edge, and numeric for the
+-- integer types and numeric, which holds them exactly.
+CREATE FUNCTION gaps._bin_type(typname text) RETURNS text
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+	SELECT CASE typname WHEN 'real' THEN 'float4' WHEN 'double precision' THEN 'float8'
+		   ELSE 'numeric' END
+$$;
+
+-- Check the bin edges of attribute a, whose column has type typ: the
+-- column is an integer, numeric or floating-point type, and the edges are
+-- a one-dimensional array of n >= 1 finite values in strictly increasing
+-- order, also once cast to gaps._bin_type (two edges that differ only
+-- past real's precision would make an empty bin), with the domain giving
+-- one label to each of the n + 1 bins
+-- (doc/DESIGN.md, "Binned attributes").  A width_bucket over edges that
+-- break these would put values in the wrong bin or fail at grounding.
+CREATE FUNCTION gaps._edges_check(a gaps.attribute, typ oid) RETURNS void
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+SET extra_float_digits = 1
+AS $$
+DECLARE
+	n int := coalesce(array_length(a.edges, 1), 0);
+	increasing boolean;
+BEGIN
+	IF typ NOT IN ('int2'::regtype, 'int4'::regtype, 'int8'::regtype, 'numeric'::regtype,
+				   'float4'::regtype, 'float8'::regtype) THEN
+		RAISE EXCEPTION 'column %.% has type %, and only a numeric column can have bin edges',
+			a.relname, a.attname, format_type(typ, NULL)
+			USING HINT = 'Bin edges need smallint, integer, bigint, numeric, real or '
+				'double precision.';
+	END IF;
+	IF array_ndims(a.edges) IS DISTINCT FROM 1 THEN
+		RAISE EXCEPTION 'the bin edges of %.% must be a one-dimensional array with at least '
+			'one edge, not %', a.relname, a.attname, a.edges;
+	END IF;
+	IF EXISTS (SELECT 1 FROM unnest(a.edges) e
+			   WHERE e IS NULL OR e IN ('Infinity', '-Infinity', 'NaN')) THEN
+		RAISE EXCEPTION 'the bin edges of %.% must be finite numbers, not %',
+			a.relname, a.attname, a.edges;
+	END IF;
+	-- Compared as gaps._value_sql writes them, in the column's bin type.
+	EXECUTE format('SELECT bool_and(p IS NULL OR e > p) '
+				   'FROM (SELECT e, lag(e) OVER (ORDER BY i) AS p '
+				   'FROM unnest(%L::%s[]) WITH ORDINALITY u(e, i)) x',
+				   a.edges, gaps._bin_type(format_type(typ, NULL)))
+		INTO increasing;
+	IF NOT increasing THEN
+		RAISE EXCEPTION 'the bin edges of %.% must be strictly increasing as %, not %',
+			a.relname, a.attname,
+			format_type(gaps._bin_type(format_type(typ, NULL))::regtype, NULL), a.edges;
+	END IF;
+	IF array_length(a.domain, 1) <> n + 1 THEN
+		RAISE EXCEPTION 'the domain of %.% has % values, but % bin edges make % bins',
+			a.relname, a.attname, array_length(a.domain, 1), n, n + 1
+			USING HINT = 'Give one label per bin, in order, the first for values below '
+				'the first edge.';
+	END IF;
+END
+$$;
+
 CREATE FUNCTION gaps._attribute_check() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -221,6 +287,9 @@ BEGIN
 	END IF;
 	IF (SELECT count(DISTINCT v) FROM unnest(NEW.domain) v) <> array_length(NEW.domain, 1) THEN
 		RAISE EXCEPTION 'the domain of %.% has duplicate values', NEW.relname, NEW.attname;
+	END IF;
+	IF NEW.edges IS NOT NULL THEN
+		PERFORM gaps._edges_check(NEW, t.atttypid);
 	END IF;
 
 	IF coalesce(array_length(NEW.entity_keys, 1), 0) = 0 THEN
@@ -467,9 +536,11 @@ AS $$
 $$;
 
 -- Declare rel.att probabilistic with the given domain.  entity_keys
--- defaults to rel's primary key.
+-- defaults to rel's primary key.  With edges, a numeric column is binned:
+-- domain labels the bins in order (doc/DESIGN.md, "Binned attributes").
 CREATE FUNCTION gaps.declare_attribute(model text, rel regclass, att name,
-									   domain text[], entity_keys name[] DEFAULT NULL)
+									   domain text[], entity_keys name[] DEFAULT NULL,
+									   edges float8[] DEFAULT NULL)
 RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -484,8 +555,9 @@ BEGIN
 			JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
 		WHERE i.indrelid = rel AND i.indisprimary;
 	END IF;
-	INSERT INTO gaps.attribute (model_id, rel, relname, attname, typname, entity_keys, domain)
-	VALUES (gaps._model_id(model), rel, '', att, '', keys, domain);
+	INSERT INTO gaps.attribute (model_id, rel, relname, attname, typname, entity_keys, domain,
+								edges)
+	VALUES (gaps._model_id(model), rel, '', att, '', keys, domain, edges);
 END
 $$;
 
@@ -1326,28 +1398,53 @@ $$;
 -- The SQL to select one attribute's entities and their evidence:
 -- SELECT n (1, 2, ... in key order), k (the key, gaps._key_row), ev text[]
 -- (the distinct non-NULL values of the attribute among the entity's rows)
--- FROM rel GROUP BY the entity keys.  With closure, the name of the
+-- FROM rel GROUP BY the entity keys.  A binned attribute's values are its
+-- bins' labels (gaps._value_sql).  With closure, the name of the
 -- attribute's closure table (gaps._ground_closure), only the entities
 -- whose keys are there are read, through gaps._key_match so that an index
 -- on the key columns answers; the query then takes the attribute's id as
 -- $1.  Identifiers come from the catalog
 -- and are quoted; nothing from callers is interpolated.
+-- The SQL expression for attribute a's value as text, over the rows of
+-- table alias c: NULL where the value is missing.  A categorical
+-- attribute's value is the column's text form.  A binned attribute's
+-- (gaps._edges_check) is the label of its bin, width_bucket over the edges
+-- plus one: bin 1 below the first edge, and a value equal to an edge in
+-- the bin above it.  Column and edges compare in gaps._bin_type, and NaN
+-- is in no bin, so it is missing (doc/DESIGN.md, "Binned attributes").
+-- The edges and labels come from the catalog and are quoted as literals,
+-- the edges in float8's shortest exact form (extra_float_digits 1), which
+-- numeric reads as that decimal; the labels are renumbered from 1
+-- whatever the domain's lower bound.
+CREATE FUNCTION gaps._value_sql(a gaps.attribute) RETURNS text
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+SET extra_float_digits = 1
+AS $$
+	SELECT CASE WHEN a.edges IS NULL THEN format('c.%I::text', a.attname)
+		   ELSE format('CASE WHEN c.%1$I::%4$s <> ''NaN'' THEN (%2$L::text[])'
+					   '[width_bucket(c.%1$I::%4$s, %3$L::%4$s[]) + 1] END',
+					   a.attname, ARRAY(SELECT unnest(a.domain)), a.edges,
+					   gaps._bin_type(a.typname)) END
+$$;
+
 CREATE FUNCTION gaps._entities_sql(a gaps.attribute, ktab text, closure text DEFAULT NULL)
 RETURNS text
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
 	SELECT format('SELECT row_number() OVER (ORDER BY %s) AS n, %s AS k, '
-				  'array_agg(DISTINCT c.%I::text) FILTER (WHERE c.%I IS NOT NULL) AS ev '
+				  'array_agg(DISTINCT %s) FILTER (WHERE %s IS NOT NULL) AS ev '
 				  'FROM %s GROUP BY %s',
-				  keylist, gaps._key_row(a, 'c', ktab), a.attname, a.attname,
+				  keylist, gaps._key_row(a, 'c', ktab), v.expr, v.expr,
 				  CASE WHEN closure IS NULL THEN format('%s c', a.rel)
 				  ELSE format('pg_temp.%I x JOIN %s c ON %s WHERE x.attribute_id = $1',
 							  closure, a.rel,
 							  gaps._key_match(a, 'c', '(x.k).k%1$s')) END,
 				  keylist)
 	FROM (SELECT string_agg(format('c.%I', k), ', ' ORDER BY o) AS keylist
-		  FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o)) x
+		  FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o)) x,
+		(SELECT gaps._value_sql(a) AS expr) v
 $$;
 
 -- The WHERE clause of a stripe's entity set.  Its constants are elements
