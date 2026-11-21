@@ -16,6 +16,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_type.h"
 #include "engine/gx_param.h"
 #include "fmgr.h"
@@ -113,6 +114,7 @@ get_bools(FunctionCallInfo fcinfo, int arg, const char *what, unsigned char **ou
 		ereport(ERROR,
 				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 				 errmsg("%s must be a one-dimensional array", what)));
+	/* deconstruct_array_builtin does not know BOOLOID. */
 	deconstruct_array(a, BOOLOID, 1, true, TYPALIGN_CHAR, &d, &nulls, &n);
 	*out = palloc(n ? n : 1);
 	for (int i = 0; i < n; i++)
@@ -179,7 +181,16 @@ obuf_array(obuf *b, Oid type)
 	for (size_t i = 0; i < b->n; i++)
 		d[i] = type == INT4OID ? Int32GetDatum(((int *) b->data)[i])
 			: Float8GetDatum(((double *) b->data)[i]);
-	return PointerGetDatum(construct_array_builtin(d, (int) b->n, type));
+
+	/*
+	 * construct_array, not construct_array_builtin, which in PostgreSQL 17
+	 * does not know FLOAT8OID.
+	 */
+	return PointerGetDatum(type == INT4OID
+						   ? construct_array(d, (int) b->n, INT4OID, sizeof(int32), true,
+											 TYPALIGN_INT)
+						   : construct_array(d, (int) b->n, FLOAT8OID, sizeof(float8),
+											 FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
 }
 
 /* The output: gaps._infer's arrays for the instances' CPTs. */

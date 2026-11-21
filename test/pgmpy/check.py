@@ -51,9 +51,10 @@ def random_cpt(rng, nrows, k, zero_frac):
     return out
 
 
-def build_model(cur, rng, name):
+def build_model(cur, rng, name, parameterised=True):
     """Create a table and a random model over it.  Returns nothing; the
-    model is read back through gaps._ground."""
+    model is read back through gaps._ground.  With parameterised, some
+    factors with parents are logistic or noisy-OR instead of CPTs."""
     natt = rng.randint(1, 4)
     nrows = rng.randint(1, 6)
     cards = [rng.randint(2, 3) for _ in range(natt)]
@@ -116,7 +117,9 @@ def build_model(cur, rng, name):
         prows = 1
         for p in parents:
             prows *= cards[p]
-        kind = rng.choice(["cpt", "cpt", "logistic", "noisy_or"]) if parents else "cpt"
+        kind = "cpt"
+        if parents and parameterised:
+            kind = rng.choice(["cpt", "cpt", "logistic", "noisy_or"])
         if kind == "noisy_or" and cards[i] != 2:
             kind = "logistic"
         if kind == "cpt":

@@ -344,8 +344,19 @@ SELECT gaps.set_cpt('email_net', 'pa', ARRAY[0.7, 0.3]);
 (1 row)
 
 -- Rejections.
-SELECT gaps.drop_model('email_net');                                -- fail: in use
-ERROR:  update or delete on table "model" violates RESTRICT setting of foreign key constraint "model_member_member_id_fkey" on table "model_member"
+-- A member in use cannot be dropped.  (The message's wording differs
+-- across major versions, so the test prints the constraint.)
+DO $$
+DECLARE
+	c text;
+BEGIN
+	PERFORM gaps.drop_model('email_net');
+EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN
+	GET STACKED DIAGNOSTICS c = CONSTRAINT_NAME;
+	RAISE WARNING 'fails: foreign key %', c;
+END
+$$;
+WARNING:  fails: foreign key model_member_member_id_fkey
 SELECT gaps.add_member('email_net', 'author');                      -- fail: cycle
 ERROR:  model "author" cannot be a member of "email_net": it holds "email_net" already
 SELECT gaps.add_member('author', 'author');                         -- fail: itself

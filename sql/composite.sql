@@ -202,7 +202,18 @@ WHERE attname = 'state' AND entity = '{"pid": 1}' AND value = 'llm';
 SELECT gaps.set_cpt('email_net', 'pa', ARRAY[0.7, 0.3]);
 
 -- Rejections.
-SELECT gaps.drop_model('email_net');                                -- fail: in use
+-- A member in use cannot be dropped.  (The message's wording differs
+-- across major versions, so the test prints the constraint.)
+DO $$
+DECLARE
+	c text;
+BEGIN
+	PERFORM gaps.drop_model('email_net');
+EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN
+	GET STACKED DIAGNOSTICS c = CONSTRAINT_NAME;
+	RAISE WARNING 'fails: foreign key %', c;
+END
+$$;
 SELECT gaps.add_member('email_net', 'author');                      -- fail: cycle
 SELECT gaps.add_member('author', 'author');                         -- fail: itself
 SELECT gaps.add_member('author', 'email_net');                      -- fail: already

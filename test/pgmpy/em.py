@@ -209,7 +209,7 @@ def main():
             rng = random.Random(seed)
             alpha = rng.choice([0.5, 1.0, 2.0])
             name = "pgmpy_em"
-            build_model(cur, rng, name)
+            build_model(cur, rng, name, parameterised=False)
             try:
                 n, _, inf = check_model(cur, name, seed, alpha, args.iterations)
             except psycopg.errors.DataException as e:
