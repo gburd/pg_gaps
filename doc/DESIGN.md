@@ -485,6 +485,24 @@ and fails, naming what changed, if the OID's current name differs, the
 column is gone, or its type changed.  Attribute numbers and type OIDs are
 not stored at all.
 
+**Relations.** An attribute may be declared over a table, a
+partitioned table, a materialized view, a view or a foreign table
+(relkinds r, p, m, v and f); `declare_attribute` refuses anything else,
+such as a sequence, an index or a composite type.  Grounding reads the
+relation with plain `SELECT`s and uses no system column, so a relation
+without `ctid` grounds like a table: where a `LEFT JOIN` must tell a
+parent row that was found from its NULLs, the parent side carries a
+marker column of its own (`true AS present`).  A view, a materialized
+view or a foreign table has no primary key, so its `entity_keys` must be
+given, and nothing checks that they are unique: rows with equal keys are
+one entity, and when they disagree on an observed value grounding fails
+saying the keys are not unique in the relation.  A view's columns carry
+no `NOT NULL`, so a restricted call treats its key columns as nullable
+(slower, never wrong), and it has no statistics, so the row estimate
+falls back to the declared `ROWS` and a restricted call never gives up
+its closure for the whole model.  A view is read afresh by every
+statement of a grounding; see "Snapshots".
+
 **Entities.** A probabilistic attribute's random variables are its
 entities: the distinct values of its `entity_keys` (by default the
 table's primary key, giving one RV per row; a subset of it gives a
@@ -653,6 +671,16 @@ in ways that leave every row an entity.  For one consistent view, run the
 call in a REPEATABLE READ (or SERIALIZABLE) transaction, where every
 statement shares the transaction's snapshot.  Grounding under one snapshot
 whatever the isolation level needs C (Phase 6).
+
+A view must return the same rows to every statement of one grounding.
+A snapshot makes a view over tables do so, but not a view over volatile
+functions (pg.ddx.io's view over `mentat.q`, a Datalog query), which may
+answer each statement differently even in one transaction.  The check
+above then fires when a mapped parent row has no entity; other
+differences go unseen, as with concurrent changes.  For such a view, run
+the call in a REPEATABLE READ transaction if the function reads only
+through the transaction's snapshot, and otherwise declare the model over
+a materialized view of it.
 
 A missing value is SQL `NULL` in a declared probabilistic column.  `NULL`
 in a deterministic column is ordinary SQL `NULL`, as in [W11 3.2].

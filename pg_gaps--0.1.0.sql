@@ -191,7 +191,17 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
 	t record;
+	kind "char";
 BEGIN
+	-- Grounding reads the relation with plain SELECTs, so anything a
+	-- SELECT can read row by row will do; a sequence, an index or a
+	-- composite type has columns in pg_attribute but is not that.
+	SELECT c.relkind INTO kind FROM pg_class c WHERE c.oid = NEW.rel;
+	IF kind NOT IN ('r', 'p', 'm', 'v', 'f') THEN
+		RAISE EXCEPTION '% is not a table, view, materialized view or foreign table',
+			NEW.rel::regclass
+			USING DETAIL = format('Its relkind is "%s".', kind);
+	END IF;
 	SELECT a.atttypid, a.atttypmod INTO t
 	FROM pg_attribute a
 	WHERE a.attrelid = NEW.rel AND a.attname = NEW.attname AND a.attnum > 0
@@ -215,7 +225,10 @@ BEGIN
 
 	IF coalesce(array_length(NEW.entity_keys, 1), 0) = 0 THEN
 		RAISE EXCEPTION 'attribute %.% has no entity keys', NEW.relname, NEW.attname
-			USING HINT = 'Give the table a primary key or pass entity_keys.';
+			USING HINT = CASE WHEN kind IN ('v', 'm', 'f')
+				THEN 'A view, materialized view or foreign table has no primary key; '
+					'pass entity_keys.'
+				ELSE 'Give the table a primary key or pass entity_keys.' END;
 	END IF;
 	IF NEW.attname = ANY (NEW.entity_keys) THEN
 		RAISE EXCEPTION 'probabilistic attribute %.% cannot be its own entity key',
@@ -1465,7 +1478,12 @@ BEGIN
 			INTO sql USING a.attribute_id, bad.v;
 		IF bad.ev = -1 THEN
 			RAISE EXCEPTION 'rows of entity % of %.% disagree: %',
-				gaps._entity_name(a.attribute_id, bad.v), a.relname, a.attname, sql;
+				gaps._entity_name(a.attribute_id, bad.v), a.relname, a.attname, sql
+				USING DETAIL = format('The entity keys (%s) are not unique in %s, and rows '
+					'with equal keys are one entity, so they must agree on its value.',
+					array_to_string(a.entity_keys, ', '), a.relname),
+					HINT = 'If each row is its own entity, the entity keys must be unique '
+						'in the relation.';
 		END IF;
 		RAISE EXCEPTION 'value "%" of %.% for entity % is not in its domain %',
 			trim(both '{}' from sql), a.relname, a.attname,
@@ -1795,9 +1813,12 @@ $$;
 -- one factor parent for child attribute a and parent attribute pa, from
 -- the child entities grounded.  It joins the same rows as the
 -- unrestricted form in the other order, flat, so that each join can be an
--- index probe; the p.ctid test keeps a missing parent row from matching a
--- NULL key.  pjoin is the join condition of the parent rows p to the
--- child rows c, and wclause the child stripe's predicate over c.  (PL/pgSQL
+-- index probe.  A parent row that was found is told from the LEFT JOIN's
+-- NULLs by a marker the parent side always produces, pm.present, which
+-- keeps a missing parent row from matching a NULL key, and which any
+-- relation has (a view or a foreign table has no ctid).  pjoin is the join
+-- condition of the parent rows p to the child rows c, and wclause the
+-- child stripe's predicate over c.  (PL/pgSQL
 -- because pg_gaps_keys, a temp table, does not exist when this is made.)
 CREATE FUNCTION gaps._parent_by_key_sql(a gaps.attribute, pa gaps.attribute, pjoin text,
 										wclause text)
@@ -1809,11 +1830,11 @@ BEGIN
 	RETURN (SELECT format(
 		'INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
 		'SELECT $2, rc.v, $3, CASE '
-		'WHEN count(*) FILTER (WHERE p.ctid IS NOT NULL AND rp.v IS NULL) > 0 THEN NULL '
+		'WHEN count(*) FILTER (WHERE pm.present AND rp.v IS NULL) > 0 THEN NULL '
 		'WHEN count(DISTINCT rp.v) = 1 THEN min(rp.v) ELSE -count(DISTINCT rp.v) END '
 		'FROM pg_temp.%I rc JOIN %s c ON rc.attribute_id = $4 AND %s '
-		'LEFT JOIN %s p ON TRUE%s '
-		'LEFT JOIN pg_temp.%I rp ON p.ctid IS NOT NULL AND rp.attribute_id = $5 '
+		'LEFT JOIN (%s p CROSS JOIN (SELECT true AS present) pm) ON TRUE%s '
+		'LEFT JOIN pg_temp.%I rp ON pm.present AND rp.attribute_id = $5 '
 		'AND rp.k = %s WHERE TRUE%s GROUP BY rc.v',
 		ct.etab, a.rel, gaps._key_match(a, 'c', '(rc.k).k%1$s'),
 		pa.rel, pjoin,
@@ -1908,10 +1929,11 @@ BEGIN
 		EXECUTE format(
 			'INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
 			'SELECT $2, rc.v, $3, CASE '
-			'WHEN count(*) FILTER (WHERE p.ctid IS NOT NULL AND rp.v IS NULL) > 0 THEN NULL '
+			'WHEN count(*) FILTER (WHERE pm.present AND rp.v IS NULL) > 0 THEN NULL '
 			'WHEN count(DISTINCT rp.v) = 1 THEN min(rp.v) ELSE -count(DISTINCT rp.v) END '
 			'FROM %s c JOIN pg_temp.%I rc ON rc.attribute_id = $4 AND rc.k = %s '
-			'LEFT JOIN (%s p LEFT JOIN pg_temp.%I rp ON rp.attribute_id = $5 AND rp.k = %s) '
+			'LEFT JOIN (%s p CROSS JOIN (SELECT true AS present) pm '
+			'LEFT JOIN pg_temp.%I rp ON rp.attribute_id = $5 AND rp.k = %s) '
 			'ON TRUE%s%s WHERE TRUE%s GROUP BY rc.v',
 			a.rel, ct.etab, gaps._key_row(a, 'c', ct.ktab),
 			pa.rel, pt.etab, gaps._key_row(pa, 'p', pt.ktab),

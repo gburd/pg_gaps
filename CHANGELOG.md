@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+A model may be declared over a view or a foreign table, not only a table
+or a materialized view: grounding no longer reads `ctid`, which failed
+on the first `marginals` call over a view.  `declare_attribute` refuses
+a relation that is none of these (a sequence, an index, a composite
+type), and a view needs its `entity_keys` given.  Rows of a view whose
+key is not unique are one entity, and when they disagree the error says
+the key is not unique.  A view over volatile functions must return the
+same rows to every statement of a grounding; DESIGN.md "Snapshots" says
+when to use REPEATABLE READ or a materialized view instead.
+
 `gaps.marginals` and `gaps.impute` take optional `rel` and `entities`
 arguments: given a jsonb array of entity keys of `rel` (the form the
 `entity` column returns), they ground only the components holding those

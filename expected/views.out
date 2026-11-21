@@ -1,0 +1,150 @@
+-- Models over relations without ctid: a plain view, beside a table, a
+-- partitioned table and a materialized view with the same rows, and the
+-- relations declare_attribute refuses.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_gaps;
+\set VERBOSITY terse
+\set SHOW_CONTEXT never
+-- pg.ddx.io's m1 shape: a latent author a per email, a markdown flag md
+-- observed.  Hand posterior P(a = llm | md): no .04/.895 = .044693, yes
+-- .06/.105 = .571429.
+CREATE TABLE em_t (num bigint, md boolean);
+INSERT INTO em_t VALUES (1, false), (2, true), (3, false);
+CREATE VIEW em_v AS
+	SELECT num, NULL::text AS a, CASE WHEN md THEN 'yes' ELSE 'no' END AS md FROM em_t;
+CREATE TABLE em_r AS SELECT * FROM em_v;
+CREATE TABLE em_p (num bigint, a text, md text) PARTITION BY RANGE (num);
+CREATE TABLE em_p1 PARTITION OF em_p FOR VALUES FROM (1) TO (3);
+CREATE TABLE em_p2 PARTITION OF em_p FOR VALUES FROM (3) TO (10);
+INSERT INTO em_p SELECT * FROM em_v;
+CREATE MATERIALIZED VIEW em_mv AS SELECT * FROM em_v;
+-- The same model over each relation; mapped by map_factor as pg.ddx.io's
+-- was, or by the default mapping (same relation and keys).
+CREATE FUNCTION pg_temp.m1(name text, rel regclass, mapped boolean DEFAULT true) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM gaps.create_model(name);
+	PERFORM gaps.declare_attribute(name, rel, 'a', ARRAY['human', 'llm'], ARRAY['num']::name[]);
+	PERFORM gaps.declare_attribute(name, rel, 'md', ARRAY['no', 'yes'], ARRAY['num']::name[]);
+	PERFORM gaps.add_stripe(name, 'a', rel, 'a');
+	PERFORM gaps.add_stripe(name, 'm', rel, 'md');
+	PERFORM gaps.add_factor(name, 'pa', 'a', '{}', ARRAY[0.9, 0.1]);
+	PERFORM gaps.add_factor(name, 'pm', 'm', ARRAY['a'], ARRAY[0.95, 0.05, 0.4, 0.6]);
+	IF mapped THEN
+		PERFORM gaps.map_factor(name, 'pm', 1, 'num', 'num');
+	END IF;
+END
+$$;
+SELECT pg_temp.m1('r', 'em_r'), pg_temp.m1('p', 'em_p'), pg_temp.m1('m', 'em_mv'),
+	   pg_temp.m1('v', 'em_v'), pg_temp.m1('vd', 'em_v', false);
+ m1 | m1 | m1 | m1 | m1 
+----+----+----+----+----
+    |    |    |    | 
+(1 row)
+
+SELECT ok FROM gaps.validate('v');
+ ok 
+----
+ t
+ t
+(2 rows)
+
+SELECT (entity->>'num')::int AS num, round(probability::numeric, 6) AS p_llm, method
+FROM gaps.marginals('v') WHERE attname = 'a' AND value = 'llm' ORDER BY 1;
+ num |  p_llm   | method 
+-----+----------+--------
+   1 | 0.044693 | exact
+   2 | 0.571429 | exact
+   3 | 0.044693 | exact
+(3 rows)
+
+-- Every relkind gives the view's rows exactly, unrestricted and restricted.
+SELECT x.model, count(*) AS rows,
+	   bool_and(x.probability = v.probability) AS equal
+FROM (SELECT 'r' AS model, * FROM gaps.marginals('r')
+	  UNION ALL SELECT 'p', * FROM gaps.marginals('p')
+	  UNION ALL SELECT 'm', * FROM gaps.marginals('m')
+	  UNION ALL SELECT 'v (restricted)', * FROM gaps.marginals('v', 'em_v', '[{"num": 1}, {"num": 2}, {"num": 3}]')) x
+	JOIN gaps.marginals('v') v USING (attname, entity, value)
+GROUP BY x.model ORDER BY 1;
+     model      | rows | equal 
+----------------+------+-------
+ m              |    6 | t
+ p              |    6 | t
+ r              |    6 | t
+ v (restricted) |    6 | t
+(4 rows)
+
+SELECT (entity->>'num')::int AS num, value, probability
+FROM gaps.impute('v', 'em_v', '[{"num": 2}]');
+ num | value |    probability     
+-----+-------+--------------------
+   2 | llm   | 0.5714285714285714
+(1 row)
+
+-- A view's columns carry no NOT NULL, so a restricted call treats its
+-- keys as nullable: a NULL-keyed entity is found like any other under the
+-- default mapping, which matches keys as entities are identified.  (A
+-- map_factor equality is SQL =, so there it maps to no parent, an error.)
+INSERT INTO em_t VALUES (NULL, true);
+SELECT entity, round(probability::numeric, 6) AS p_llm
+FROM gaps.marginals('vd', 'em_v', '[{"num": null}]') WHERE value = 'llm';
+    entity     |  p_llm   
+---------------+----------
+ {"num": null} | 0.571429
+(1 row)
+
+SELECT count(*) FROM gaps.marginals('v', 'em_v', '[{"num": null}]');  -- fail: no parent
+ERROR:  factor "pm": child entity {"num": null} maps to 0 parent entities in parent 1
+-- A view's key need not be unique: rows with equal keys are one entity,
+-- and when they disagree the error says the key is not unique.
+INSERT INTO em_t VALUES (2, false);
+SELECT * FROM gaps.marginals('v');                                 -- fail: key not unique
+ERROR:  rows of entity {"num": 2} of public.em_v.md disagree: {no,yes}
+\set VERBOSITY default
+SELECT * FROM gaps.marginals('v');                                 -- fail: same, in full
+ERROR:  rows of entity {"num": 2} of public.em_v.md disagree: {no,yes}
+DETAIL:  The entity keys (num) are not unique in public.em_v, and rows with equal keys are one entity, so they must agree on its value.
+HINT:  If each row is its own entity, the entity keys must be unique in the relation.
+\set VERBOSITY terse
+-- Rejections at declare time.
+SELECT gaps.create_model('bad');
+ create_model 
+--------------
+ 
+(1 row)
+
+\set VERBOSITY default
+SELECT gaps.declare_attribute('bad', 'em_v', 'a', ARRAY['human']);   -- fail: no key
+ERROR:  attribute public.em_v.a has no entity keys
+HINT:  A view, materialized view or foreign table has no primary key; pass entity_keys.
+SELECT gaps.declare_attribute('bad', 'em_mv', 'a', ARRAY['human']);  -- fail: no key
+ERROR:  attribute public.em_mv.a has no entity keys
+HINT:  A view, materialized view or foreign table has no primary key; pass entity_keys.
+\set VERBOSITY terse
+CREATE SEQUENCE em_seq;
+CREATE INDEX em_r_num ON em_r (num);
+CREATE TYPE em_ct AS (num int, a text);
+SELECT gaps.declare_attribute('bad', 'em_seq', 'last_value', ARRAY['1'], ARRAY['log_cnt']::name[]); -- fail
+ERROR:  public.em_seq is not a table, view, materialized view or foreign table
+SELECT gaps.declare_attribute('bad', 'em_r_num', 'num', ARRAY['1'], ARRAY['num']::name[]);       -- fail
+ERROR:  public.em_r_num is not a table, view, materialized view or foreign table
+SELECT gaps.declare_attribute('bad', 'em_ct', 'a', ARRAY['1'], ARRAY['num']::name[]);            -- fail
+ERROR:  public.em_ct is not a table, view, materialized view or foreign table
+SELECT count(*) FROM gaps.attribute a JOIN gaps.model m USING (model_id) WHERE m.name = 'bad';
+ count 
+-------
+     0
+(1 row)
+
+SELECT gaps.drop_model(name) FROM gaps.model WHERE name IN ('r', 'p', 'm', 'v', 'vd', 'bad');
+ drop_model 
+------------
+ 
+ 
+ 
+ 
+ 
+ 
+(6 rows)
+
