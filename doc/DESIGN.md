@@ -578,6 +578,25 @@ component sits in the network.  The key hashes native `int` and
 to be correctly rounded, so bit-identical results are promised on one
 platform, not across byte orders or C libraries.
 
+**Expected counts.**  `gx_expected_counts` is EM's E-step.  For each
+grounded CPT it needs the posterior over the CPT's whole family (child
+and parents), not the product of per-variable marginals, which ignores
+their correlation.  Every reduced CPT is a base factor of the bucket of
+its first-eliminated variable, and that bucket's cluster contains its
+scope; after the downward pass the bucket's belief (its base factors,
+its parent's message and every kid's message) is the joint posterior
+over the cluster, and summing it onto the CPT's variables gives the
+family posterior.  Summed over the instances of a first-order factor,
+these are its expected counts; an instance with its family observed adds
+1 to its cell, so on complete data they are `learn_cpts`' counts.  The
+same call returns log P(evidence), the sum of each component's log Z and
+the logs of the fully observed CPTs, which an EM loop needs for its
+convergence test.  Shared components reuse the cached family posteriors:
+the cache key orders a component's factors canonically, the entry stores
+the posteriors in that order, and each component maps them back to its
+own CPTs through the factor's source index.  Only exact inference is
+used; the engine does not sample an E-step.
+
 `impute` on a sampled component returns each variable's most probable
 pooled value (method 'gibbs-marginal-argmax') with a NULL probability.
 That is not the joint MAP, and sampling gives no estimate of a joint

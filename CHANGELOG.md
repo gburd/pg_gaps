@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+`gaps._expected_counts`: the E-step of EM over a ground network, the
+expected count of every cell of every first-order factor's CPT given the
+evidence, and log P(evidence).  Internal, for the EM mode of
+`learn_cpts` that follows.
+
 Gibbs sampling for components too large for exact inference: set
 `gaps.samples` (default 0, never) and `gaps.seed`.  `marginals` and
 `impute` gain a `samples` column (NULL for exact) and report method

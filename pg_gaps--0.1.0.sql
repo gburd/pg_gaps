@@ -946,6 +946,21 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'gaps_infer'
 LANGUAGE C STRICT VOLATILE;
 
+-- The E-step of EM over the ground network gaps._infer takes: for each
+-- first-order factor (the CPTs that share a cpt_off) and each cell of its
+-- CPT (1-based, parents then child, child fastest), the expected number of
+-- its instances whose child and parents take that cell's values, given
+-- the evidence.  loglik, the same on every row, is log P(evidence).
+-- Exact only (src/gaps_infer.c).
+CREATE FUNCTION gaps._expected_counts(card int[], evidence int[], child int[],
+									  parent_off int[], parents int[], cpt_off int[],
+									  cpts float8[],
+									  OUT cpt_off int, OUT cell int, OUT n float8,
+									  OUT loglik float8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'gaps_expected_counts'
+LANGUAGE C STRICT VOLATILE;
+
 -- For each attribute of model m, the temp tables that hold its entities
 -- during a grounding: ktab, an empty table whose row type is the entity
 -- key (one field per key column, named k1, k2, ... in key order, with the
