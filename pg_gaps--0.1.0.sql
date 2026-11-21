@@ -278,7 +278,9 @@ AS $$
 $$;
 
 -- Check one of a factor's arrays (its CPT or its prior, named by what):
--- one-dimensional, every entry finite and non-negative, and a length that
+-- one-dimensional and indexed from 1 (the layout and learn_cpts index from
+-- 1, so '[0:1]={...}' would shift every cell), every entry finite and
+-- non-negative, and a length that
 -- is a multiple of k, the child's domain size, or with with_parents exactly
 -- want.  rows is the number of parent combinations, for the message.
 CREATE FUNCTION gaps._cells_check(fname text, what text, a float8[], k int,
@@ -287,6 +289,10 @@ LANGUAGE plpgsql IMMUTABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+	IF coalesce(array_ndims(a), 0) = 1 AND array_lower(a, 1) <> 1 THEN
+		RAISE EXCEPTION '% of factor "%" must be indexed from 1, not %', what, fname,
+			array_lower(a, 1);
+	END IF;
 	IF coalesce(array_ndims(a), 0) <> 1 OR array_length(a, 1) % k <> 0
 	   OR (with_parents AND array_length(a, 1) <> rows * k) THEN
 		RAISE EXCEPTION '% of factor "%" has % entries, needs %', what, fname,
@@ -1726,9 +1732,11 @@ BEGIN
 
 		-- Rows must sum to 1 within the trigger's 1e-9; division can leave a
 		-- last-bit error, so the last entry of each row takes up the slack.
+		-- When that entry should be 0 the slack can come out as -2e-16;
+		-- clamp it, which moves the row sum by no more than the slack.
 		FOR r IN 0 .. nrows / k - 1 LOOP
-			newcpt[r * k + k] := 1.0 - (SELECT coalesce(sum(newcpt[r * k + i]), 0)
-										FROM generate_series(1, k - 1) i);
+			newcpt[r * k + k] := greatest(0.0, 1.0 - (SELECT coalesce(sum(newcpt[r * k + i]), 0)
+													 FROM generate_series(1, k - 1) i));
 		END LOOP;
 		UPDATE gaps.factor x SET cpt = newcpt WHERE x.factor_id = f.factor_id;
 		factor := f.name;

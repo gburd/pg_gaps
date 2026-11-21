@@ -429,8 +429,8 @@ to other sessions.  A real model rarely has more than a handful of key
 types; the limit is a guard against an unbounded failure, not a tuning
 knob, so it is not a GUC.
 
-**CPTs** are dense `float8[]` in row-major order over (parents..., child),
-the child varying fastest.  Each variable's values are in
+**CPTs** are dense `float8[]`, indexed from 1, in row-major order over
+(parents..., child), the child varying fastest.  Each variable's values are in
 `gaps.attribute.domain` order, which is the order passed to
 `declare_attribute`, not sorted: `ARRAY['1', '2', '10']` stays
 `{1,2,10}`.  Note that a domain built with `array_agg(DISTINCT col)` comes

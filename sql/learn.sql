@@ -113,6 +113,9 @@ SELECT * FROM gaps.learn_cpts('hz', 100);
 SELECT abs(cpt[1] - (8.70 + 9) / (8.70 + 191.30 + 200)) < 1e-12 AS beta_mean,
 	   round(cpt[1]::numeric, 5) AS p_yes
 FROM gaps.factor WHERE name = 'ev';
+-- Arrays indexed from 0 would shift every cell, so both are refused.
+SELECT gaps.set_prior('hz', 'ev', '[0:1]={8.70,191.30}');          -- fail: lower bound
+SELECT gaps.set_cpt('hz', 'ev', '[0:1]={0.5,0.5}');                -- fail: lower bound
 DROP TABLE hz;
 SELECT gaps.drop_model('hz');
 
@@ -131,11 +134,27 @@ SELECT gaps.add_factor('cr', 'pc', 'sc', ARRAY['sa', 'sb'],
 	ARRAY[0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6, 0.5, 0.5, 0.6, 0.4]);
 SELECT gaps.set_prior('cr', 'pc', ARRAY[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 SELECT * FROM gaps.cpt_rows('cr', 'pc') WITH ORDINALITY;
-SELECT count(*) AS parent_rows, sum(n) AS cells, bool_and(abs(s - 1) < 1e-12) AS rows_sum_to_1
+SELECT count(*) AS parent_rows, sum(n) AS cells,
+	   bool_and(abs(s - 1) < 1e-12) AS rows_sum_to_1
 FROM (SELECT parents, count(*) n, sum(probability) s FROM gaps.cpt_rows('cr', 'pc') GROUP BY parents) x;
 -- A stripe twice among the parents keeps both, in order.
 SELECT gaps.add_factor('cr', 'pb', 'sb', ARRAY['sa', 'sa']);
 SELECT parents, value, probability, prior FROM gaps.cpt_rows('cr', 'pb') LIMIT 3;
 SELECT * FROM gaps.cpt_rows('cr', 'nope');                         -- fail: no factor
 DROP TABLE cr;
+
+
+-- A cell that should be 0 stays 0 after the row-sum slack fix: with
+-- counts (6, 23, 1, 0) and alpha 0 the slack used to come out -2.2e-16.
+CREATE TABLE s4 (id int PRIMARY KEY, v text);
+INSERT INTO s4 SELECT i, CASE WHEN i <= 6 THEN 'a' WHEN i <= 29 THEN 'b' ELSE 'c' END
+FROM generate_series(1, 30) i;
+SELECT gaps.create_model('s4');
+SELECT gaps.declare_attribute('s4', 's4', 'v', ARRAY['a', 'b', 'c', 'd']);
+SELECT gaps.add_stripe('s4', 'v', 's4', 'v');
+SELECT gaps.add_factor('s4', 'pv', 'v');
+SELECT * FROM gaps.learn_cpts('s4', 0);
+SELECT cpt[4] = 0 AS last_is_zero FROM gaps.factor WHERE name = 'pv';
+SELECT gaps.drop_model('s4');
+DROP TABLE s4;
 SELECT gaps.drop_model('cr');
