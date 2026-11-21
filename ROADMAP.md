@@ -69,6 +69,7 @@ green on the first push.  Packaged for PGXN, not yet published.
 | 2 | engine: exact inference, bucket tree, log space, bounds, sharing | done; brute-force oracle, closed forms, allocation failure (`test/engine`); two independent reviews |
 | 2 | `marginals`, `impute`, `learn_cpts` | done (`sql/infer.sql`, `sql/learn.sql`) |
 | 2 | per-cell Dirichlet priors for `learn_cpts`, `cpt_rows` | done: `gaps.factor.prior`, `set_prior`; posterior mean per parent row, exact to 1e-12 against the closed form including pg.ddx.io's Beta(8.70, 191.30) cell; validated in the trigger and at grounding; kept by dump and restore (`sql/learn.sql`, `test/dump`) |
+| 2 | EM for `learn_cpts` with missing values (pg.ddx.io Gap 2) | done: `learn_cpts(..., method => 'em', max_iterations, tol)`, MAP-EM with the factor's prior, grounded once.  E-step `gx_expected_counts` (family posteriors off the bucket tree, shared components) against brute force to 1e-12 (counts) and 1e-10 (loglik) on 40,000 random cases a run (`test/engine`); the loop against an EM built on pgmpy's VariableElimination to 1e-9 on 200 models, 97 with a missing parent of an observed child (`test/pgmpy/em.py`); t5's case by hand and the objective's climb (`sql/em.sql`).  Exact only: no sampled E-step, a too-large component is an `ERROR`.  Measured: the latent-class model at 20,000 rows (200 labelled) converges in 7 iterations, 1.0 s, max error to the planted CPTs 0.014; `learn_cpts` 'counts' is linear, 0.84 s at 40,800 rows (was 7.8 min) (`bench/RESULTS_LEARN_2026-11-21.md`) |
 | 2 | pgmpy cross-check | done: 2,647 to 2,762 marginals per run agree to 1e-9 (`test/pgmpy`, flake check `pgmpy`) |
 | 2 | sharing measured with A/A | done: 1.6-2.2x on inference (`bench/RESULTS_SHARING_2026-11-19.md`) |
 | 2 | `marginals` / `impute` restricted to some entities | done: optional `rel, entities` arguments ground only the requested entities' components (closure over the ground graph, set-at-a-time rounds, bounded at 1e7 entities and 1e4 rounds; a long closure gives up for the whole grounding); bit-identical to the unrestricted rows on fixed and 150 random models, NULL keys under NOT NULL that does not hold, and mixed-case keys (`sql/subset.sql`); 230 of 318,000 emails in 110 ms against 33 s (local, loaded host; `bench/RESULTS_SUBSET_2026-11-21.md`, which also measures unindexed nullable keys and chains).  Checks validity only for the components it grounds.  No d-separation pruning; `select_rows` (Phase 4) stays separate |
@@ -144,6 +145,15 @@ Delivers:
   in-database learning as future work [W11 ch. 8], and a workshop paper
   discussed learning for hierarchical FOBNs (T2496-2499).  Without it the
   extension is unusable on real data.
+- EM for factors whose variables are missing in some rows: the engine's
+  E-step (`gx_expected_counts`, exposed as `gaps._expected_counts`)
+  computes each grounded CPT's family posterior (child and parents
+  jointly, since a family can have several missing variables) from the
+  same bucket tree as `marginals`, summed per first-order factor; the
+  loop is `learn_cpts(model, alpha, method => 'em')` (DESIGN.md
+  "Learning with missing values").  Exact only: a component too large
+  for exact inference is an `ERROR`, since a Gibbs E-step would make the
+  M-step's monotonicity a matter of luck.
 - `SupportRequestRows` support functions for the SRFs.
 
 Done when: a brute-force possible-worlds oracle agrees with every

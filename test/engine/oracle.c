@@ -79,3 +79,60 @@ oracle_run(const gx_bn *bn, oracle_out *out)
 				out->marg[missing[i]][x] /= out->z;
 	return 0;
 }
+
+int
+oracle_counts(const gx_bn *bn, const int *group, const size_t *goff,
+			  double *counts, size_t ncounts, double *z)
+{
+	int			missing[ORACLE_MAX_MISSING];
+	int			nmissing = 0;
+	int			assign[64];
+	*z = 0.0;
+	for (int v = 0; v < bn->nvars; v++)
+	{
+		if (bn->evidence[v] >= 0)
+			assign[v] = bn->evidence[v];
+		else
+		{
+			if (nmissing == ORACLE_MAX_MISSING)
+				return -1;
+			missing[nmissing++] = v;
+			assign[v] = 0;
+		}
+	}
+
+	/* Every world: its joint goes to the cell each CPT's family takes. */
+	for (;;)
+	{
+		double		p = oracle_joint(bn, assign);
+		int			k;
+
+		*z += p;
+		for (int i = 0; i < bn->ncpts; i++)
+		{
+			const gx_cpt *c = &bn->cpts[i];
+			size_t		idx = 0;
+
+			for (int j = 0; j < c->nparents; j++)
+				idx = idx * bn->card[c->parents[j]] + assign[c->parents[j]];
+			idx = idx * bn->card[c->child] + assign[c->child];
+			counts[goff[group[i]] + idx] += p;
+		}
+		for (k = 0; k < nmissing; k++)
+		{
+			int			v = missing[k];
+
+			if (++assign[v] < bn->card[v])
+				break;
+			assign[v] = 0;
+		}
+		if (k == nmissing)
+			break;
+	}
+
+	if (*z == 0)
+		return 1;
+	for (size_t x = 0; x < ncounts; x++)
+		counts[x] /= *z;
+	return 0;
+}

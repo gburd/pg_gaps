@@ -32,6 +32,7 @@ jobs:
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install --quiet pgmpy 'psycopg[binary]'
           pg_virtualenv -v ${{ matrix.pg }} /tmp/venv/bin/python test/pgmpy/check.py --models 300
+          pg_virtualenv -v ${{ matrix.pg }} /tmp/venv/bin/python test/pgmpy/em.py --models 200
 
   # The flake gate: PG 17, 18 and 19 from nixpkgs, built with clang.
   nix:
