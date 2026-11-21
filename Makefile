@@ -18,13 +18,14 @@ EXTENSION = pg_gaps
 EXTVERSION = $(shell sed -n "s/^default_version *= *'\(.*\)'/\1/p" $(srcdir)/$(EXTENSION).control)
 
 MODULE_big = pg_gaps
-OBJS = src/pg_gaps.o src/gaps_infer.o src/gaps_support.o src/engine/gx.o
+OBJS = src/pg_gaps.o src/gaps_infer.o src/gaps_param.o src/gaps_support.o \
+	src/engine/gx.o src/engine/gx_param.o
 DATA = $(EXTENSION)--$(EXTVERSION).sql
 PGFILEDESC = "pg_gaps - probabilistic graphical models over incomplete relations"
 
 PG_CPPFLAGS = -DPG_GAPS_VERSION=\"$(EXTVERSION)\" -I$(srcdir)/src
 
-REGRESS = pg_gaps catalog infer learn em validate rows subset
+REGRESS = pg_gaps catalog infer learn em validate rows subset param
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

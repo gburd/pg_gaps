@@ -21,6 +21,7 @@
  * Exits non-zero on the first failure and prints the case's seed.
  */
 #include "engine/gx.h"
+#include "engine/gx_param.h"
 #include "oracle.h"
 
 #include <math.h>
@@ -1530,6 +1531,373 @@ check_counts_fixed(void)
 	nchecks += 4;
 }
 
+/* ----------------------------------------------------------------
+ * Parameterised factors (gx_param.h)
+ * ----------------------------------------------------------------
+ */
+
+#define PMAXM 8					/* explicit members, all slots together */
+
+static long param_aux_cases;		/* compared cases with auxiliary variables */
+#define PMAXS 3					/* slots */
+
+/* A random parameterised factor and one instance of it. */
+typedef struct pcase
+{
+	gx_pfactor	f;
+	int			slot_card[PMAXS];
+	unsigned char slot_agg[PMAXS];
+	double		params[3 * (1 + 3 * 4)];
+	int			off[PMAXS + 1];
+	int			mvar[PMAXM];	/* member -> distinct variable 0..nd-1 */
+	int			mval[PMAXM];	/* the member's evidence, or -1 */
+	int			nd;				/* distinct member variables */
+	int			dcard[PMAXM];
+	int			dev[PMAXM];
+} pcase;
+
+/*
+ * The formula, written out over every explicit member, independently of
+ * gx_param.c: P(child = k | the members' values val[] by distinct
+ * variable).
+ */
+static double
+pformula(const pcase *pc, const int *val, int k)
+{
+	const gx_pfactor *f = &pc->f;
+
+	if (f->kind == GX_NOISY_OR)
+	{
+		double		off = 1.0 - f->params[0];
+
+		for (int s = 0; s < f->nslots; s++)
+			for (int i = pc->off[s]; i < pc->off[s + 1]; i++)
+				if (val[pc->mvar[i]] > 0)
+					off *= 1.0 - f->params[1 + s];
+		return k == 0 ? off : 1.0 - off;
+	}
+	else
+	{
+		int			width = 1;
+		double		sc[4],
+					z = 0.0;
+
+		for (int s = 0; s < f->nslots; s++)
+			width += pc->slot_card[s];
+		for (int c = 0; c < f->card; c++)
+		{
+			int			base = 1;
+
+			sc[c] = 0.0;
+			if (c == 0)
+				continue;
+			sc[c] = f->params[(c - 1) * width];
+			for (int s = 0; s < f->nslots; s++)
+			{
+				for (int i = pc->off[s]; i < pc->off[s + 1]; i++)
+					sc[c] += f->params[(c - 1) * width + base + val[pc->mvar[i]]];
+				base += pc->slot_card[s];
+			}
+		}
+		for (int c = 0; c < f->card; c++)
+			z += exp(sc[c]);
+		return exp(sc[k]) / z;
+	}
+}
+
+/* Draw a random factor and instance into pc. */
+static void
+pgen(pcase *pc)
+{
+	gx_pfactor *f = &pc->f;
+	int			nm = 0;
+
+	memset(pc, 0, sizeof(*pc));
+	f->kind = rnd(2) ? GX_LOGISTIC : GX_NOISY_OR;
+	f->card = f->kind == GX_NOISY_OR ? 2 : 2 + rnd(3);
+	f->nslots = 1 + rnd(PMAXS);
+	pc->nd = 0;
+	for (int s = 0; s < f->nslots; s++)
+	{
+		int			n;
+
+		pc->slot_card[s] = 1 + rnd(3);
+		pc->slot_agg[s] = (unsigned char) rnd(2);
+		n = pc->slot_agg[s] ? rnd(PMAXM / f->nslots + 1) : 1;
+		pc->off[s] = nm;
+		for (int i = 0; i < n; i++, nm++)
+		{
+			int			reuse = -1;
+
+			/* Now and then a variable already in an earlier slot. */
+			for (int d = 0; d < pc->nd && reuse < 0; d++)
+				if (pc->dcard[d] == pc->slot_card[s] && rnd(4) == 0)
+				{
+					reuse = d;
+					for (int j = pc->off[s]; j < nm; j++)
+						if (pc->mvar[j] == d)
+							reuse = -1;
+				}
+			if (reuse < 0)
+			{
+				reuse = pc->nd++;
+				pc->dcard[reuse] = pc->slot_card[s];
+				pc->dev[reuse] = rnd(2) ? -1 : rnd(pc->slot_card[s]);
+			}
+			pc->mvar[nm] = reuse;
+		}
+	}
+	pc->off[f->nslots] = nm;
+	for (int i = 0; i < nm; i++)
+		pc->mval[i] = pc->dev[pc->mvar[i]];
+	f->slot_card = pc->slot_card;
+	f->slot_agg = pc->slot_agg;
+	if (f->kind == GX_NOISY_OR)
+	{
+		f->nparams = 1 + f->nslots;
+		for (int i = 0; i < f->nparams; i++)
+			pc->params[i] = rnd(8) == 0 ? (double) rnd(2) : rnd(1000) / 1000.0;
+	}
+	else
+	{
+		int			width = 1;
+
+		for (int s = 0; s < f->nslots; s++)
+			width += pc->slot_card[s];
+		f->nparams = (f->card - 1) * width;
+		for (int i = 0; i < f->nparams; i++)
+			pc->params[i] = (rnd(6001) - 3000) / 1000.0;
+	}
+	f->params = pc->params;
+}
+
+/*
+ * One case: the dense network (member priors, then the child's CPT over
+ * every distinct member by the formula) and the parameterised one (the
+ * same priors, then gx_param_ground's CPTs, over the missing members
+ * only, plus auxiliary variables) give the same marginals to 1e-12 for
+ * every missing member and the child.  A component holding an auxiliary
+ * CPT with a zero must be refused for sampling.
+ */
+static void
+check_param_case(uint64_t cseed)
+{
+	pcase		pc;
+	int			card[PMAXM + 1 + 64],
+				ev[PMAXM + 1 + 64];
+	double		prior[PMAXM][3];
+	double	   *dense;
+	int			dpar[PMAXM];
+	gx_cpt		cpts[PMAXM + 1 + 64];
+	gx_pcpt		pcpts[64 + 1];
+	int			vals[PMAXM];
+	gx_pinst	in;
+	gx_bn		a,
+				b;
+	gx_result	ra,
+				rb;
+	int			child,
+				naux,
+				rc,
+				rca,
+				bad,
+				zero_aux = 0;
+	size_t		rows = 1;
+
+	pgen(&pc);
+	child = pc.nd;
+	for (int d = 0; d < pc.nd; d++)
+	{
+		double		sum = 0.0;
+
+		card[d] = pc.dcard[d];
+		ev[d] = pc.dev[d];
+		for (int x = 0; x < card[d]; x++)
+			sum += (prior[d][x] = 0.05 + rnd(1000) / 1000.0);
+		for (int x = 0; x < card[d]; x++)
+			prior[d][x] /= sum;
+		cpts[d] = (gx_cpt) {d, 0, NULL, prior[d]};
+		dpar[d] = d;
+		rows *= (size_t) card[d];
+	}
+	card[child] = pc.f.card;
+	ev[child] = rnd(2) ? -1 : rnd(pc.f.card);
+
+	/* The dense CPT, every member variable a parent, the last fastest. */
+	dense = malloc(sizeof(double) * rows * (size_t) pc.f.card);
+	memset(vals, 0, sizeof(vals));
+	for (size_t r = 0; r < rows; r++)
+	{
+		for (int k = 0; k < pc.f.card; k++)
+			dense[r * (size_t) pc.f.card + (size_t) k] = pformula(&pc, vals, k);
+		for (int d = pc.nd - 1; d >= 0; d--)
+		{
+			if (++vals[d] < card[d])
+				break;
+			vals[d] = 0;
+		}
+	}
+	cpts[child] = (gx_cpt) {child, pc.nd, dpar, dense};
+	a = (gx_bn) {pc.nd + 1, card, ev, pc.nd + 1, cpts};
+
+	/* The parameterised instance; its variables are the same numbers. */
+	in.child = child;
+	in.off = pc.off;
+	in.var = pc.mvar;
+	in.value = pc.mval;
+	in.first_aux = child + 1;
+	naux = gx_param_naux(&pc.f, &in);
+	if (gx_param_check(&pc.f) != GX_OK)
+		FAIL("param: gx_param_check rejected a valid factor");
+	rc = gx_param_ground(&env, &pc.f, &in, pcpts);
+	if (rc != GX_OK)
+		FAIL("param: gx_param_ground returned %d", rc);
+	b = a;
+	{
+		gx_cpt		bc[PMAXM + 1 + 64];
+
+		memcpy(bc, cpts, sizeof(gx_cpt) * (size_t) pc.nd);
+		for (int i = 0; i <= naux; i++)
+		{
+			gx_pcpt    *t = &pcpts[i];
+
+			if (t->child != (i < naux ? child + 1 + i : child))
+				FAIL("param: CPT %d is for variable %d", i, t->child);
+			if (i < naux)
+			{
+				card[t->child] = t->card;
+				ev[t->child] = -1;
+				for (size_t x = 0; x < t->ncells; x++)
+					zero_aux |= t->vals[x] == 0.0;
+			}
+			bc[pc.nd + i] = (gx_cpt) {t->child, t->nparents, t->parents, t->vals};
+			for (int p = 0; p < t->nparents; p++)
+				if (t->parents[p] < child && pc.dev[t->parents[p]] >= 0)
+					FAIL("param: CPT %d has observed parent %d", i, t->parents[p]);
+		}
+		b.nvars = b.ncpts = pc.nd + 1 + naux;
+		b.cpts = bc;
+		if (gx_check(&env, &b, &bad) != GX_OK)
+			FAIL("param: gx_check rejected the parameterised network (var %d)", bad);
+		memset(&ra, 0, sizeof(ra));
+		memset(&rb, 0, sizeof(rb));
+		rca = gx_infer(&env, &a, &ra);
+		rc = gx_infer(&env, &b, &rb);
+		if (rca != rc)
+			FAIL("param: dense returned %d, parameterised %d", rca, rc);
+		if (rc == GX_OK)
+		{
+			for (int v = 0; v <= child; v++)
+				if (ev[v] < 0)
+					for (int x = 0; x < card[v]; x++)
+						if (fabs(M(&ra, v, x) - M(&rb, v, x)) > TOL)
+							FAIL("param: var %d value %d: dense %.17g, parameterised %.17g",
+								 v, x, M(&ra, v, x), M(&rb, v, x));
+			free_result(&a, &ra);
+			free_result(&b, &rb);
+			nchecks++;
+			if (naux > 1)
+				param_aux_cases++;
+		}
+
+		/* Deterministic auxiliary CPTs rule out sampling. */
+		if (zero_aux)
+		{
+			gx_env		se = env;
+
+			se.samples = 100;
+			se.sample_always = 1;
+			memset(&rb, 0, sizeof(rb));
+			rc = gx_infer(&se, &b, &rb);
+			if (rc == GX_OK)
+				FAIL("param: a component with a zero auxiliary CPT entry was sampled");
+		}
+	}
+	gx_param_free(&env, pcpts, naux + 1);
+	free(dense);
+}
+
+/*
+ * Fixed cases: bad descriptions are GX_EINVAL; the size bound is
+ * GX_ETOOBIG; fifteen five-valued observed parents of a binary logistic
+ * child give a one-row CPT.
+ */
+static void
+check_param_fixed(void)
+{
+	uint64_t	cseed = 0;
+	int			sc[15],
+				off[16],
+				var[15],
+				val[15];
+	unsigned char agg[15] = {0};
+	double		w[1 + 15 * 5];
+	gx_pfactor	f = {GX_LOGISTIC, 2, 15, sc, agg, 1 + 15 * 5, w};
+	gx_pinst	in = {15, off, var, val, 16};
+	gx_pcpt		out[1];
+	gx_env		tiny = env;
+
+	for (int i = 0; i < 15; i++)
+	{
+		sc[i] = 5;
+		off[i] = i;
+		var[i] = i;
+		val[i] = i % 5;
+	}
+	off[15] = 15;
+	for (int i = 0; i < 1 + 15 * 5; i++)
+		w[i] = 0.01 * i;
+	if (gx_param_ground(&env, &f, &in, out) != GX_OK || out[0].nparents != 0 ||
+		out[0].ncells != 2)
+		FAIL("param: 15 observed parents did not give a one-row CPT");
+	gx_param_free(&env, out, 1);
+
+	/* All fifteen missing: 5^15 x 2 cells, over the bound. */
+	for (int i = 0; i < 15; i++)
+		val[i] = -1;
+	if (gx_param_ground(&env, &f, &in, out) != GX_ETOOBIG)
+		FAIL("param: 5^15 cells were not GX_ETOOBIG");
+
+	f.nparams--;
+	if (gx_param_check(&f) != GX_EINVAL)
+		FAIL("param: a short parameter array passed");
+	f.nparams++;
+	w[3] = NAN;
+	if (gx_param_check(&f) != GX_EINVAL)
+		FAIL("param: a NaN weight passed");
+	w[3] = 0.0;
+	f.kind = GX_NOISY_OR;
+	f.nparams = 16;
+	w[2] = 1.5;
+	if (gx_param_check(&f) != GX_EINVAL)
+		FAIL("param: a noisy-OR probability above 1 passed");
+
+	/* An aggregating slot of 200 missing ternary members: the count of a
+	 * value over 200 members has C(202, 2) = 20301 values, so its link is
+	 * 20100 x 3 x 20301 cells, over a bound of 1 << 20. */
+	{
+		int			sc1[1] = {3},
+					off1[2] = {0, 200},
+					var1[200],
+					val1[200];
+		unsigned char agg1[1] = {1};
+		double		w1[4] = {0.1, 0.2, 0.3, 0.4};
+		gx_pfactor	f1 = {GX_LOGISTIC, 2, 1, sc1, agg1, 4, w1};
+		gx_pinst	in1 = {0, off1, var1, val1, 201};
+		gx_pcpt    *big = malloc(sizeof(gx_pcpt) * 201);
+
+		for (int i = 0; i < 200; i++)
+		{
+			var1[i] = i + 1;
+			val1[i] = -1;
+		}
+		tiny.max_cells = (size_t) 1 << 20;
+		if (gx_param_ground(&tiny, &f1, &in1, big) != GX_ETOOBIG)
+			FAIL("param: a count chain over the bound was not GX_ETOOBIG");
+		free(big);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1553,6 +1921,7 @@ main(int argc, char **argv)
 	check_gibbs_seed();
 	check_gibbs_nomix();
 	check_counts_fixed();
+	check_param_fixed();
 	for (long i = 0; i < cases; i++)
 	{
 		net			n;
@@ -1565,6 +1934,7 @@ main(int argc, char **argv)
 		check_case(&n, cseed);
 		check_counts_case(&n, cseed);
 		check_counts_firstorder(cseed);
+		check_param_case(cseed);
 		if (i % 10 == 0)
 			check_gibbs_case(&n, cseed);
 	}
@@ -1576,6 +1946,14 @@ main(int argc, char **argv)
 		FAIL("counts cases had %ld families with two missing variables and %ld "
 			 "cache hits; both must be positive", counts_multi_missing, counts_cache_hits);
 	}
+	if (cases >= 100 && param_aux_cases == 0)
+	{
+		uint64_t	cseed = seed;
+
+		FAIL("no parameterised case had two or more auxiliary variables");
+	}
+	printf("engine: parameterised factors: %ld cases with auxiliary chains\n",
+		   param_aux_cases);
 	printf("engine: expected counts: %ld families with two or more missing, %ld cache hits\n",
 		   counts_multi_missing, counts_cache_hits);
 	printf("engine: %ld checks passed (seed %llu, %ld random cases)\n",

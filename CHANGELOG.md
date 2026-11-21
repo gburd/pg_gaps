@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Parameterised factors: `gaps.add_factor(..., kind => 'logistic' |
+'noisy_or', params => ...)` declares a factor whose table is computed
+from weights at grounding instead of stored, over each instance's missing
+parents only, so a logistic over 15 observed five-valued inputs costs one
+row per instance rather than 5^15.  `learn_cpts` keeps them fixed (method
+'fixed (<kind>)'), EM learns the other factors around them, and
+`cpt_rows` shows their computed table.
+
 `gaps.marginals` and `gaps.impute` take optional `rel` and `entities`
 arguments: given a jsonb array of entity keys of `rel` (the form the
 `entity` column returns), they ground only the components holding those

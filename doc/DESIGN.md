@@ -471,7 +471,8 @@ gaps.attribute      (attribute_id, model_id, rel regclass, relname, attname,
                      typname, entity_keys name[], domain text[])
 gaps.stripe         (stripe_id, model_id, name, attribute_id)
 gaps.stripe_qual    (stripe_id, ord, attname, op, value)   -- ANDed, on Ad
-gaps.factor         (factor_id, model_id, name, child_stripe, cpt float8[])
+gaps.factor         (factor_id, model_id, name, child_stripe, cpt float8[],
+                     prior float8[], kind text, params float8[])
 gaps.factor_parent  (factor_id, ord, parent_stripe)
 gaps.factor_map     (factor_id, ord, child_att, parent_att) -- equalities
 ```
@@ -560,6 +561,55 @@ catalog, and inference never reads it.  A column rather than a
 as long as the factor, survives dump and restore, and is visible through
 `cpt_rows`), and an argument would make every caller pass the same
 arrays again.
+
+**Parameterised factors.**  `gaps.factor.kind` is `'cpt'` (the default),
+`'logistic'` or `'noisy_or'`; the last two have `params` instead of a CPT
+and a prior, and their tables are computed at grounding, never stored, so
+a factor over 15 five-valued inputs needs 1 + 15 x 5 weights where its CPT
+would need 5^15 rows.  pg.ddx.io's best authorship model is such a
+logistic, and naive Bayes over the same inputs loses 0.086 AUC.
+`add_factor` takes `kind` and `params` as two more arguments after `cpt`,
+so every existing call keeps working and new ones pass them by name.
+
+- `logistic`: a child of K values, value 1 the reference with score 0.
+  Value k > 1 scores its bias plus one weight per parent for that parent's
+  value; P(child = k) is the softmax of the scores.  `params` has (K - 1) x
+  (1 + the sum of the parents' domain sizes) entries, class-major: for
+  each k > 1, its bias, then the weights of parent 1's values, then parent
+  2's, and so on.  With K = 2 this is logistic regression over one-hot
+  inputs.  Every weight must be finite.
+- `noisy_or`: a binary child whose second value is "on"; a parent is
+  active when its value is not its first.  P(child off) = (1 - leak) x the
+  product of (1 - p_i) over active parents.  `params` is the leak, then
+  p_i per parent, each in [0, 1].
+
+The trigger and every grounding check the kind, the length, finiteness
+and the probability range, and refuse a CPT or prior on a parameterised
+factor and `params` on a CPT one.
+
+Grounding knows each instance's evidence, so for each instance it builds
+the table over the instance's missing parents only, folding the observed
+parents into the scores (logistic) or the product (noisy-OR), and hands
+the engine an ordinary CPT (`src/engine/gx_param.c`, called through
+`gaps._param_cpts`).  That table is P(child | missing parents, observed
+parents = e), a valid conditional, so the engine needs no change and
+everything it does (components, sharing, bounds, EM's E-step) applies.
+Its size is the product of the missing parents' domains times the child's,
+checked against `gaps.max_factor_cells` before it is built; when every
+input is observed, as in pg.ddx.io's use, it is one row.  A variable that
+fills two parent slots is one parent of the table.  The tables of a
+model's parameterised factors follow all its CPTs in the network's `cpts`
+array.
+
+`learn_cpts` does not learn parameterised factors: they keep their
+`params`, their rows report method `'fixed (<kind>)'` with no count, and
+EM conditions on their tables as they are while it learns the CPTs
+(`gaps._estep` takes them as a fixed tail of the CPT array, so their
+expected counts are computed and never read).  Fitting logistic weights or
+noisy-OR probabilities is deferred.  `cpt_rows` returns a parameterised
+factor's table computed with every parent missing, bounded by
+`gaps.max_factor_cells` like any other, so a factor over many parents is
+an `ERROR` naming its size there while it still grounds.
 
 **Learning with missing values.**  `learn_cpts(model, alpha, method =>
 'em', max_iterations => 50, tol => 1e-6)` runs expectation maximization,
