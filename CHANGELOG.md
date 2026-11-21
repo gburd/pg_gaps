@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Composite models: `gaps.add_member(model, member)` makes a model hold
+others, and its factors may name a member's stripes as `member.stripe`.
+One call grounds and solves the union as one network, so a person-level
+combiner over three networks conditions everything on everything instead
+of multiplying the members' marginals in SQL.  A member in use cannot be
+dropped; membership cycles and members the caller cannot see are
+refused; composites survive pg_dump and restore.
+
 Parameterised factors: `gaps.add_factor(..., kind => 'logistic' |
 'noisy_or', params => ...)` declares a factor whose table is computed
 from weights at grounding instead of stored, over each instance's missing

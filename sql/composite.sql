@@ -1,0 +1,262 @@
+-- Composite models (doc/DESIGN.md, "Composite models"): a model that holds
+-- other models as members grounds the union of their networks and its own
+-- factors as one network.  The example is pg.ddx.io's: three naive-Bayes
+-- networks (e-mail, commit message, patch), each with a latent author
+-- state per row and observed children, and a person-level combiner whose
+-- child is the person's state and whose parents are the latent states of
+-- all that person's rows, through aggregating slots.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_gaps;
+\set VERBOSITY terse
+
+CREATE TABLE person (pid int PRIMARY KEY, state text);
+CREATE TABLE email (eid int PRIMARY KEY, pid int, a text, x1 text, x2 text);
+CREATE TABLE cmsg (cid int PRIMARY KEY, pid int, a text, x1 text);
+CREATE TABLE patch (tid int PRIMARY KEY, pid int, a text, x1 text, x2 text);
+INSERT INTO person VALUES (1, NULL), (2, 'llm'), (3, NULL), (4, 'human');
+INSERT INTO email VALUES
+	(1, 1, NULL, 'long', 'formal'), (2, 1, NULL, 'short', NULL), (3, 2, NULL, 'long', 'formal'),
+	(4, 2, 'human', 'short', 'casual'), (5, 3, NULL, NULL, 'casual'), (6, 4, NULL, 'long', NULL);
+INSERT INTO cmsg VALUES
+	(1, 1, NULL, 'terse'), (2, 2, NULL, 'verbose'), (3, 2, NULL, 'verbose'), (4, 4, NULL, NULL);
+INSERT INTO patch VALUES
+	(1, 2, NULL, 'big', 'tests'), (2, 3, NULL, 'small', NULL), (3, 4, NULL, 'big', 'none');
+
+-- One member: a latent a with a prior, observed children given a.
+CREATE FUNCTION naive(m text, rel regclass, kids text[], doms text[][]) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM gaps.create_model(m);
+	PERFORM gaps.declare_attribute(m, rel, 'a', ARRAY['human', 'llm']);
+	PERFORM gaps.add_stripe(m, 'a', rel, 'a');
+	PERFORM gaps.add_factor(m, 'pa', 'a', '{}', ARRAY[0.7, 0.3]);
+	FOR i IN 1 .. cardinality(kids) LOOP
+		PERFORM gaps.declare_attribute(m, rel, kids[i]::name, ARRAY(SELECT unnest(doms[i:i][1:2])));
+		PERFORM gaps.add_stripe(m, kids[i], rel, kids[i]::name);
+		PERFORM gaps.add_factor(m, 'p' || kids[i], kids[i], ARRAY['a'],
+			CASE i WHEN 1 THEN ARRAY[0.8, 0.2, 0.25, 0.75] ELSE ARRAY[0.6, 0.4, 0.1, 0.9] END);
+	END LOOP;
+END
+$$;
+SELECT naive('email_net', 'email', ARRAY['x1', 'x2'],
+			 ARRAY[ARRAY['short', 'long'], ARRAY['casual', 'formal']]);
+SELECT naive('commit_net', 'cmsg', ARRAY['x1'], ARRAY[ARRAY['terse', 'verbose']]);
+SELECT naive('patch_net', 'patch', ARRAY['x1', 'x2'],
+			 ARRAY[ARRAY['small', 'big'], ARRAY['none', 'tests']]);
+
+-- The composite: the person's state given every latent of the person's
+-- rows in the three members, as a noisy-OR with one probability per
+-- member.  Each mapping is one-to-many (person.pid = email.pid, ...).
+CREATE FUNCTION author(m text, kind text, params float8[]) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM gaps.create_model(m);
+	PERFORM gaps.add_member(m, 'email_net');
+	PERFORM gaps.add_member(m, 'commit_net');
+	PERFORM gaps.add_member(m, 'patch_net');
+	PERFORM gaps.declare_attribute(m, 'person', 'state', ARRAY['human', 'llm']);
+	PERFORM gaps.add_stripe(m, 'state', 'person', 'state');
+	PERFORM gaps.add_factor(m, 'combine', 'state',
+		ARRAY['email_net.a', 'commit_net.a', 'patch_net.a'],
+		kind => kind, params => params, aggregate => ARRAY[true, true, true]);
+	FOR i IN 1 .. 3 LOOP
+		PERFORM gaps.map_factor(m, 'combine', i, 'pid', 'pid');
+	END LOOP;
+END
+$$;
+SELECT author('author', 'noisy_or', ARRAY[0.05, 0.6, 0.4, 0.5]);
+SELECT c.name AS composite, m.name AS member, mm.ord
+FROM gaps.model_member mm JOIN gaps.model c ON c.model_id = mm.model_id
+	JOIN gaps.model m ON m.model_id = mm.member_id ORDER BY mm.ord;
+SELECT * FROM gaps.validate('author');
+
+-- The posterior of every missing value, in one call.
+SELECT rel, attname, entity, value, round(probability::numeric, 9) AS p
+FROM gaps.marginals('author') WHERE value = 'llm' ORDER BY rel::text, entity::text;
+SELECT count(*) AS bad_distributions FROM (
+	SELECT rel, attname, entity FROM gaps.marginals('author')
+	GROUP BY rel, attname, entity
+	HAVING abs(sum(probability) - 1) > 1e-12 OR min(probability) < 0) x;
+
+-- The oracle: the flat model that declares all the same attributes and
+-- factors in one model, in the same order, gives bit-identical rows.
+CREATE FUNCTION flat(m text, kind text, params float8[]) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+	t record;
+BEGIN
+	PERFORM gaps.create_model(m);
+	FOR t IN SELECT * FROM (VALUES (1, 'email', 'e', ARRAY['x1', 'x2'],
+									ARRAY[ARRAY['short', 'long'], ARRAY['casual', 'formal']]),
+								   (2, 'cmsg', 'c', ARRAY['x1'],
+									ARRAY[ARRAY['terse', 'verbose']]),
+								   (3, 'patch', 'p', ARRAY['x1', 'x2'],
+									ARRAY[ARRAY['small', 'big'], ARRAY['none', 'tests']]))
+				v(o, rel, pre, kids, doms) ORDER BY o LOOP
+		PERFORM gaps.declare_attribute(m, t.rel::regclass, 'a', ARRAY['human', 'llm']);
+		PERFORM gaps.add_stripe(m, t.pre || 'a', t.rel::regclass, 'a');
+		PERFORM gaps.add_factor(m, t.pre || 'pa', t.pre || 'a', '{}', ARRAY[0.7, 0.3]);
+		FOR i IN 1 .. cardinality(t.kids) LOOP
+			PERFORM gaps.declare_attribute(m, t.rel::regclass, t.kids[i]::name,
+										   ARRAY(SELECT unnest(t.doms[i:i][1:2])));
+			PERFORM gaps.add_stripe(m, t.pre || t.kids[i], t.rel::regclass, t.kids[i]::name);
+			PERFORM gaps.add_factor(m, t.pre || 'p' || t.kids[i], t.pre || t.kids[i],
+				ARRAY[t.pre || 'a'],
+				CASE i WHEN 1 THEN ARRAY[0.8, 0.2, 0.25, 0.75] ELSE ARRAY[0.6, 0.4, 0.1, 0.9] END);
+		END LOOP;
+	END LOOP;
+	PERFORM gaps.declare_attribute(m, 'person', 'state', ARRAY['human', 'llm']);
+	PERFORM gaps.add_stripe(m, 'state', 'person', 'state');
+	PERFORM gaps.add_factor(m, 'combine', 'state', ARRAY['ea', 'ca', 'pa'],
+		kind => kind, params => params, aggregate => ARRAY[true, true, true]);
+	FOR i IN 1 .. 3 LOOP
+		PERFORM gaps.map_factor(m, 'combine', i, 'pid', 'pid');
+	END LOOP;
+END
+$$;
+-- The flat model cannot share columns with the members, so it runs in a
+-- transaction where they are gone.
+BEGIN;
+CREATE TEMP TABLE comp AS SELECT * FROM gaps.marginals('author');
+SELECT gaps.drop_model('author');
+SELECT gaps.drop_model(x) FROM unnest(ARRAY['email_net', 'commit_net', 'patch_net']) x;
+SELECT flat('flat', 'noisy_or', ARRAY[0.05, 0.6, 0.4, 0.5]);
+SELECT count(*) AS rows, count(f.*) AS matched,
+	   count(*) FILTER (WHERE f.probability IS DISTINCT FROM c.probability) AS differ
+FROM comp c LEFT JOIN gaps.marginals('flat') f USING (rel, attname, entity, value);
+ROLLBACK;
+
+-- Why the combination is a factor and not SQL (AGENTS.md rule 21).  Run
+-- each member on its own and combine their posteriors in SQL with the same
+-- noisy-OR.  For person 3, whose state is missing, that happens to be
+-- right: the person's state is a common child, and with it unobserved the
+-- members' latents stay independent.  For person 2, labelled 'llm', it is
+-- wrong: the label is evidence about every latent of that person at once,
+-- which no member sees on its own.  The latent of e-mail 3 shows it.
+WITH sep AS (
+	SELECT * FROM gaps.marginals('email_net')
+	UNION ALL SELECT * FROM gaps.marginals('commit_net')
+	UNION ALL SELECT * FROM gaps.marginals('patch_net')),
+lat AS (
+	SELECT s.rel, (s.entity ->> CASE s.rel WHEN 'email'::regclass THEN 'eid'
+								 WHEN 'cmsg'::regclass THEN 'cid' ELSE 'tid' END)::int AS id,
+		   s.probability
+	FROM sep s WHERE s.attname = 'a' AND s.value = 'llm'),
+rws AS (
+	SELECT 'email'::regclass AS rel, eid AS id, pid, a, 0.6 AS p FROM email
+	UNION ALL SELECT 'cmsg', cid, pid, a, 0.4 FROM cmsg
+	UNION ALL SELECT 'patch', tid, pid, a, 0.5 FROM patch),
+sqlcomb AS (
+	SELECT r.pid,
+		   1 - 0.95 * exp(sum(ln(1 - r.p * coalesce(l.probability,
+													CASE r.a WHEN 'llm' THEN 1 ELSE 0 END))))
+			   AS p_llm
+	FROM rws r LEFT JOIN lat l USING (rel, id) GROUP BY r.pid)
+SELECT 'person 3, state missing' AS "case",
+	   abs(c.p_llm - m.probability) < 1e-12 AS sql_combination_agrees
+FROM sqlcomb c JOIN gaps.marginals('author') m
+	ON m.attname = 'state' AND m.entity = '{"pid": 3}' AND m.value = 'llm'
+WHERE c.pid = 3
+UNION ALL
+SELECT 'e-mail 3 of person 2, labelled llm',
+	   abs(s.probability - m.probability) < 1e-12
+FROM gaps.marginals('email_net') s JOIN gaps.marginals('author') m USING (rel, attname, entity, value)
+WHERE s.attname = 'a' AND s.entity = '{"eid": 3}' AND s.value = 'llm';
+SELECT round(s.probability::numeric, 6) AS email_net_alone, round(m.probability::numeric, 6) AS composite
+FROM gaps.marginals('email_net') s JOIN gaps.marginals('author') m USING (rel, attname, entity, value)
+WHERE s.attname = 'a' AND s.entity = '{"eid": 3}' AND s.value = 'llm';
+
+-- A restricted call on the composite follows the aggregating mappings in
+-- both directions: one person, or one patch, gives the rows of the whole
+-- call bit for bit.
+SELECT count(*) AS requested, count(u.*) AS matched,
+	   count(*) FILTER (WHERE r.probability IS DISTINCT FROM u.probability) AS differ
+FROM (SELECT * FROM gaps.marginals('author', 'person', '[{"pid": 1}]')
+	  UNION ALL
+	  SELECT * FROM gaps.marginals('author', 'patch', '[{"tid": 2}]')) r
+	LEFT JOIN gaps.marginals('author') u USING (rel, attname, entity, value);
+
+-- The same combiner as a logistic over the counts of llm latents per
+-- member, with its own flat oracle.
+SELECT gaps.drop_model('author');
+SELECT author('author', 'logistic', ARRAY[-1.5, -0.2, 0.9, -0.1, 0.6, 0, 1.2]);
+SELECT attname, entity, round(probability::numeric, 9) AS p
+FROM gaps.marginals('author') WHERE attname = 'state' AND value = 'llm' ORDER BY entity::text;
+BEGIN;
+CREATE TEMP TABLE comp AS SELECT * FROM gaps.marginals('author');
+SELECT gaps.drop_model('author');
+SELECT gaps.drop_model(x) FROM unnest(ARRAY['email_net', 'commit_net', 'patch_net']) x;
+SELECT flat('flat', 'logistic', ARRAY[-1.5, -0.2, 0.9, -0.1, 0.6, 0, 1.2]);
+SELECT count(*) AS rows, count(f.*) AS matched,
+	   count(*) FILTER (WHERE f.probability IS DISTINCT FROM c.probability) AS differ
+FROM comp c LEFT JOIN gaps.marginals('flat') f USING (rel, attname, entity, value);
+ROLLBACK;
+
+-- Members are referenced, not copied: a new CPT in a member is what the
+-- composite uses at its next call.
+SELECT round(probability::numeric, 9) AS before FROM gaps.marginals('author')
+WHERE attname = 'state' AND entity = '{"pid": 1}' AND value = 'llm';
+SELECT gaps.set_cpt('email_net', 'pa', ARRAY[0.2, 0.8]);
+SELECT round(probability::numeric, 9) AS after FROM gaps.marginals('author')
+WHERE attname = 'state' AND entity = '{"pid": 1}' AND value = 'llm';
+SELECT gaps.set_cpt('email_net', 'pa', ARRAY[0.7, 0.3]);
+
+-- Rejections.
+SELECT gaps.drop_model('email_net');                                -- fail: in use
+SELECT gaps.add_member('email_net', 'author');                      -- fail: cycle
+SELECT gaps.add_member('author', 'author');                         -- fail: itself
+SELECT gaps.add_member('author', 'email_net');                      -- fail: already
+SELECT gaps.add_factor('author', 'bad', 'state', ARRAY['nosuch.a']);  -- fail: no stripe
+SELECT gaps.add_factor('author', 'bad', 'state', ARRAY['a']);         -- fail: not own
+SELECT * FROM gaps.learn_cpts('author');                            -- fail: composite
+-- A column declared by two models of a composite.
+SELECT gaps.create_model('dup');
+SELECT gaps.declare_attribute('dup', 'email', 'a', ARRAY['human', 'llm']);
+SELECT gaps.add_stripe('dup', 'a', 'email', 'a');
+SELECT gaps.add_factor('dup', 'pa', 'a', '{}', ARRAY[0.5, 0.5]);
+SELECT gaps.add_member('author', 'dup');
+SELECT count(*) FROM gaps.marginals('author');                      -- fail: both declare
+DELETE FROM gaps.model_member WHERE member_id = gaps._model_id('dup');
+SELECT gaps.drop_model('dup');
+-- A member removed by direct DML leaves the composite's factor with a
+-- parent outside it.
+BEGIN;
+DELETE FROM gaps.model_member WHERE member_id = gaps._model_id('patch_net');
+SELECT count(*) FROM gaps.marginals('author');                      -- fail: not a member
+ROLLBACK;
+
+-- Row-level security: a composite is visible only with all its members.
+-- Another role's composite over this role's member cannot be grounded.
+CREATE ROLE gaps_other;
+GRANT SELECT ON person, email, cmsg, patch TO gaps_other;
+SELECT gaps._model_id('email_net') AS email_net_id \gset
+SET ROLE gaps_other;
+SELECT count(*) AS visible_models FROM gaps.model;
+SELECT gaps.create_model('theirs');
+SELECT gaps.add_member('theirs', 'email_net');                      -- fail: not visible
+\set VERBOSITY sqlstate
+INSERT INTO gaps.model_member
+SELECT x.model_id, :email_net_id, 1 FROM gaps.model x
+WHERE x.name = 'theirs';                                            -- fail: not visible
+\set VERBOSITY terse
+RESET ROLE;
+SELECT gaps.add_member('theirs', 'email_net');  -- the owner sees both
+SET ROLE gaps_other;
+DO $$
+BEGIN
+	PERFORM count(*) FROM gaps.marginals('theirs');
+EXCEPTION WHEN OTHERS THEN
+	RAISE WARNING 'fails: %', regexp_replace(SQLERRM, 'model [0-9]+', 'model N');
+END
+$$;
+RESET ROLE;
+DELETE FROM gaps.model_member WHERE model_id = gaps._model_id('theirs');
+SELECT gaps.drop_model('theirs');
+
+SELECT gaps.drop_model('author');
+SELECT gaps.drop_model(x) FROM unnest(ARRAY['email_net', 'commit_net', 'patch_net']) x;
+SELECT count(*) AS rows_left FROM gaps.model;
+DROP TABLE person, email, cmsg, patch;
+DROP FUNCTION naive(text, regclass, text[], text[]), author(text, text, float8[]),
+	flat(text, text, float8[]);
+DROP ROLE gaps_other;

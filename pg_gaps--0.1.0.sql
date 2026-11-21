@@ -75,7 +75,20 @@ CREATE TABLE gaps.factor_map (
 	FOREIGN KEY (factor_id, ord) REFERENCES gaps.factor_parent ON DELETE CASCADE
 );
 
+-- A composite model's members (doc/DESIGN.md, "Composite models"): its
+-- ground network is the union of theirs and its own factors.  A member
+-- in use cannot be dropped.
+CREATE TABLE gaps.model_member (
+	model_id	int NOT NULL REFERENCES gaps.model ON DELETE CASCADE,
+	member_id	int NOT NULL REFERENCES gaps.model ON DELETE RESTRICT,
+	ord			int NOT NULL,
+	PRIMARY KEY (model_id, member_id),
+	UNIQUE (model_id, ord),
+	CHECK (member_id <> model_id)
+);
+
 SELECT pg_catalog.pg_extension_config_dump('gaps.model', '');
+SELECT pg_catalog.pg_extension_config_dump('gaps.model_member', '');
 SELECT pg_catalog.pg_extension_config_dump('gaps.model_model_id_seq', '');
 SELECT pg_catalog.pg_extension_config_dump('gaps.attribute', '');
 SELECT pg_catalog.pg_extension_config_dump('gaps.attribute_attribute_id_seq', '');
@@ -113,6 +126,9 @@ CREATE POLICY stripe_model ON gaps.stripe USING (gaps._may(model_id));
 ALTER TABLE gaps.factor ENABLE ROW LEVEL SECURITY;
 CREATE POLICY factor_model ON gaps.factor USING (gaps._may(model_id));
 
+ALTER TABLE gaps.model_member ENABLE ROW LEVEL SECURITY;
+CREATE POLICY model_member_model ON gaps.model_member USING (gaps._may(model_id));
+
 ALTER TABLE gaps.stripe_qual ENABLE ROW LEVEL SECURITY;
 CREATE POLICY stripe_qual_model ON gaps.stripe_qual
 	USING (EXISTS (SELECT 1 FROM gaps.stripe s WHERE s.stripe_id = stripe_qual.stripe_id));
@@ -124,8 +140,8 @@ CREATE POLICY factor_map_model ON gaps.factor_map
 	USING (EXISTS (SELECT 1 FROM gaps.factor f WHERE f.factor_id = factor_map.factor_id));
 
 GRANT USAGE ON SCHEMA gaps TO PUBLIC;
-GRANT SELECT, INSERT, UPDATE, DELETE ON gaps.model, gaps.attribute, gaps.stripe,
-	gaps.stripe_qual, gaps.factor, gaps.factor_parent, gaps.factor_map TO PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON gaps.model, gaps.model_member, gaps.attribute,
+	gaps.stripe, gaps.stripe_qual, gaps.factor, gaps.factor_parent, gaps.factor_map TO PUBLIC;
 GRANT USAGE ON SEQUENCE gaps.model_model_id_seq, gaps.attribute_attribute_id_seq,
 	gaps.stripe_stripe_id_seq, gaps.factor_factor_id_seq TO PUBLIC;
 
@@ -517,6 +533,111 @@ BEGIN
 END
 $$;
 
+-- Model m and every model it holds as a member, directly or through
+-- members that are composites themselves, in id order: the models whose
+-- factors and attributes one grounding of m reads.  Fails naming the first
+-- member the caller cannot see (row-level security hides it), since
+-- leaving it out would ground a different network.  The recursion
+-- terminates whatever the rows say (UNION drops repeats), though
+-- gaps.add_member refuses cycles.
+CREATE FUNCTION gaps._models(m int) RETURNS int[]
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	ids int[];
+	hidden int;
+BEGIN
+	WITH RECURSIVE r(id) AS (
+		SELECT m
+		UNION
+		SELECT mm.member_id FROM gaps.model_member mm JOIN r ON mm.model_id = r.id)
+	SELECT array_agg(r.id ORDER BY r.id) INTO ids FROM r;
+	SELECT u.id INTO hidden FROM unnest(ids) u(id)
+	WHERE NOT EXISTS (SELECT 1 FROM gaps.model x WHERE x.model_id = u.id)
+	ORDER BY u.id LIMIT 1;
+	IF hidden IS NOT NULL THEN
+		RAISE EXCEPTION 'member model % of model "%" is not visible to role %', hidden,
+			(SELECT x.name FROM gaps.model x WHERE x.model_id = m), current_user
+			USING HINT = 'A composite reads every member as its caller; the caller must be a '
+				'member of each member''s owner role.';
+	END IF;
+	RETURN ids;
+END
+$$;
+
+-- Add model member to composite model (doc/DESIGN.md, "Composite
+-- models").  Members are referenced, not copied.  The trigger on
+-- gaps.model_member refuses a cycle and a member the caller cannot see.
+CREATE FUNCTION gaps.add_member(model text, member text) RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	m int := gaps._model_id(model);
+	mem int := gaps._model_id(member);
+BEGIN
+	INSERT INTO gaps.model_member (model_id, member_id, ord)
+	SELECT m, mem, coalesce(max(mm.ord), 0) + 1 FROM gaps.model_member mm WHERE mm.model_id = m;
+END
+$$;
+
+-- Every write of gaps.model_member, through gaps.add_member or direct
+-- DML: the member must be visible to the caller, since a foreign key check
+-- ignores row-level security and a hidden member would otherwise let any
+-- role block its owner's drop_model (ON DELETE RESTRICT); and the row must
+-- not close a cycle of membership.  pg_restore loads the table whole, as a
+-- superuser, from rows that passed both checks.
+CREATE FUNCTION gaps._model_member_check() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM gaps.model x WHERE x.model_id = NEW.member_id) THEN
+		RAISE EXCEPTION 'model % does not exist', NEW.member_id;
+	END IF;
+	IF NEW.model_id = ANY (gaps._models(NEW.member_id)) THEN
+		RAISE EXCEPTION 'model "%" cannot be a member of "%": it holds "%" already',
+			(SELECT x.name FROM gaps.model x WHERE x.model_id = NEW.member_id),
+			(SELECT x.name FROM gaps.model x WHERE x.model_id = NEW.model_id),
+			(SELECT x.name FROM gaps.model x WHERE x.model_id = NEW.model_id);
+	END IF;
+	RETURN NEW;
+END
+$$;
+CREATE TRIGGER model_member_check BEFORE INSERT OR UPDATE ON gaps.model_member
+	FOR EACH ROW EXECUTE FUNCTION gaps._model_member_check();
+
+-- A parent stripe of a factor of model p_model: one of its own, or
+-- "<member>.<stripe>", a stripe of one of its members (gaps._models).
+CREATE FUNCTION gaps._parent_stripe_id(p_model text, p_stripe text) RETURNS int
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	m int := gaps._model_id(p_model);
+	ids int[];
+BEGIN
+	SELECT array_agg(s.stripe_id) INTO ids FROM gaps.stripe s WHERE s.model_id = m
+	AND s.name = p_stripe;
+	IF ids IS NOT NULL THEN
+		RETURN ids[1];
+	END IF;
+	SELECT array_agg(s.stripe_id) INTO ids
+	FROM gaps.stripe s JOIN gaps.model x USING (model_id)
+	WHERE s.model_id = ANY (gaps._models(m)) AND s.model_id <> m
+	  AND x.name || '.' || s.name = p_stripe;
+	IF cardinality(ids) > 1 THEN
+		RAISE EXCEPTION 'stripe "%" is ambiguous among the members of model "%"', p_stripe, p_model;
+	END IF;
+	IF ids IS NULL THEN
+		RAISE EXCEPTION 'stripe "%" does not exist in model "%" or its members', p_stripe, p_model
+			USING HINT = 'Name a member''s stripe as <member>.<stripe>.';
+	END IF;
+	RETURN ids[1];
+END
+$$;
+
 -- Note that SQL-function parameters are qualified with the function name
 -- wherever a column of the same name is in scope: an unqualified "name"
 -- inside a query on gaps.model is the column, not the parameter.
@@ -624,7 +745,7 @@ BEGIN
 	END IF;
 	FOR i IN 1 .. coalesce(array_length(parents, 1), 0) LOOP
 		INSERT INTO gaps.factor_parent (factor_id, ord, parent_stripe, aggregate)
-		VALUES (f, i, gaps._stripe_id(model, parents[i]), coalesce(aggregate[i], false));
+		VALUES (f, i, gaps._parent_stripe_id(model, parents[i]), coalesce(aggregate[i], false));
 	END LOOP;
 	PERFORM gaps._cpt_check(f, true);
 END
@@ -1019,6 +1140,7 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
 	m int := gaps._model_id(model);
+	ms int[] := gaps._models(m);
 	nf int;
 	np bigint;
 	ncmp bigint;
@@ -1033,14 +1155,15 @@ DECLARE
 	path int[];
 	pred int;
 BEGIN
-	PERFORM gaps._resolve(a) FROM gaps.attribute a WHERE a.model_id = m ORDER BY a.attribute_id;
-	SELECT count(*) INTO nf FROM gaps.factor fa WHERE fa.model_id = m;
+	PERFORM gaps._resolve(a) FROM gaps.attribute a WHERE a.model_id = ANY (ms)
+	ORDER BY a.attribute_id;
+	SELECT count(*) INTO nf FROM gaps.factor fa WHERE fa.model_id = ANY (ms);
 	IF nf > 100 THEN
 		RAISE EXCEPTION 'model "%" has % factors; gaps.validate handles at most 100', model, nf
 			USING HINT = 'Grounding (gaps.marginals) still checks the ground network for cycles exactly.';
 	END IF;
 	SELECT count(*) INTO np FROM gaps.factor_parent fp JOIN gaps.factor fa USING (factor_id)
-	WHERE fa.model_id = m;
+	WHERE fa.model_id = ANY (ms);
 	IF np > 20000 THEN
 		RAISE EXCEPTION 'model "%" has % parent slots; gaps.validate handles at most 20000',
 			model, np
@@ -1053,10 +1176,10 @@ BEGIN
 	FROM (SELECT DISTINCT f.child_stripe AS c, gp.parent_stripe AS p
 		  FROM gaps.factor f
 			JOIN gaps.stripe cs ON cs.stripe_id = f.child_stripe
-			JOIN gaps.factor g ON g.model_id = f.model_id
+			JOIN gaps.factor g ON g.model_id = ANY (ms)
 			JOIN gaps.factor_parent gp ON gp.factor_id = g.factor_id
 			JOIN gaps.stripe ps ON ps.stripe_id = gp.parent_stripe
-		  WHERE f.model_id = m AND ps.attribute_id = cs.attribute_id) x;
+		  WHERE f.model_id = ANY (ms) AND ps.attribute_id = cs.attribute_id) x;
 	SELECT coalesce(sum(10 + ((SELECT count(*) FROM gaps.stripe_qual q WHERE q.stripe_id = x.c)
 							 + (SELECT count(*) FROM gaps.stripe_qual q WHERE q.stripe_id = x.p))
 							^ 2), 0)
@@ -1091,10 +1214,10 @@ BEGIN
 			JOIN share x ON x.c = f.child_stripe
 			JOIN (SELECT DISTINCT fp.factor_id, fp.parent_stripe
 				  FROM gaps.factor_parent fp JOIN gaps.factor g USING (factor_id)
-				  WHERE g.model_id = m) gp ON gp.parent_stripe = x.p
+				  WHERE g.model_id = ANY (ms)) gp ON gp.parent_stripe = x.p
 			JOIN gaps.factor g ON g.factor_id = gp.factor_id
 			JOIN gaps.stripe ps ON ps.stripe_id = gp.parent_stripe
-		  WHERE f.model_id = m
+		  WHERE f.model_id = ANY (ms)
 		  GROUP BY f.factor_id, g.factor_id, f.name, cs.name) x;
 	test := 'within-factor';
 	ok := selfloops IS NULL;
@@ -1104,7 +1227,8 @@ BEGIN
 	-- Kahn's algorithm, ignoring self-loops: repeatedly remove the factors
 	-- with no edge from a remaining factor.  What remains lies on or behind
 	-- a cycle.
-	alive := ARRAY(SELECT fa.factor_id FROM gaps.factor fa WHERE fa.model_id = m ORDER BY 1);
+	alive := ARRAY(SELECT fa.factor_id FROM gaps.factor fa WHERE fa.model_id = ANY (ms)
+				   ORDER BY 1);
 	LOOP
 		removed := ARRAY(SELECT u.id FROM unnest(alive) u(id)
 						 EXCEPT
@@ -1208,7 +1332,7 @@ AS $$
 				', ' ORDER BY u.o), 'UTF8')), 'hex'), 32) AS h
 		  FROM gaps.attribute a
 			CROSS JOIN LATERAL unnest(a.entity_keys) WITH ORDINALITY u(k, o)
-		  WHERE a.model_id = m
+		  WHERE a.model_id = ANY (gaps._models(m))
 		  GROUP BY a.attribute_id) x
 $$;
 
@@ -1281,7 +1405,8 @@ DECLARE
 BEGIN
 	FOR t IN SELECT k.etab, k.ctab, a.entity_keys, array_agg(k.attribute_id) AS ids
 			 FROM pg_gaps_keys k JOIN gaps.attribute a ON a.attribute_id = k.attribute_id
-			 WHERE a.model_id = m GROUP BY k.etab, k.ctab, a.entity_keys LOOP
+			 WHERE a.model_id = ANY (gaps._models(m))
+			 GROUP BY k.etab, k.ctab, a.entity_keys LOOP
 		RETURN QUERY EXECUTE format('SELECT e.v, e.attribute_id, %s '
 									'FROM pg_temp.%I e WHERE e.ev = 0 '
 									'AND e.attribute_id = ANY ($1)%s',
@@ -1494,6 +1619,7 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+	ms int[] := gaps._models(m);
 	a gaps.attribute;
 	t record;
 	nv int := 0;
@@ -1504,9 +1630,24 @@ DECLARE
 BEGIN
 	-- Every attribute's names still resolve, then each gets its tables,
 	-- named in one query; each shape's entity table is emptied once.
-	FOR a IN SELECT * FROM gaps.attribute WHERE model_id = m ORDER BY attribute_id LOOP
+	FOR a IN SELECT * FROM gaps.attribute WHERE model_id = ANY (ms) ORDER BY attribute_id LOOP
 		PERFORM gaps._resolve(a);
 	END LOOP;
+	-- Two models of a composite may not both declare one column: each
+	-- would make its own random variables for the same values.
+	SELECT x.relname, x.attname, mx.name AS m1, my.name AS m2 INTO bad
+	FROM gaps.attribute x JOIN gaps.attribute y
+		ON y.rel = x.rel AND y.attname = x.attname AND y.attribute_id > x.attribute_id
+		JOIN gaps.model mx ON mx.model_id = x.model_id
+		JOIN gaps.model my ON my.model_id = y.model_id
+	WHERE x.model_id = ANY (ms) AND y.model_id = ANY (ms)
+	ORDER BY x.attribute_id LIMIT 1;
+	IF bad.attname IS NOT NULL THEN
+		RAISE EXCEPTION 'models "%" and "%" both declare %.%', bad.m1, bad.m2, bad.relname,
+			bad.attname
+			USING HINT = 'A column belongs to one model of a composite; the other names its '
+				'stripes as <member>.<stripe>.';
+	END IF;
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_rv (
 		v int, attribute_id int, card int, ev int)
 		ON COMMIT DROP;
@@ -1604,6 +1745,7 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+	ms int[] := gaps._models(m);
 	t record;
 	bad jsonb;
 	build text;
@@ -1615,7 +1757,7 @@ BEGIN
 			USING HINT = 'Name the relation whose entities they are.';
 	END IF;
 	IF NOT EXISTS (SELECT 1 FROM gaps.attribute a
-				   WHERE a.model_id = m AND a.rel = _closure_seed.rel) THEN
+				   WHERE a.model_id = ANY (ms) AND a.rel = _closure_seed.rel) THEN
 		RAISE EXCEPTION 'relation % has no attribute in the model', rel;
 	END IF;
 	IF jsonb_typeof(entities) <> 'array' THEN
@@ -1628,7 +1770,7 @@ BEGIN
 	END IF;
 	SELECT e INTO bad FROM jsonb_array_elements(entities) e
 	WHERE NOT EXISTS (SELECT 1 FROM gaps.attribute a
-					  WHERE a.model_id = m AND a.rel = _closure_seed.rel
+					  WHERE a.model_id = ANY (ms) AND a.rel = _closure_seed.rel
 						AND (SELECT array_agg(x ORDER BY x COLLATE "C")
 							 FROM unnest(a.entity_keys::text[]) x)
 							= (SELECT array_agg(x ORDER BY x COLLATE "C")
@@ -1638,14 +1780,14 @@ BEGIN
 		RAISE EXCEPTION 'entity % does not name the entity keys of any attribute of %', bad, rel
 			USING DETAIL = format('The attributes of %s are keyed by %s.', rel,
 				(SELECT string_agg(DISTINCT array_to_string(a.entity_keys, ', '), '; ')
-				 FROM gaps.attribute a WHERE a.model_id = m AND a.rel = _closure_seed.rel));
+				 FROM gaps.attribute a WHERE a.model_id = ANY (ms) AND a.rel = _closure_seed.rel));
 	END IF;
 
 	-- One insert per attribute of rel.  A value that does not cast fails
 	-- the whole insert; the handler finds the first entity it came from.
 	FOR t IN SELECT a AS a, k.ktab, k.ctab
 			 FROM gaps.attribute a JOIN pg_gaps_keys k USING (attribute_id)
-			 WHERE a.model_id = m AND a.rel = _closure_seed.rel ORDER BY a.attribute_id LOOP
+			 WHERE a.model_id = ANY (ms) AND a.rel = _closure_seed.rel ORDER BY a.attribute_id LOOP
 		SELECT string_agg(format('%L, e -> %L', 'k' || o, k), ', ' ORDER BY o) INTO build
 		FROM unnest((t.a).entity_keys) WITH ORDINALITY u(k, o);
 		build := format('jsonb_populate_record(NULL::pg_temp.%I, jsonb_build_object(%s))',
@@ -1825,7 +1967,7 @@ BEGIN
 			USING HINT = 'Call without entities to ground the whole model.';
 	END IF;
 	SELECT CASE WHEN bool_and(c.reltuples >= 0) THEN sum(c.reltuples) END INTO modelrows
-	FROM gaps.attribute a JOIN pg_class c ON c.oid = a.rel WHERE a.model_id = m;
+	FROM gaps.attribute a JOIN pg_class c ON c.oid = a.rel WHERE a.model_id = ANY (gaps._models(m));
 
 	LOOP
 		r := r + 1;
@@ -1840,7 +1982,7 @@ BEGIN
 		added := 0;
 		FOR e IN SELECT fp.factor_id, fp.ord
 				 FROM gaps.factor fa JOIN gaps.factor_parent fp USING (factor_id)
-				 WHERE fa.model_id = m ORDER BY fp.factor_id, fp.ord LOOP
+				 WHERE fa.model_id = ANY (gaps._models(m)) ORDER BY fp.factor_id, fp.ord LOOP
 			added := added + gaps._closure_edge(e.factor_id, e.ord, true, r, cap - total - added + 1);
 			added := added + gaps._closure_edge(e.factor_id, e.ord, false, r, cap - total - added + 1);
 			stmts := stmts + 2;
@@ -2216,6 +2358,7 @@ DECLARE
 	restricted boolean;
 	fids int[] := '{}';
 	offs int[] := '{}';
+	ms int[];
 	pg record;
 	p_aux int[] := '{}';
 	p_child int[] := '{}';
@@ -2227,6 +2370,23 @@ BEGIN
 		RAISE EXCEPTION 'rel % is given without entities', rel
 			USING HINT = 'Pass both to restrict the call to some entities of rel, or neither.';
 	END IF;
+	-- A composite grounds the union of its members and its own factors.
+	-- Every parent stripe must be of a model in it: gaps.add_factor makes
+	-- sure, but gaps.model_member rows can be deleted directly, and
+	-- pg_restore loads them in a transaction of their own, so this is
+	-- checked here rather than by a trigger.
+	ms := gaps._models(m);
+	SELECT fa.name, s.name AS sname, x.name AS fmodel, sm.name AS smodel INTO bad
+	FROM gaps.factor fa JOIN gaps.factor_parent fp USING (factor_id)
+		JOIN gaps.stripe s ON s.stripe_id = fp.parent_stripe
+		JOIN gaps.model x ON x.model_id = fa.model_id
+		LEFT JOIN gaps.model sm ON sm.model_id = s.model_id
+	WHERE fa.model_id = ANY (ms) AND s.model_id <> ALL (ms)
+	ORDER BY fa.factor_id, fp.ord LIMIT 1;
+	IF bad.name IS NOT NULL THEN
+		RAISE EXCEPTION 'factor "%" of model "%" has parent stripe "%" of model "%", which is not '
+			'one of its members', bad.name, bad.fmodel, bad.sname, coalesce(bad.smodel, '?');
+	END IF;
 	restricted := gaps._ground_entities(m, rel, entities);
 
 	-- Each factor: its child entities, each with its parent entities.
@@ -2236,7 +2396,7 @@ BEGIN
 	FOR f IN SELECT fa.*, s.attribute_id AS cattr, k.ktab, k.etab
 			 FROM gaps.factor fa JOIN gaps.stripe s ON s.stripe_id = fa.child_stripe
 				JOIN pg_gaps_keys k ON k.attribute_id = s.attribute_id
-			 WHERE fa.model_id = m ORDER BY fa.factor_id LOOP
+			 WHERE fa.model_id = ANY (ms) ORDER BY fa.factor_id LOOP
 		IF f.cpt IS NULL AND f.kind = 'cpt' THEN
 			RAISE EXCEPTION 'factor "%" has no CPT', f.name
 				USING HINT = 'Set one with gaps.set_cpt or learn one with gaps.learn_cpts.';
@@ -2283,13 +2443,13 @@ BEGIN
 	-- the rest.
 	cpts := '{}';
 	FOR f IN SELECT fa.factor_id, fa.cpt FROM gaps.factor fa
-			 WHERE fa.model_id = m AND fa.kind = 'cpt' ORDER BY fa.factor_id LOOP
+			 WHERE fa.model_id = ANY (ms) AND fa.kind = 'cpt' ORDER BY fa.factor_id LOOP
 		fids := fids || f.factor_id;
 		offs := offs || (cardinality(cpts) + 1);
 		cpts := cpts || f.cpt;
 	END LOOP;
 	FOR f IN SELECT fa.factor_id FROM gaps.factor fa
-			 WHERE fa.model_id = m AND fa.kind <> 'cpt' ORDER BY fa.factor_id LOOP
+			 WHERE fa.model_id = ANY (ms) AND fa.kind <> 'cpt' ORDER BY fa.factor_id LOOP
 		pg := gaps._param_ground(f.factor_id, cardinality(card) + cardinality(p_aux) + 1,
 								 cardinality(cpts) + 1);
 		p_poff := p_poff
@@ -2640,7 +2800,8 @@ $$;
 -- also loglik (log P(evidence) under the returned CPTs) and converged
 -- (false when max_iterations stopped it); both NULL for 'counts'.
 -- iterations, loglik and converged describe the whole model, and repeat
--- on every factor's row.  A parameterised factor ('logistic', 'noisy_or')
+-- on every factor's row.  A composite model is refused: learning through
+-- it would write its members' CPTs.  A parameterised factor ('logistic', 'noisy_or')
 -- keeps its params: its row, after the learned ones, has method 'fixed
 -- (<kind>)' and complete_entities NULL, and EM conditions on its tables
 -- as they are.
@@ -2678,6 +2839,10 @@ BEGIN
 	END IF;
 	IF tol IS NULL OR tol < 0 OR tol = 'Infinity'::float8 OR tol = 'NaN'::float8 THEN
 		RAISE EXCEPTION 'tol must be a finite non-negative number, not %', tol;
+	END IF;
+	IF EXISTS (SELECT 1 FROM gaps.model_member mm WHERE mm.model_id = m) THEN
+		RAISE EXCEPTION 'model "%" is a composite; learn_cpts learns one model at a time', model
+			USING HINT = 'Learn each member on its own.';
 	END IF;
 
 	-- Grounding needs a CPT on every factor, but only uses them to build

@@ -467,13 +467,14 @@ transactional, dumpable (each table and sequence is registered with
 
 ```
 gaps.model          (model_id, name, owner regrole)
+gaps.model_member   (model_id, member_id, ord)  -- composite model's members
 gaps.attribute      (attribute_id, model_id, rel regclass, relname, attname,
                      typname, entity_keys name[], domain text[])
 gaps.stripe         (stripe_id, model_id, name, attribute_id)
 gaps.stripe_qual    (stripe_id, ord, attname, op, value)   -- ANDed, on Ad
 gaps.factor         (factor_id, model_id, name, child_stripe, cpt float8[],
                      prior float8[], kind text, params float8[])
-gaps.factor_parent  (factor_id, ord, parent_stripe)
+gaps.factor_parent  (factor_id, ord, parent_stripe, aggregate boolean)
 gaps.factor_map     (factor_id, ord, child_att, parent_att) -- equalities
 ```
 
@@ -706,6 +707,67 @@ rows.  The output says `method` 'em', `iterations` (M-steps, 0 for
 'counts'), `loglik` (log P(evidence) under the returned CPTs) and
 `converged` (false when `max_iterations` stopped it).  A component too
 large for exact inference is an `ERROR`; there is no sampled E-step.
+
+**Composite models.**  pg.ddx.io runs three networks (e-mail, commit
+message, patch), each a latent author state per row with observed
+children, and wants one answer per person.  Combining the three
+posteriors in SQL is rule 21's failure: they are not independent when the
+networks share a person.  A composite model holds member models
+(`gaps.add_member(model, member)`, rows of `gaps.model_member`) and adds
+factors of its own; its ground network is the union of its members'
+networks and its own factors, solved as one network by one call.
+
+- Members are referenced, not copied: a new CPT in a member is what the
+  composite uses at its next call.  A member may be a composite itself;
+  the trigger on `gaps.model_member` refuses a cycle of membership.  The
+  foreign key on the member is `ON DELETE RESTRICT`, so dropping a model
+  in use is an error, and `pg_dump` keeps the table like the rest of the
+  catalog (`test/dump`).
+- A composite's factors name a member's stripe as `member.stripe`; its
+  own stripes keep plain names, which are looked up first, so a stripe
+  of its own whose name contains a dot hides a member's of that name.
+  A composite cannot change a member's factors: what the combination
+  needs to cause is declared in the member.
+- Validity is checked on the union, as for one model: coverage, mappings,
+  evidence, cycles, and `gaps.validate`'s structural proof all run over
+  every model in it (`gaps._models`).  Two models of a composite may not
+  declare one column; grounding refuses that, naming both.  A factor
+  whose parent stripe has left the union (its member row deleted by hand)
+  is refused at grounding rather than by a trigger, since `pg_restore`
+  loads `gaps.model_member` in a transaction of its own.
+- Row-level security: grounding reads every member as the caller, so a
+  member the caller cannot see is an `ERROR` naming it, never silently
+  left out.  `gaps.model_member` follows its composite's visibility, and
+  its trigger refuses a member the caller cannot see, since the foreign
+  key check ignores row-level security and a hidden member would let any
+  role block its owner's `drop_model`.
+- `learn_cpts` refuses a composite (it would write members' CPTs); learn
+  each member on its own.  The row estimate of `marginals` and `impute`
+  sums over the composite's and its members' attributes.
+
+**The combiner's direction.**  In pg.ddx.io's example the combiner's
+child is the person's state and its parents are the member latents of all
+the person's rows, through aggregating slots, one per member:
+person.pid = email.pid one-to-many.  That direction is chosen because it
+leaves the members untouched: each member stays a valid model with its
+own priors, a composite only adds a factor over latents that already
+exist, and the person's state is the one variable a combiner introduces.
+The other direction (person state causes each row's latent) is the
+classical hierarchical model and is often the better story, but it makes
+the person's state a parent inside every member, which the members must
+then declare themselves (a composite cannot change a member's factors);
+it needs no new mechanism, only that each member declares a vertical
+factor to the person.  With the chosen direction, a person's latents are
+independent of each other until the person's state is observed: a
+labelled person is evidence about every row at once, which is exactly
+what separate inference misses.  `sql/composite.sql` shows both sides:
+for an unlabelled person, combining the members' separate marginals in
+SQL by the same noisy-OR gives the composite's answer (a common child
+that is not observed leaves its parents independent), and for a person
+labelled 'llm' the composite moves an e-mail's latent from 0.783 to
+0.824, which no member sees on its own.  So the SQL combination is right
+only by accident, for one kind of question, and the composite is right
+for both.
 
 **Entity-set predicates** are a conjunction of `column op constant` terms
 stored as rows, with `op` one of `=`, `<>`, `<`, `<=`, `>`, `>=`.  Each use

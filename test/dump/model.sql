@@ -33,3 +33,22 @@ SELECT gaps.add_factor('dump', 'light', 'l', ARRAY['tp']);
 SELECT gaps.add_factor('dump', 'occ', 'occ', '{}');
 SELECT gaps.set_prior('dump', 'light', ARRAY[2, 0.5, 0.25, 3]);
 SELECT * FROM gaps.learn_cpts('dump');
+
+-- A composite over model dump: a building's alarm as a noisy-OR of every
+-- room's occupancy in it (an aggregating parent of a member's stripe),
+-- and a logistic of the alarm.  Its marginals cover dump's variables too.
+CREATE TABLE building (b int PRIMARY KEY, alarm text, siren text);
+INSERT INTO building VALUES (1, NULL, 'on'), (2, NULL, NULL);
+ALTER TABLE room ADD COLUMN b int;
+UPDATE room SET b = room;
+SELECT gaps.create_model('site');
+SELECT gaps.add_member('site', 'dump');
+SELECT gaps.declare_attribute('site', 'building', 'alarm', ARRAY['off', 'on']);
+SELECT gaps.declare_attribute('site', 'building', 'siren', ARRAY['off', 'on']);
+SELECT gaps.add_stripe('site', 'alarm', 'building', 'alarm');
+SELECT gaps.add_stripe('site', 'siren', 'building', 'siren');
+SELECT gaps.add_factor('site', 'alarm', 'alarm', ARRAY['dump.occ'], kind => 'noisy_or',
+					   params => ARRAY[0.05, 0.7], aggregate => ARRAY[true]);
+SELECT gaps.map_factor('site', 'alarm', 1, 'b', 'b');
+SELECT gaps.add_factor('site', 'siren', 'siren', ARRAY['alarm'], kind => 'logistic',
+					   params => ARRAY[-2, 0, 4]);

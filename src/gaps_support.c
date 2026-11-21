@@ -13,6 +13,11 @@
  *	 impute:	 sum over attributes of reltuples * null_frac
  *	 learn_cpts: the number of factors
  *
+ * For a composite model the attributes are its own and its members'
+ * (gaps._models), so the estimate is the members' sum plus its own.
+ * learn_cpts refuses a composite, so its estimate stays the model's own
+ * factors.
+ *
  * A restricted call (rel and entities given) to marginals or impute gets
  * the number of requested entities times the same sum over rel's
  * attributes alone, the rows its requested entities return on average,
@@ -159,14 +164,14 @@ estimate_rows(GapsSrf srf, Datum *args, PlannerGlobal *glob, double *rows)
 		"SELECT a.rel::pg_catalog.oid, a.attname::pg_catalog.text, "
 		"pg_catalog.cardinality(a.domain)::pg_catalog.float8 "
 		"FROM gaps.model m LEFT JOIN gaps.attribute a "
-		"ON a.model_id OPERATOR(pg_catalog.=) m.model_id "
+		"ON a.model_id OPERATOR(pg_catalog.=) ANY (gaps._models(m.model_id)) "
 		"WHERE m.name OPERATOR(pg_catalog.=) $1";
 	static const char *const restricted_sql =
 		"SELECT a.rel::pg_catalog.oid, a.attname::pg_catalog.text, "
 		"pg_catalog.cardinality(a.domain)::pg_catalog.float8, "
 		"pg_catalog.jsonb_array_length($3)::pg_catalog.float8 "
 		"FROM gaps.model m LEFT JOIN gaps.attribute a "
-		"ON a.model_id OPERATOR(pg_catalog.=) m.model_id "
+		"ON a.model_id OPERATOR(pg_catalog.=) ANY (gaps._models(m.model_id)) "
 		"AND a.rel OPERATOR(pg_catalog.=) $2 "
 		"WHERE m.name OPERATOR(pg_catalog.=) $1";
 	Oid			argtypes[3] = {TEXTOID, REGCLASSOID, JSONBOID};
@@ -455,13 +460,15 @@ gaps_rows_support(PG_FUNCTION_ARGS)
 
 	/*
 	 * The lookup's tables, locked without waiting.  The lookup reads
-	 * gaps.model, and gaps.attribute or gaps.factor; the catalog's policies
-	 * read only gaps.model.
+	 * gaps.model, and gaps.attribute and gaps.model_member (through
+	 * gaps._models) or gaps.factor; the catalog's policies read only
+	 * gaps.model.
 	 */
 	nsp = get_namespace_oid("gaps", true);
 	if (!OidIsValid(nsp) || !lock_catalog_table(nsp, "model", glob) ||
 		!lock_catalog_table(nsp, srf == SRF_LEARN_CPTS ? "factor" :
-							"attribute", glob))
+							"attribute", glob) ||
+		(srf != SRF_LEARN_CPTS && !lock_catalog_table(nsp, "model_member", glob)))
 		PG_RETURN_POINTER(NULL);
 
 	if (!estimate_rows_safely(srf, args, glob, &rows))
