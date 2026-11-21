@@ -44,14 +44,62 @@ time grows 8.3x for 10x the entities, so the cost follows the entities
 requested, not the table.  The full call's own A/A spread (up to 17%)
 is load noise on a shared host.
 
+## After the review fixes (same day, the fix commit)
+
+The nightly shape again, after the key-match and closure changes (load
+average 8 to 10): 916 rows, 0 mismatched; restricted medians 108.2 and
+105.8 ms (A/A), full 33.2 and 33.7 s.  No change.
+
+## When it is not proportional
+
+`bench/subset_keys.sql`: 100,000 rows, naive Bayes with three children,
+230 entities requested, and a 2,000-row chain of vertical factors (y of
+row i depends on y of row i - 1, `prev` indexed) with one entity
+requested.  Every restricted call returned the full call's rows bit for
+bit (460 rows for each key variant, 2 for the chain, 0 mismatched).
+Medians of three, two passes, in ms; load average 9 to 11:
+
+| arm | pass 1 | pass 2 |
+|---|---|---|
+| full call, 100,000 rows | 3,660 | 3,558 |
+| restricted, nullable key with an index | 49.6 | 49.7 |
+| restricted, nullable key, no index | 355.4 | 354.3 |
+| restricted, primary key | 44.8 | 44.3 |
+| restricted, NOT NULL key, no index | 207.5 | 204.8 |
+| full call, 2,000-row chain | 31.1 | 30.8 |
+| restricted, 2,000-row chain | 104.7 | 105.1 |
+
+A nullable key column must also match two NULLs.  With an index the
+planner probes it for both sides of that test; without one the key is
+compared a second time as a record, which hashes.  Before that second
+comparison the reviewer measured 24 to 27 s for the unindexed nullable
+key, 7x the full call; it is now about 10x cheaper than the full call,
+and an index makes it 70x cheaper.
+
+A chain costs one closure round per step, and a round costs about one
+statement per factor edge and direction, whatever its frontier: the
+reviewer measured 1,772 ms restricted against 39 ms full on this chain,
+and a 10,001-row chain hit the round cap after 9 s.  The closure now
+gives up once its statements, less 100, times 25 exceed the model's
+rows, and the call grounds the whole model and reports the requested
+entities only.  The factor 25 is the measured ratio: the chain's one
+edge makes 2 statements a round, so the reviewer's 1.77 s for its 2,000
+rounds is about 0.44 ms a statement, and the full call's 31 to 39 ms for
+2,000 rows about 0.02 ms a row, some 22 to 28 rows a statement.  Here
+the closure gives up after 90 rounds (180 statements), then grounds
+everything: 105 ms against 31 ms for the full call.  A 10,001-row chain took
+320 ms against 134 ms (one run each, not A/A).  The restricted call can
+still cost up to a few times the full call on such a model, but no
+longer 45x, and it no longer fails.
+
 ## What makes it proportional
 
 Each closure round, and each grounding step of a restricted call, joins
 the frontier to the user's table on the entity key columns and the
 mapping columns.  Here both are the primary key `num`, so every join is
-an index probe.  Without an index on the mapping columns a round falls
-back to a scan of the table, which is still correct but costs the
-table's size per round.
+an index probe.  Without an index on the mapping columns a round is a
+hash join over the table: still correct, but it costs the table's size
+per round.  The section above measures the other cases.
 
 ## Not measured
 
