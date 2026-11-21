@@ -302,6 +302,54 @@ Its text says 5-10x (T3551), and its Table 4.11 gives 5-14x
 (T3504-3508).  It also notes that the overhead can outweigh the gain
 (T3555-3557), which is why it wanted an optimizer to choose.
 
+**Restricted calls.**  `gaps.marginals(model, rel, entities)` and
+`gaps.impute(model, rel, entities)` answer for some entities of one
+relation rather than the whole model.  `entities` is a jsonb array of
+entity keys in the form the `entity` column returns, so a caller can pass
+back what it got; `rel` names their relation.  The call returns the rows
+of every attribute of `rel` declared in the model for those entities, and
+nothing of the rest of their components.  The interface is two optional
+arguments rather than a predicate, a view or a new function: a key list
+is what the pg.ddx.io nightly job has (the ids of new rows), it needs no
+predicate language (Phase 4 brings one for selection, which is a
+different operation: it conditions on `Exist`, where this only chooses
+which posteriors to report), and both NULL is the old call.
+
+An entity's posterior depends on its whole ground component (Principle
+1; vertical factors, coarse entities and one-to-many mappings correlate
+rows), so the call grounds exactly the components that hold a requested
+variable.  `gaps._ground_closure` computes them over the ground graph in
+rounds of set-at-a-time SQL: from the requested entities, each round
+adds, along every factor's every parent, the parents of the entities the
+last round added and their children, through the same mapping and
+stripe predicates grounding uses, until a round adds nothing.  Grounding
+then runs on that entity set: entities, factor instances, coverage,
+mapping totality and evidence checks are the same code restricted to
+it, and because the set is closed (every factor instance has all of its
+variables in it or none), each grounded component equals the
+unrestricted one.  The probabilities are therefore the unrestricted
+call's, bit for bit; component numbers differ.  `sql/subset.sql` checks
+this on fixed models of each shape and 150 random ones.
+
+The closure ignores evidence, so it can hold more than a component in
+the engine's sense (observed variables separate components there).  That
+over-grounds, never under-grounds.  Pruning by d-separation (observed
+separators, barren children) could shrink it; it is not done, because
+the measured workload has one entity per component, where it cannot
+help.  Each round joins the frontier to the user's table on the entity
+key columns and the mapping columns, with `=` on NOT NULL key columns
+(a nullable key column also matches two NULLs, an `OR` only a nested
+loop with an index can use), so a round costs in proportion to its
+frontier when those columns are indexed; the primary key usually is
+one.  Without such an index a round scans the table: correct, but no
+cheaper than the full call.  The closure is bounded at 10,000,000
+entities and 10,000 rounds (AGENTS.md rule 16), an `ERROR` naming the
+size with a hint to call without entities; the inference bounds
+(`gaps.max_total_cells`) still apply to each component.  At the nightly
+shape (318,000 emails, 230 requested) a restricted call takes 110 ms
+against 33 s (`bench/RESULTS_SUBSET_2026-11-21.md`).  `learn_cpts` is
+not restricted: it learns from all the data.
+
 ### The CRF instance [W11 3.4, 5, 6]
 
 For information extraction, BayesStore stores text as a token table
@@ -518,9 +566,12 @@ SELECT gaps.set_prior('sensors', ...);    -- optional Dirichlet pseudocounts per
 SELECT gaps.learn_cpts('sensors');        -- posterior mean from complete rows
 SELECT * FROM gaps.validate('sensors');   -- first-order acyclicity, no data read
 
--- query
-SELECT * FROM gaps.marginals('sensors', 'sensor1'::regclass);
-SELECT * FROM gaps.impute('sensors', 'sensor1'::regclass);   -- MAP completion
+-- query (built: the whole model, or the components of some entities)
+SELECT * FROM gaps.marginals('sensors');
+SELECT * FROM gaps.marginals('sensors', 'sensor1'::regclass,
+                             '[{"t": 1, "room": 2, "sid": 1}]');
+SELECT * FROM gaps.impute('sensors');                        -- MAP completion
+-- proposed
 SELECT * FROM gaps.select_rows('sensors', 'sensor1'::regclass,
                                $$ light = 'dark' $$);        -- rows + P(exist)
 -- Phase 5 adds the join form: two relations and a join predicate.
@@ -626,7 +677,12 @@ planner statistics, never user data:
   `reltuples * null_frac * |domain|`, one row per (missing value, domain
   value);
 - `impute`: the same sum without `|domain|`, one row per missing value;
-- `learn_cpts`: the number of factors.
+- `learn_cpts`: the number of factors;
+- a restricted `marginals` or `impute` (rel and entities constants): the
+  length of the entities array times the same sum over `rel`'s
+  attributes alone divided by `rel`'s `reltuples`, the rows an average
+  entity of `rel` returns.  With `entities` not a constant (a subquery),
+  or only one of the two given, there is no estimate.
 
 `null_frac` is the column's `pg_statistic.stanullfrac`.  On a table that
 ANALYZE samples completely the estimate is exact; otherwise it is as good
