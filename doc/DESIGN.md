@@ -504,7 +504,9 @@ some author state.  Then EM starts instead from the counts plus
 max(pseudocount, 1), the add-one estimate, for the start only: every
 cell of it is positive, so the evidence is possible, and the iterations
 use the caller's pseudocounts as before (`sql/em.sql` has t5's shape and
-a latent-class one), and learn_cpts says so with a NOTICE.  Smoothing
+a latent-class one).  learn_cpts says so with a WARNING and in its
+output, whose method is then 'em (add-one start)', because the start
+decides which fixed point EM reaches.  Smoothing
 the start only when it is needed keeps the documented start, and the
 'counts' answer on complete data, everywhere else.  Any positive
 smoothing makes the evidence possible; add-one is the conventional one

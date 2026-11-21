@@ -183,6 +183,23 @@ SELECT gaps.add_factor('lc', 'pa', 'a');
 SELECT gaps.add_factor('lc', 'p' || x, x, ARRAY['a']) FROM unnest(ARRAY['b', 'c']) x;
 SELECT factor, complete_entities, method, converged FROM gaps.learn_cpts('lc', 0, 'em')
 ORDER BY factor;
+
+-- Only the start's "probability zero" error triggers the add-one restart:
+-- a directed cycle (22023, the same SQLSTATE class) is reported as itself.
+CREATE TABLE cyc (id int PRIMARY KEY, a text, b text);
+INSERT INTO cyc VALUES (1, NULL, 'x');
+SELECT gaps.create_model('cyc');
+SELECT gaps.declare_attribute('cyc', 'cyc', 'a', ARRAY['x', 'y']);
+SELECT gaps.declare_attribute('cyc', 'cyc', 'b', ARRAY['x', 'y']);
+SELECT gaps.add_stripe('cyc', 'a', 'cyc', 'a');
+SELECT gaps.add_stripe('cyc', 'b', 'cyc', 'b');
+SELECT gaps.add_factor('cyc', 'ab', 'a', ARRAY['b']);
+SELECT gaps.add_factor('cyc', 'ba', 'b', ARRAY['a']);
+SELECT gaps.map_factor('cyc', 'ab', 1, 'id', 'id');
+SELECT gaps.map_factor('cyc', 'ba', 1, 'id', 'id');
+SELECT * FROM gaps.learn_cpts('cyc', 0, 'em');                   -- fail: cycle, no restart
+SELECT gaps.drop_model('cyc');
+DROP TABLE cyc;
 -- P(c = 3) under the learned model: the share of rows with c = 3, 40 / 60,
 -- since EM's fixed points match the observed marginal of a child that is
 -- never missing.

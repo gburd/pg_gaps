@@ -1542,10 +1542,6 @@ BEGIN
 		END LOOP;
 	END LOOP;
 
-	-- The steps below and gaps.learn_cpts join pg_gaps_inst; without
-	-- statistics the planner can rescan it once per instance.
-	ANALYZE pg_gaps_inst;
-
 	-- Coverage: every RV is the child of exactly one factor.
 	SELECT r.v, r.attribute_id, at.relname, at.attname, count(DISTINCT i.factor_id) AS n
 	INTO bad
@@ -1723,24 +1719,35 @@ $$;
 -- cell of that start is positive, so the evidence is possible under it.
 CREATE FUNCTION gaps._em(card int[], evidence int[], child int[], parent_off int[],
 	parents int[], cpt_off int[], max_iterations int, tol float8,
-	OUT iterations int, OUT loglik float8, OUT converged boolean)
+	OUT iterations int, OUT loglik float8, OUT converged boolean, OUT add_one boolean)
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
 	obj float8;
 	prev float8;
+	state text;
 BEGIN
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_ec (
 		cpt_off int, cell int, n float8, loglik float8) ON COMMIT DROP;
 	iterations := 0;
 	converged := false;
+	add_one := false;
 	BEGIN
 		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off);
-	EXCEPTION WHEN SQLSTATE '22000' THEN
-		-- gaps._expected_counts' "probability zero" error.
-		RAISE NOTICE 'the complete-data estimate gives probability 0 to observed values; '
+	EXCEPTION WHEN data_exception THEN
+		-- Only gaps._expected_counts' "probability zero" error (22000
+		-- itself, not the rest of its class: a directed cycle is 22023)
+		-- means the start is the problem.
+		GET STACKED DIAGNOSTICS state = RETURNED_SQLSTATE;
+		IF state <> '22000' THEN
+			RAISE;
+		END IF;
+		-- A WARNING, not a NOTICE, and the result says so too: the start
+		-- decides which fixed point EM reaches.
+		RAISE WARNING 'the complete-data estimate gives probability 0 to observed values; '
 			'EM starts from the counts plus max(pseudocount, 1) instead';
+		add_one := true;
 		UPDATE pg_gaps_learn l
 		SET cpt = gaps._normalize((SELECT array_agg(greatest(u.a, 1) + u.n ORDER BY u.i)
 								   FROM unnest(l.pseudo, l.n) WITH ORDINALITY u(a, n, i)),
@@ -1859,7 +1866,8 @@ $$;
 -- tolerance, or after max_iterations.  When the 'counts' estimate gives
 -- probability 0 to a value present in an incomplete row (possible with a
 -- pseudocount of 0), EM starts from the counts plus max(pseudocount, 1)
--- instead (gaps._em).  The model is grounded once.  A component too large
+-- instead (gaps._em), warns, and reports method 'em (add-one start)'.
+-- The model is grounded once.  A component too large
 -- for exact inference is an ERROR; nothing is sampled.
 --
 -- One row per factor: complete_entities, the entities complete for the
@@ -1939,6 +1947,9 @@ BEGIN
 		iterations := r.iterations;
 		loglik := r.loglik;
 		converged := r.converged;
+		IF r.add_one THEN
+			method := 'em (add-one start)';
+		END IF;
 	END IF;
 
 	FOR f IN SELECT * FROM pg_gaps_learn ORDER BY factor_id LOOP
