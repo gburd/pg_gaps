@@ -116,8 +116,9 @@ extern int	gx_param_naux(const gx_pfactor *f, const gx_pinst *in);
  * order, then the last auxiliary variable of the chain (noisy-OR) or of
  * each aggregating slot's chain (logistic), in slot order.  Returns GX_OK,
  * GX_EINVAL (a malformed instance, or a logistic score that overflows),
- * GX_ETOOBIG (a CPT larger than env->max_cells) or GX_ENOMEM.  On error,
- * the CPTs built so far are freed.
+ * GX_ETOOBIG (a CPT larger than env->max_cells, or the instance's CPTs
+ * together larger than env->max_total_cells, either found before the table
+ * is allocated) or GX_ENOMEM.  On error, the CPTs built so far are freed.
  */
 extern int	gx_param_ground(const gx_env *env, const gx_pfactor *f,
 							const gx_pinst *in, gx_pcpt *out);
