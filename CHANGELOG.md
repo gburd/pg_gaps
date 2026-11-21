@@ -8,7 +8,11 @@ from weights at grounding instead of stored, over each instance's missing
 parents only, so a logistic over 15 observed five-valued inputs costs one
 row per instance rather than 5^15.  `learn_cpts` keeps them fixed (method
 'fixed (<kind>)'), EM learns the other factors around them, and
-`cpt_rows` shows their computed table.
+`cpt_rows` shows their computed table.  A parent of such a factor may
+aggregate (`aggregate => ARRAY[true, ...]`): a child then maps to any
+number of parent entities there, which share the slot's parameters, and
+grounding expands them into an OR chain or count chains of internal
+auxiliary variables, so inference stays exact.
 
 `gaps.marginals` and `gaps.impute` take optional `rel` and `entities`
 arguments: given a jsonb array of entity keys of `rel` (the form the

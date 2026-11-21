@@ -310,6 +310,178 @@ RESET gaps.max_factor_cells;
 SELECT gaps.drop_model('cr');
 DROP TABLE cr;
 
+-- Aggregating parents (doc/DESIGN.md, "Aggregating parents").  Person p
+-- has n emails, each with a latent state; the person's state is the child
+-- of one aggregating slot over all of them.  The oracle declares the same
+-- distribution with n explicit parent stripes (email k of the person,
+-- k = 1 .. n) and a dense CPT from the formula with the slot's parameters
+-- repeated per parent.  n runs 0 .. 8, evidence is random.
+CREATE TABLE person (pid int PRIMARY KEY, st text);
+CREATE TABLE mail (pid int, k int, st text, PRIMARY KEY (pid, k));
+CREATE FUNCTION build_agg(seed float8, form text, OUT n int, OUT kind text)
+LANGUAGE plpgsql AS $$
+DECLARE
+	m text := 'g' || form;
+	kc int;
+	ec int;
+	params float8[];
+	full_params float8[];
+	pr float8[];
+BEGIN
+	PERFORM setseed(seed);
+	n := floor(random() * 9)::int;
+	kind := CASE WHEN random() < 0.5 THEN 'logistic' ELSE 'noisy_or' END;
+	kc := CASE WHEN kind = 'noisy_or' THEN 2 ELSE 2 + floor(random() * 2)::int END;
+	ec := 2 + floor(random() * 2)::int;
+	TRUNCATE person, mail;
+	INSERT INTO person SELECT i, CASE WHEN random() < 0.5 THEN 'v' || floor(random() * kc) END
+	FROM generate_series(1, 3) i;
+	INSERT INTO mail SELECT i, j, CASE WHEN random() < 0.5 THEN 'v' || floor(random() * ec) END
+	FROM generate_series(1, 3) i, generate_series(1, n) j;
+	PERFORM gaps.create_model(m);
+	PERFORM gaps.declare_attribute(m, 'person', 'st',
+		ARRAY(SELECT 'v' || x FROM generate_series(0, kc - 1) x));
+	PERFORM gaps.declare_attribute(m, 'mail', 'st',
+		ARRAY(SELECT 'v' || x FROM generate_series(0, ec - 1) x));
+	PERFORM gaps.add_stripe(m, 'ps', 'person', 'st');
+	PERFORM gaps.add_stripe(m, 'ms', 'mail', 'st');
+	pr := ARRAY(SELECT 0.1 + random() FROM generate_series(1, ec));
+	PERFORM gaps.add_factor(m, 'pm', 'ms', '{}',
+		ARRAY(SELECT x / (SELECT sum(y) FROM unnest(pr) y) FROM unnest(pr) x));
+	IF kind = 'noisy_or' THEN
+		params := ARRAY[random(), random()];
+		full_params := params[1] || array_fill(params[2], ARRAY[n]);
+	ELSE
+		-- Per class after the first: a bias, then ec weights.
+		params := ARRAY(SELECT random() * 4 - 2 FROM generate_series(1, (kc - 1) * (1 + ec)));
+		full_params := ARRAY(SELECT CASE WHEN i % (1 + n * ec) = 0
+										 THEN params[(i / (1 + n * ec)) * (1 + ec) + 1]
+										 ELSE params[(i / (1 + n * ec)) * (1 + ec) + 2
+													 + ((i % (1 + n * ec)) - 1) % ec] END
+							 FROM generate_series(0, (kc - 1) * (1 + n * ec) - 1) i ORDER BY i);
+	END IF;
+	IF form = 'a' THEN
+		PERFORM gaps.add_factor(m, 'comb', 'ps', ARRAY['ms'], kind => kind, params => params,
+								aggregate => ARRAY[true]);
+		PERFORM gaps.map_factor(m, 'comb', 1, 'pid', 'pid');
+		RETURN;
+	END IF;
+	FOR j IN 1 .. n LOOP
+		PERFORM gaps.add_stripe(m, 'm' || j, 'mail', 'st');
+		PERFORM gaps.add_stripe_qual(m, 'm' || j, 'k', '=', j::text);
+	END LOOP;
+	PERFORM gaps.add_factor(m, 'comb', 'ps', ARRAY(SELECT 'm' || j FROM generate_series(1, n) j),
+		dense(kind, full_params, kc, array_fill(ec, ARRAY[n])));
+	FOR j IN 1 .. n LOOP
+		PERFORM gaps.map_factor(m, 'comb', j, 'pid', 'pid');
+	END LOOP;
+END
+$$;
+CREATE TABLE cmpa (seed int, n int, kind text, attname name, entity jsonb, value text,
+				   pd float8, pa float8);
+DO $$
+DECLARE
+	b record;
+BEGIN
+	FOR s IN 1 .. 60 LOOP
+		b := build_agg(s / 100.0, 'd');
+		CREATE TEMP TABLE md AS SELECT * FROM gaps.marginals('gd');
+		PERFORM build_agg(s / 100.0, 'a');
+		INSERT INTO cmpa
+		SELECT s, b.n, b.kind, d.attname, d.entity, d.value, d.probability, a.probability
+		FROM md d FULL JOIN gaps.marginals('ga') a USING (attname, entity, value);
+		DROP TABLE md;
+		PERFORM gaps.drop_model('gd');
+		PERFORM gaps.drop_model('ga');
+	END LOOP;
+END
+$$;
+SELECT kind, count(DISTINCT seed) AS models, count(DISTINCT n) AS sizes, max(n) AS max_n,
+	   count(*) > 500 AS many_marginals,
+	   count(*) FILTER (WHERE pd IS NULL OR pa IS NULL) AS unmatched,
+	   count(*) FILTER (WHERE abs(pd - pa) > 1e-12) AS disagree
+FROM cmpa GROUP BY kind ORDER BY kind;
+SELECT count(*) AS bad_distributions FROM (
+	SELECT seed, attname, entity FROM cmpa GROUP BY seed, attname, entity
+	HAVING abs(sum(pa) - 1) > 1e-12 OR min(pa) < 0) x;
+-- No auxiliary variable is returned: every row is a declared attribute.
+SELECT count(*) FILTER (WHERE attname NOT IN ('st')) AS foreign_rows,
+	   count(DISTINCT seed) FILTER (WHERE n >= 2 AND attname = 'st'
+									AND entity ? 'k') AS models_with_mail_rows
+FROM cmpa;
+
+-- A restricted call follows an aggregating slot's one-to-many mapping in
+-- both directions and grounds the chains with their instance: asking for
+-- one person, or for one of a person's mails, gives the rows of the
+-- unrestricted call bit for bit.
+SELECT build_agg(0.42, 'a');
+UPDATE person SET st = NULL WHERE pid = 1;
+UPDATE mail SET st = NULL WHERE pid = 2 AND k = 1;
+SELECT count(*) AS requested, count(u.*) AS matched,
+	   count(*) FILTER (WHERE r.probability IS DISTINCT FROM u.probability) AS differ
+FROM (SELECT * FROM gaps.marginals('ga', 'person', '[{"pid": 1}]')
+	  UNION ALL
+	  SELECT * FROM gaps.marginals('ga', 'mail', '[{"pid": 2, "k": 1}]')) r
+	LEFT JOIN gaps.marginals('ga') u USING (rel, attname, entity, value);
+SELECT gaps.drop_model('ga');
+
+-- An aggregating slot needs a parameterised factor, one flag per parent.
+SELECT build_agg(0.01, 'a');
+SELECT gaps.add_factor('ga', 'bad', 'ps', ARRAY['ms'],
+	(SELECT array_agg(1.0 / k) FROM gaps.attribute a, generate_subscripts(a.domain, 1),
+		 LATERAL (SELECT cardinality(a.domain) AS k) x
+	 WHERE a.relname = 'public.person')::float8[]
+	|| (SELECT array_agg(1.0 / k) FROM gaps.attribute a, generate_subscripts(a.domain, 1),
+			LATERAL (SELECT cardinality(a.domain) AS k) x
+		WHERE a.relname = 'public.person')::float8[],
+	aggregate => ARRAY[true]);                                       -- fail: a CPT
+SELECT gaps.add_factor('ga', 'bad', 'ps', ARRAY['ms'], kind => 'noisy_or',
+	params => ARRAY[0.1, 0.2], aggregate => ARRAY[true, false]);     -- fail: length
+-- A component holding the chains' deterministic tables is never sampled:
+-- with the exact bound too small for it, sampling is refused.  A noisy-OR
+-- over 12 missing mails: its tables hold 145 cells, elimination needs
+-- more than 400.
+SELECT gaps.drop_model('ga');
+TRUNCATE person, mail;
+INSERT INTO person VALUES (1, 'v1');
+INSERT INTO mail SELECT 1, j, NULL FROM generate_series(1, 12) j;
+SELECT gaps.create_model('ga');
+SELECT gaps.declare_attribute('ga', 'person', 'st', ARRAY['v0', 'v1']);
+SELECT gaps.declare_attribute('ga', 'mail', 'st', ARRAY['v0', 'v1', 'v2']);
+SELECT gaps.add_stripe('ga', 'ps', 'person', 'st');
+SELECT gaps.add_stripe('ga', 'ms', 'mail', 'st');
+SELECT gaps.add_factor('ga', 'pm', 'ms', '{}', ARRAY[0.2, 0.3, 0.5]);
+SELECT gaps.add_factor('ga', 'comb', 'ps', ARRAY['ms'], kind => 'noisy_or',
+	params => ARRAY[0.1, 0.3], aggregate => ARRAY[true]);
+SELECT gaps.map_factor('ga', 'comb', 1, 'pid', 'pid');
+SELECT count(*) AS marginals FROM gaps.marginals('ga');
+SET gaps.max_total_cells = 400;
+SET gaps.samples = 100;
+SELECT count(*) FROM gaps.marginals('ga');                           -- fail: not positive
+RESET gaps.samples;
+RESET gaps.max_total_cells;
+-- A count chain over many members is bounded: a logistic slot over 31
+-- missing three-valued members needs a link of 465 x 3 x 496 cells.
+SELECT gaps.drop_model('ga');
+TRUNCATE person, mail;
+INSERT INTO person VALUES (1, NULL);
+INSERT INTO mail SELECT 1, j, NULL FROM generate_series(1, 31) j;
+SELECT gaps.create_model('gl');
+SELECT gaps.declare_attribute('gl', 'person', 'st', ARRAY['v0', 'v1']);
+SELECT gaps.declare_attribute('gl', 'mail', 'st', ARRAY['v0', 'v1', 'v2']);
+SELECT gaps.add_stripe('gl', 'ps', 'person', 'st');
+SELECT gaps.add_stripe('gl', 'ms', 'mail', 'st');
+SELECT gaps.add_factor('gl', 'pm', 'ms', '{}', ARRAY[0.2, 0.3, 0.5]);
+SELECT gaps.add_factor('gl', 'comb', 'ps', ARRAY['ms'], kind => 'logistic',
+	params => ARRAY[0.1, 0.2, 0.3, 0.4], aggregate => ARRAY[true]);
+SELECT gaps.map_factor('gl', 'comb', 1, 'pid', 'pid');
+SET gaps.max_factor_cells = 100000;
+SELECT count(*) FROM gaps.marginals('gl');                           -- fail: too big
+RESET gaps.max_factor_cells;
+SELECT gaps.drop_model('gl');
+DROP TABLE cmpa, person, mail;
+DROP FUNCTION build_agg(float8, text);
+
 DROP TABLE rt, cmp;
 DROP FUNCTION build(float8, text), dense(text, float8[], int, int[]),
 	formula(text, float8[], int, int[], int[], int);

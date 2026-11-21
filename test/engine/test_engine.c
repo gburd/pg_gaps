@@ -1621,7 +1621,7 @@ pgen(pcase *pc)
 	{
 		int			n;
 
-		pc->slot_card[s] = 1 + rnd(3);
+		pc->slot_card[s] = 1 + rnd(4);
 		pc->slot_agg[s] = (unsigned char) rnd(2);
 		n = pc->slot_agg[s] ? rnd(PMAXM / f->nslots + 1) : 1;
 		pc->off[s] = nm;
@@ -1685,7 +1685,7 @@ check_param_case(uint64_t cseed)
 	pcase		pc;
 	int			card[PMAXM + 1 + 64],
 				ev[PMAXM + 1 + 64];
-	double		prior[PMAXM][3];
+	double		prior[PMAXM][4];
 	double	   *dense;
 	int			dpar[PMAXM];
 	gx_cpt		cpts[PMAXM + 1 + 64];

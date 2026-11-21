@@ -601,6 +601,47 @@ fills two parent slots is one parent of the table.  The tables of a
 model's parameterised factors follow all its CPTs in the network's `cpts`
 array.
 
+**Aggregating parents.**  A person has many e-mails, and a combiner over
+them has a different number of parents per person.  A parent slot of a
+parameterised factor may aggregate (`gaps.factor_parent.aggregate`,
+`add_factor(..., aggregate => ARRAY[...])`, one flag per parent): a child
+entity may then map to any number of parent entities there, zero
+included, where an ordinary slot needs exactly one.  The slot's parents
+are exchangeable and share its parameters (one p for noisy-OR, one weight
+per value for logistic), so `params` has the same length as for one
+parent.  Only parameterised factors may aggregate; the trigger refuses an
+aggregating slot on a CPT factor.
+
+Exact inference stays tractable through auxiliary variables built with
+the instance (`gx_param.c`), over its missing members only (observed ones
+are folded in as for any parent):
+
+- noisy-OR: an OR chain z_1 .. z_n over every missing member of every
+  aggregating slot, z_j = z_(j-1) OR (member j fires), each link a table
+  of 2 x |member| x 2 cells; the child's table has z_n as one parent.
+- logistic: per aggregating slot, a count chain c_1 .. c_n where c_j is
+  the vector of counts of each value among the first j missing members,
+  one value per such vector (C(j + V - 1, V - 1) of them for V values).
+  Each link is deterministic; the child's scores depend on the slot only
+  through c_n.  A slot of n missing binary members costs O(n^2) cells,
+  ternary O(n^3).
+
+Each auxiliary table is held to `gaps.max_factor_cells` and an instance's
+tables together to `gaps.max_total_cells`, both checked before
+allocation; past either the call is an `ERROR` naming the variable and
+the limits.  The auxiliary variables are missing, belong to no attribute,
+and are never returned or learned.  Their tables contain zeros, so a
+component holding them is solved exactly or refused, never sampled: the
+existing positivity rule (`GX_ENOTPOS`) refuses it, and `sql/param.sql`
+checks that it does.
+
+A restricted call (`marginals(model, rel, entities)`) reaches an
+aggregating slot's parents and children through the same closure as any
+mapping, in both directions (the closure ignores how many entities a
+mapping reaches), and the chains are built from the grounded instance, so
+they come with it; `sql/param.sql` checks restricted rows equal
+unrestricted ones bit for bit.
+
 `learn_cpts` does not learn parameterised factors: they keep their
 `params`, their rows report method `'fixed (<kind>)'` with no count, and
 EM conditions on their tables as they are while it learns the CPTs

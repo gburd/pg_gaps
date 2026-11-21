@@ -34,6 +34,7 @@ typedef struct pctx
 	const gx_pinst *in;
 	gx_pcpt    *out;
 	int			nout;			/* CPTs built so far */
+	size_t		total;			/* their cells */
 	int			err;
 } pctx;
 
@@ -53,13 +54,23 @@ pa_alloc(pctx *c, size_t size)
 /*
  * Start CPT number c->nout for child, with nparents parents and a table of
  * cells = (product of the parents' cardinalities) x card cells, which the
- * caller has checked against env->max_cells.  Returns it, or NULL with
- * c->err set.
+ * caller has checked against env->max_cells.  The instance's tables
+ * together are held to env->max_total_cells, checked here before each is
+ * allocated.  Returns it, or NULL with c->err set.
  */
 static gx_pcpt *
 new_cpt(pctx *c, int child, int card, int nparents, size_t cells)
 {
 	gx_pcpt    *t = &c->out[c->nout];
+
+	if (c->err)
+		return NULL;
+	if (cells > c->env->max_total_cells - c->total || c->total > c->env->max_total_cells)
+	{
+		c->err = GX_ETOOBIG;
+		return NULL;
+	}
+	c->total += cells;
 
 	t->child = child;
 	t->card = card;
@@ -714,7 +725,7 @@ int
 gx_param_ground(const gx_env *env, const gx_pfactor *f, const gx_pinst *in,
 				gx_pcpt *out)
 {
-	pctx		c = {env, f, in, out, 0, GX_OK};
+	pctx		c = {env, f, in, out, 0, 0, GX_OK};
 	int		   *ws;
 	int			rc;
 

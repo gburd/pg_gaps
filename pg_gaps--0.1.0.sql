@@ -62,6 +62,7 @@ CREATE TABLE gaps.factor_parent (
 	factor_id	int NOT NULL REFERENCES gaps.factor ON DELETE CASCADE,
 	ord			int NOT NULL,
 	parent_stripe int NOT NULL REFERENCES gaps.stripe ON DELETE CASCADE,
+	aggregate	boolean NOT NULL DEFAULT false,	-- any number of exchangeable parents
 	PRIMARY KEY (factor_id, ord)
 );
 
@@ -431,6 +432,14 @@ AS $$
 BEGIN
 	IF TG_TABLE_NAME = 'factor' THEN
 		PERFORM gaps._cpt_check(NEW.factor_id, false);
+		IF NEW.kind = 'cpt' AND EXISTS (SELECT 1 FROM gaps.factor_parent fp
+										WHERE fp.factor_id = NEW.factor_id AND fp.aggregate) THEN
+			RAISE EXCEPTION 'factor "%" is a CPT and cannot have an aggregating parent', NEW.name;
+		END IF;
+	ELSIF NEW.aggregate AND EXISTS (SELECT 1 FROM gaps.factor f WHERE f.factor_id = NEW.factor_id
+								   AND f.kind = 'cpt') THEN
+		RAISE EXCEPTION 'parent % of a CPT factor cannot aggregate', NEW.ord
+			USING HINT = 'Only logistic and noisy_or factors have aggregating parents.';
 	ELSIF EXISTS (SELECT 1 FROM gaps.factor f WHERE f.factor_id = NEW.factor_id
 				  AND f.child_stripe = NEW.parent_stripe) THEN
 		RAISE EXCEPTION 'a stripe cannot be a parent of itself';
@@ -589,10 +598,14 @@ $$;
 -- and 'noisy_or' have params instead, from which grounding computes each
 -- instance's table (doc/DESIGN.md, "Parameterised factors").  The first
 -- five arguments keep their positions, so kind and params are best passed
--- by name.
+-- by name.  aggregate, one boolean per parent (NULL: none), marks the
+-- parents that aggregate: a child entity may map to any number of parent
+-- entities there, and they share the slot's parameters (doc/DESIGN.md,
+-- "Aggregating parents").
 CREATE FUNCTION gaps.add_factor(model text, factor text, child text,
 								parents text[] DEFAULT '{}', cpt float8[] DEFAULT NULL,
-								kind text DEFAULT 'cpt', params float8[] DEFAULT NULL)
+								kind text DEFAULT 'cpt', params float8[] DEFAULT NULL,
+								aggregate boolean[] DEFAULT NULL)
 RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -604,9 +617,14 @@ BEGIN
 	INSERT INTO gaps.factor (model_id, name, child_stripe, cpt, kind, params)
 	VALUES (m, factor, gaps._stripe_id(model, child), cpt, coalesce(kind, 'cpt'), params)
 	RETURNING factor_id INTO f;
+	IF aggregate IS NOT NULL AND (coalesce(array_ndims(aggregate), 1) <> 1
+								  OR cardinality(aggregate) <> coalesce(cardinality(parents), 0)
+								  OR array_position(aggregate, NULL) IS NOT NULL) THEN
+		RAISE EXCEPTION 'aggregate must have one true or false per parent of factor "%"', factor;
+	END IF;
 	FOR i IN 1 .. coalesce(array_length(parents, 1), 0) LOOP
-		INSERT INTO gaps.factor_parent (factor_id, ord, parent_stripe)
-		VALUES (f, i, gaps._stripe_id(model, parents[i]));
+		INSERT INTO gaps.factor_parent (factor_id, ord, parent_stripe, aggregate)
+		VALUES (f, i, gaps._stripe_id(model, parents[i]), coalesce(aggregate[i], false));
 	END LOOP;
 	PERFORM gaps._cpt_check(f, true);
 END
@@ -1918,6 +1936,57 @@ BEGIN
 END
 $$;
 
+-- The step of gaps._ground_parent for an aggregating parent: every
+-- distinct parent entity each child entity's rows reach through pjoin (the
+-- mapping and the parent stripe's predicate over p and c), one
+-- pg_gaps_inst row each, none for a child that reaches none.  A reached
+-- parent row without an entity can only come from a concurrent change and
+-- is an error, as for any parent.  Restricted groundings read the child
+-- rows by key (gaps._key_match), as gaps._parent_by_key_sql does.  The
+-- number of parents a child may have is bounded where it costs memory,
+-- in gaps._param_cpts (each auxiliary table and each instance's total).
+CREATE FUNCTION gaps._ground_parent_agg(fid int, parent_ord int, a gaps.attribute,
+	pa gaps.attribute, pjoin text, wclause text, params text[], restricted boolean)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	ct record;
+	pt record;
+	crows text;
+	bad record;
+BEGIN
+	SELECT k.ktab, k.etab INTO ct FROM pg_gaps_keys k WHERE k.attribute_id = a.attribute_id;
+	SELECT k.ktab, k.etab INTO pt FROM pg_gaps_keys k WHERE k.attribute_id = pa.attribute_id;
+	IF restricted THEN
+		crows := format('pg_temp.%I rc JOIN %s c ON rc.attribute_id = $3 AND %s',
+						ct.etab, a.rel, gaps._key_match(a, 'c', '(rc.k).k%1$s'));
+	ELSE
+		crows := format('%s c JOIN pg_temp.%I rc ON rc.attribute_id = $3 AND rc.k = %s',
+						a.rel, ct.etab, gaps._key_row(a, 'c', ct.ktab));
+	END IF;
+	EXECUTE format(
+		'INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
+		'SELECT DISTINCT $2, rc.v, $5, rp.v '
+		'FROM %s JOIN %s p ON TRUE%s '
+		'LEFT JOIN pg_temp.%I rp ON rp.attribute_id = $4 AND rp.k = %s '
+		'WHERE TRUE%s',
+		crows, pa.rel, pjoin, pt.etab, gaps._key_row(pa, 'p', pt.ktab), wclause)
+		USING params, fid, a.attribute_id, pa.attribute_id, parent_ord;
+	SELECT i.v INTO bad FROM pg_gaps_inst i
+	WHERE i.factor_id = fid AND i.ord = parent_ord AND i.pv IS NULL
+	ORDER BY i.v LIMIT 1;
+	IF bad.v IS NOT NULL THEN
+		RAISE EXCEPTION 'factor "%": a parent row of child entity % has no entity in parent %',
+			(SELECT name FROM gaps.factor WHERE factor_id = fid),
+			gaps._entity_name(a.attribute_id, bad.v), parent_ord
+			USING HINT = 'The table changed while grounding read it.  Run in a REPEATABLE READ '
+				'transaction for one snapshot.';
+	END IF;
+END
+$$;
+
 -- A step of gaps._ground: the instances of factor fid's parent parent_ord
 -- (ord parent_ord in pg_gaps_inst), one per child variable of the factor,
 -- whose ord-0 instances must already be in pg_gaps_inst.  a is the
@@ -1948,8 +2017,9 @@ DECLARE
 	on_clause text;
 	wp record;
 	bad record;
+	agg boolean;
 BEGIN
-	SELECT fa.name, fp.parent_stripe INTO fname, pstripe
+	SELECT fa.name, fp.parent_stripe, fp.aggregate INTO fname, pstripe, agg
 	FROM gaps.factor fa JOIN gaps.factor_parent fp USING (factor_id)
 	WHERE fa.factor_id = fid AND fp.ord = parent_ord;
 	SELECT at.* INTO pa FROM gaps.stripe s JOIN gaps.attribute at USING (attribute_id)
@@ -1974,7 +2044,7 @@ BEGIN
 		-- entities on the key, and the user's table is not read again; a
 		-- child with no such parent entity can only come from a concurrent
 		-- change, and gets pv NULL, as below.
-		IF wp.clause = '' THEN
+		IF wp.clause = '' AND NOT agg THEN
 			EXECUTE format('INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
 						   'SELECT $1, i.v, $2, rp.v FROM pg_gaps_inst i '
 						   'JOIN pg_temp.%I rc ON rc.attribute_id = $3 AND rc.v = i.v '
@@ -1996,7 +2066,12 @@ BEGIN
 	-- Exactly one gives its v; anything else is stored as minus the number
 	-- reached, and a reached parent row with no entity as NULL, and is
 	-- reported below.  The restricted form is gaps._parent_by_key_sql.
-	IF on_clause IS NOT NULL AND restricted THEN
+	-- An aggregating parent keeps every parent entity instead.
+	IF agg THEN
+		PERFORM gaps._ground_parent_agg(fid, parent_ord, a, pa, on_clause || wp.clause,
+										wclause, wparams || wp.params, restricted);
+		RETURN;
+	ELSIF on_clause IS NOT NULL AND restricted THEN
 		EXECUTE gaps._parent_by_key_sql(a, pa, on_clause || wp.clause, wclause)
 			USING wparams || wp.params, fid, parent_ord, a.attribute_id, pa.attribute_id;
 	ELSIF on_clause IS NOT NULL THEN
@@ -2071,7 +2146,7 @@ DECLARE
 BEGIN
 	SELECT * INTO fr FROM gaps.factor WHERE factor_id = fid;
 	SELECT count(*), coalesce(array_agg(gaps._card(fp.parent_stripe) ORDER BY fp.ord), '{}'),
-		   coalesce(array_agg(false ORDER BY fp.ord), '{}')
+		   coalesce(array_agg(fp.aggregate ORDER BY fp.ord), '{}')
 	INTO ns, scard, sagg
 	FROM gaps.factor_parent fp WHERE fp.factor_id = fid;
 

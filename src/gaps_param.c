@@ -203,10 +203,11 @@ report(int rc, int child)
 	if (rc == GX_ETOOBIG)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("a parameterised factor's CPT for variable %d would have more than "
-						"gaps.max_factor_cells (%d) cells", child, gaps_max_factor_cells),
-				 errhint("Raise gaps.max_factor_cells, or give the instance fewer missing "
-						 "parents.")));
+				 errmsg("a parameterised factor's tables for variable %d need a table of more "
+						"than gaps.max_factor_cells (%d) cells, or more than "
+						"gaps.max_total_cells (%d) together", child, gaps_max_factor_cells,
+						gaps_max_total_cells),
+				 errhint("Raise the limits, or give the instance fewer missing parents.")));
 	if (rc == GX_ENOMEM)
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
@@ -220,28 +221,18 @@ report(int rc, int child)
 
 /*
  * Ground one instance and append its CPTs to o.  The instance's CPTs land
- * in one component, so their total is bounded by gaps.max_total_cells.
+ * in one component, so gx_param_ground bounds their total by
+ * gaps.max_total_cells as well as each by gaps.max_factor_cells.
  */
 static void
 emit_instance(const gx_env *env, const gx_pfactor *f, const gx_pinst *in, pout *o)
 {
 	int			naux = gx_param_naux(f, in);
 	gx_pcpt    *t = palloc(sizeof(gx_pcpt) * (size_t) (naux + 1));
-	size_t		total = 0;
 	int			rc;
 
 	rc = gx_param_ground(env, f, in, t);
 	report(rc, in->child);
-	for (int i = 0; i <= naux; i++)
-	{
-		total += t[i].ncells;
-		if (total > (size_t) gaps_max_total_cells)
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("a parameterised factor's CPTs for variable %d would hold more "
-							"than gaps.max_total_cells (%d) cells", in->child,
-							gaps_max_total_cells)));
-	}
 	for (int i = 0; i <= naux; i++)
 	{
 		if (i < naux)
@@ -349,6 +340,7 @@ gaps_param_cpts(PG_FUNCTION_ARGS)
 		bad_arg("first_aux must be positive");
 
 	env.max_cells = (size_t) gaps_max_factor_cells;
+	env.max_total_cells = (size_t) gaps_max_total_cells;
 	memset(&o, 0, sizeof(o));
 	o.aux_card.elem = o.child.elem = o.parent_off.elem = o.parents.elem =
 		o.cpt_off.elem = sizeof(int);
