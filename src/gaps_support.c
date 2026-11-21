@@ -199,8 +199,9 @@ estimate_rows(GapsSrf srf, Datum *args, PlannerGlobal *glob, double *rows)
 
 	/*
 	 * One row per attribute, or one row of NULLs for a model with no
-	 * attributes (of rel, for a restricted call).  Every attribute's random variables are all of its
-	 * entities, whatever its stripes, so stripe predicates do not enter.
+	 * attributes (of rel, for a restricted call).  Every attribute's random
+	 * variables are all of its entities, whatever its stripes, so stripe
+	 * predicates do not enter.
 	 */
 	*rows = 0;
 	for (uint64 i = 0; i < SPI_processed; i++)

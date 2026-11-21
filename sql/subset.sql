@@ -166,6 +166,71 @@ SELECT count(*) FROM gaps.marginals('c', 'reading', '[{"sid": 3, "t": 3}]');
 SELECT count(*) AS grounded_rvs FROM pg_gaps_rv;
 COMMIT;
 
+-- A key column marked NOT NULL that still holds a NULL: its entity is
+-- found like any other.  n1's parent is made NOT NULL with ALTER TABLE
+-- ONLY over a child that holds the NULL; on PostgreSQL 18 and later n2's
+-- is a NOT VALID constraint over the NULL (before 18, a plain nullable
+-- column, with the same result).
+SELECT current_setting('server_version_num')::int >= 180000 AS pg18 \gset
+CREATE TABLE np (id int PRIMARY KEY, x text);
+INSERT INTO np VALUES (1, NULL), (2, NULL);
+CREATE TABLE n1 (a int, b int, y text);
+CREATE TABLE n1_kid () INHERITS (n1);
+INSERT INTO n1_kid VALUES (1, NULL, 'q'), (2, 5, 'q');
+ALTER TABLE ONLY n1 ALTER b SET NOT NULL;
+CREATE TABLE n2 (a int, b int, y text);
+INSERT INTO n2 VALUES (1, NULL, 'q'), (2, 5, 'q');
+\if :pg18
+ALTER TABLE n2 ADD CONSTRAINT n2_b NOT NULL b NOT VALID;
+\endif
+SELECT gaps.create_model('n');
+SELECT gaps.declare_attribute('n', 'np', 'x', ARRAY['p', 'q']);
+SELECT gaps.declare_attribute('n', 'n1', 'y', ARRAY['p', 'q'], ARRAY['a', 'b']::name[]);
+SELECT gaps.declare_attribute('n', 'n2', 'y', ARRAY['p', 'q'], ARRAY['a', 'b']::name[]);
+SELECT gaps.add_stripe('n', 'x', 'np', 'x');
+SELECT gaps.add_stripe('n', 'y1', 'n1', 'y');
+SELECT gaps.add_stripe('n', 'y2', 'n2', 'y');
+SELECT gaps.add_factor('n', 'x', 'x', '{}', ARRAY[0.5, 0.5]);
+SELECT gaps.add_factor('n', 'y1', 'y1', ARRAY['x'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT gaps.add_factor('n', 'y2', 'y2', ARRAY['x'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT gaps.map_factor('n', 'y1', 1, 'a', 'id');
+SELECT gaps.map_factor('n', 'y2', 1, 'a', 'id');
+SELECT * FROM same('n', 'np', '[{"id": 1}, {"id": 2}]');
+-- Entity 1's x has two observed children, one through each NULL key.
+SELECT value, probability FROM gaps.marginals('n', 'np', '[{"id": 1}]') ORDER BY value;
+
+-- Key names in mixed case: matched whatever the database's collation.
+CREATE TABLE mc ("B" int, a int, y text, PRIMARY KEY ("B", a));
+INSERT INTO mc VALUES (1, 1, NULL), (1, 2, 'p');
+SELECT gaps.create_model('mc');
+SELECT gaps.declare_attribute('mc', 'mc', 'y', ARRAY['p', 'q']);
+SELECT gaps.add_stripe('mc', 'y', 'mc', 'y');
+SELECT gaps.add_factor('mc', 'y', 'y', '{}', ARRAY[0.3, 0.7]);
+SELECT * FROM same('mc', 'mc', '[{"B": 1, "a": 1}, {"a": 2, "B": 1}]');
+
+-- A chain of vertical factors costs a closure round per step, so on a long
+-- one the closure gives up and the whole model is grounded (all 300
+-- variables), with the same answers for the requested entity.
+CREATE TABLE ch (id int PRIMARY KEY, prev int, s int, y text);
+INSERT INTO ch SELECT i, i - 1, least(i - 1, 1), CASE WHEN i % 50 = 0 THEN 'p' END
+FROM generate_series(1, 300) i;
+ANALYZE ch;
+SELECT gaps.create_model('ch');
+SELECT gaps.declare_attribute('ch', 'ch', 'y', ARRAY['p', 'q']);
+SELECT gaps.add_stripe('ch', 'y', 'ch', 'y');
+SELECT gaps.add_stripe('ch', 'y0', 'ch', 'y');
+SELECT gaps.add_stripe_qual('ch', 'y0', 's', '=', '0');
+SELECT gaps.add_stripe('ch', 'y1', 'ch', 'y');
+SELECT gaps.add_stripe_qual('ch', 'y1', 's', '=', '1');
+SELECT gaps.add_factor('ch', 'y0', 'y0', '{}', ARRAY[0.4, 0.6]);
+SELECT gaps.add_factor('ch', 'y1', 'y1', ARRAY['y'], ARRAY[0.9, 0.1, 0.2, 0.8]);
+SELECT gaps.map_factor('ch', 'y1', 1, 'prev', 'id');
+SELECT * FROM same('ch', 'ch', '[{"id": 1}, {"id": 7}]');
+BEGIN;
+SELECT count(*) FROM gaps.marginals('ch', 'ch', '[{"id": 7}]');
+SELECT count(*) AS grounded_rvs FROM pg_gaps_rv;
+COMMIT;
+
 -- Random models (AGENTS.md rule 13): restricted equals unrestricted on
 -- every one.  Over table rnd, x is keyed by id or, coarse, by grp; y by id
 -- with parent x (by grp when x is coarse) and maybe z; z by id, either
@@ -249,5 +314,8 @@ SELECT gaps.drop_model('nb');
 SELECT gaps.drop_model('m');
 SELECT gaps.drop_model('o');
 SELECT gaps.drop_model('c');
-DROP TABLE em, sensor, occ, health, reading;
+SELECT gaps.drop_model('n');
+SELECT gaps.drop_model('mc');
+SELECT gaps.drop_model('ch');
+DROP TABLE em, sensor, occ, health, reading, np, n1, n1_kid, n2, mc, ch;
 DROP FUNCTION same;

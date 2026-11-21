@@ -1055,16 +1055,17 @@ LANGUAGE C STRICT VOLATILE;
 -- attribute whose key has that shape: (attribute_id int, v int, k ktab,
 -- ev int), v the variable number and ev the evidence code as in
 -- pg_gaps_rv, and ctab, the closure table of a restricted call
--- (gaps._ground_closure).  The names are a hash of the shape, the types, typmods and
--- collations in key order but not the column names, so attributes whose
--- keys have the same types share both tables whatever the columns are
--- called (gaps._entity_json gives the names back), and a key column whose
--- type changes gets new ones.  NB: call gaps._resolve on every attribute
--- first; a missing key column would drop out of the hash.  Each key
--- column is looked up by name alone, one scalar subquery per column, so
--- that pg_attribute's index on (attrelid, attname) answers (a join was
--- planned as a scan of every column of the relation per attribute); no
--- user column shares a system column's name, so attnum > 0 adds nothing.
+-- (gaps._ground_closure).  The names are a hash of the shape, the types,
+-- typmods and collations in key order but not the column names, so
+-- attributes whose keys have the same types share the tables whatever the
+-- columns are called (gaps._entity_json gives the names back), and a key
+-- column whose type changes gets new ones.  NB: call gaps._resolve on
+-- every attribute first; a missing key column would drop out of the
+-- hash.  Each key column is looked up by name alone, one scalar subquery
+-- per column, so that pg_attribute's index on (attrelid, attname) answers
+-- (a join was planned as a scan of every column of the relation per
+-- attribute); no user column shares a system column's name, so attnum > 0
+-- adds nothing.
 CREATE FUNCTION gaps._key_tables(m int,
 	OUT attribute_id int, OUT ktab text, OUT etab text, OUT ctab text)
 RETURNS SETOF record
@@ -1196,28 +1197,96 @@ BEGIN
 END
 $$;
 
+-- For a restricted grounding, which of attribute a's key columns may hold
+-- a NULL in some row grounding reads (nullable, in key order), and whether
+-- gaps._key_match should add record equality (hashed).  A column holds no
+-- NULL when it is attnotnull in a's relation and in each of its
+-- inheritance children and partitions, all of which a scan reads, and no
+-- not-null constraint of theirs is unvalidated.  The parent's attnotnull
+-- alone does not promise it: a NOT VALID not-null constraint (PostgreSQL
+-- 18 and later) sets attnotnull over existing NULLs, and on a parent made
+-- NOT NULL by ALTER TABLE ONLY (any version) or with NO INHERIT (18 and
+-- later) a child can hold NULLs.  pg_constraint has no not-null rows
+-- before 18, so there attnotnull decides alone.  An unvalidated not-null
+-- constraint on any column of those tables makes every key column count
+-- as nullable: rare, slower, never wrong.  hashed is true when some key
+-- column is nullable and no index of a's relation leads with a key
+-- column (gaps._key_match says why).
+CREATE FUNCTION gaps._key_nulls(a gaps.attribute, OUT nullable boolean[], OUT hashed boolean)
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	tabs oid[] := ARRAY[a.rel::oid];
+	unvalidated boolean;
+BEGIN
+	-- The tables a scan of a.rel reads: it, and when it has any (as
+	-- relhassubclass says, which may stay true after they are gone), every
+	-- relation that inherits from it, directly or not, partitions included.
+	IF (SELECT c.relhassubclass FROM pg_class c WHERE c.oid = a.rel) THEN
+		WITH RECURSIVE d(oid) AS (
+			SELECT a.rel::oid
+			UNION
+			SELECT h.inhrelid FROM d JOIN pg_inherits h ON h.inhparent = d.oid)
+		SELECT array_agg(d.oid) INTO tabs FROM d;
+	END IF;
+	SELECT EXISTS (SELECT 1 FROM pg_constraint c
+				   WHERE c.conrelid = ANY (tabs) AND c.contype = 'n' AND NOT c.convalidated)
+	INTO unvalidated;
+	SELECT array_agg(unvalidated OR EXISTS (
+						 SELECT 1 FROM pg_attribute t
+						 WHERE t.attrelid = ANY (tabs) AND t.attname = u.k
+						   AND NOT t.attnotnull) ORDER BY u.o)
+	INTO nullable
+	FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o);
+	hashed := true = ANY (nullable)
+		AND NOT EXISTS (SELECT 1 FROM pg_index i JOIN pg_attribute t
+						  ON t.attrelid = i.indrelid AND t.attnum = i.indkey[0]
+						WHERE i.indrelid = a.rel AND t.attname = ANY (a.entity_keys));
+END
+$$;
+
 -- A join condition: attribute a's entity key over the rows of table
 -- alias equals another key, column by column, NULLs equal (as record
 -- equality and GROUP BY have it).  other is a format() string for the
 -- other side's column, given the key position as %1$s and the key
 -- column's name as %2$s: '(x.k).k%1$s' for the key composite of an entity
--- table, 'c.%2$I' for the same key columns of another row.  A NOT NULL column compares
--- with plain =, which the planner can hash or probe an index with; a
--- nullable one also matches two NULLs, an OR that only a nested loop can
--- use, through an index on the column.  This is what lets a restricted
--- grounding read the rows of the entities it needs rather than the table
--- (doc/DESIGN.md, "Restricted calls").
+-- table, 'c.%2$I' for the same key columns of another row.  A column that
+-- holds no NULL compares with plain =, which the planner can hash or
+-- probe an index with; any other column also matches two NULLs, an OR
+-- that an index on the column can answer for each side.  With no such
+-- index the OR leaves only a nested loop over the table, so the same test
+-- is added once more as record equality of the key type, which treats
+-- NULLs as equal and hashes.  This is what lets a restricted grounding
+-- read the rows of the entities it needs rather than the table
+-- (doc/DESIGN.md, "Restricted calls").  NB: for restricted groundings
+-- only, after gaps._ground_closure has filled pg_gaps_keys' nullable and
+-- hashed (gaps._key_nulls).
 CREATE FUNCTION gaps._key_match(a gaps.attribute, alias text, other text) RETURNS text
-LANGUAGE sql STABLE
+LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
-	SELECT string_agg(CASE WHEN t.attnotnull
-						   THEN format('%1$I.%2$I = %3$s', alias, k, format(other, o, k))
+DECLARE
+	k record;
+	cols text;
+	others text;
+BEGIN
+	SELECT x.ktab, x.nullable, x.hashed INTO k
+	FROM pg_gaps_keys x WHERE x.attribute_id = a.attribute_id;
+	SELECT string_agg(CASE WHEN NOT k.nullable[u.o]
+						   THEN format('%1$I.%2$I = %3$s', alias, u.k, format(other, u.o, u.k))
 						   ELSE format('(%1$I.%2$I = %3$s OR (%1$I.%2$I IS NULL AND %3$s IS NULL))',
-									   alias, k, format(other, o, k)) END,
-					  ' AND ' ORDER BY o)
-	FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o)
-		JOIN pg_attribute t ON t.attrelid = a.rel AND t.attname = u.k
+									   alias, u.k, format(other, u.o, u.k)) END,
+					  ' AND ' ORDER BY u.o),
+		   string_agg(format(other, u.o, u.k), ', ' ORDER BY u.o)
+	INTO cols, others
+	FROM unnest(a.entity_keys) WITH ORDINALITY u(k, o);
+	IF NOT k.hashed THEN
+		RETURN cols;
+	END IF;
+	RETURN format('%s = ROW(%s)::pg_temp.%I AND %s',
+				  gaps._key_row(a, alias, k.ktab), others, k.ktab, cols);
+END
 $$;
 
 -- The SQL to select one attribute's entities and their evidence:
@@ -1278,12 +1347,15 @@ $$;
 -- The first step of gaps._ground(m): every attribute's entities, with
 -- their evidence, numbered 1..n in attribute order and then key order,
 -- into the entity tables (gaps._key_tables) and pg_gaps_rv (v,
--- attribute_id, card, ev); pg_gaps_keys (attribute_id, ktab, etab) says
+-- attribute_id, card, ev); pg_gaps_keys (attribute_id, ktab, etab, ctab,
+-- and for a restricted call nullable and hashed, gaps._key_nulls) says
 -- which tables hold which attribute.  Fails naming the first entity whose
 -- rows disagree on the observed value or whose value is not in the
 -- domain.  With entities not NULL, only the entities of the closure of
--- the requested entities of relation rel (gaps._ground_closure).
-CREATE FUNCTION gaps._ground_entities(m int, rel regclass, entities jsonb) RETURNS void
+-- the requested entities of relation rel (gaps._ground_closure), unless
+-- that closure gives up for the whole model.  Returns whether the
+-- grounding is restricted to the closure.
+CREATE FUNCTION gaps._ground_entities(m int, rel regclass, entities jsonb) RETURNS boolean
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
@@ -1294,6 +1366,7 @@ DECLARE
 	n int;
 	bad record;
 	sql text;
+	restricted boolean := false;
 BEGIN
 	-- Every attribute's names still resolve, then each gets its tables,
 	-- named in one query; each shape's entity table is emptied once.
@@ -1305,10 +1378,10 @@ BEGIN
 		ON COMMIT DROP;
 	TRUNCATE pg_gaps_rv;
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_keys (
-		attribute_id int, ktab text, etab text, ctab text)
+		attribute_id int, ktab text, etab text, ctab text, nullable boolean[], hashed boolean)
 		ON COMMIT DROP;
 	TRUNCATE pg_gaps_keys;
-	INSERT INTO pg_gaps_keys SELECT * FROM gaps._key_tables(m);
+	INSERT INTO pg_gaps_keys (attribute_id, ktab, etab, ctab) SELECT * FROM gaps._key_tables(m);
 	ANALYZE pg_gaps_keys;
 	-- Each key shape holds about 16 locks until commit, in the lock table
 	-- every backend shares, so the number of shapes is bounded before any
@@ -1326,7 +1399,7 @@ BEGIN
 		PERFORM gaps._key_tables_reset(t.a, t.ktab, t.etab);
 	END LOOP;
 	IF entities IS NOT NULL THEN
-		PERFORM gaps._ground_closure(m, rel, entities);
+		restricted := gaps._ground_closure(m, rel, entities);
 	END IF;
 
 	-- One pass per attribute reads the table once: every entity is stored,
@@ -1345,7 +1418,7 @@ BEGIN
 					   'ELSE coalesce(array_position($2, e.ev[1]), -2) END '
 					   'FROM (%s) e', t.etab,
 					   gaps._entities_sql(a, t.ktab,
-										  CASE WHEN entities IS NULL THEN NULL ELSE t.ctab END))
+										  CASE WHEN restricted THEN t.ctab END))
 			USING a.attribute_id, a.domain, nv;
 		GET DIAGNOSTICS n = ROW_COUNT;
 		nv := nv + n;
@@ -1377,6 +1450,7 @@ BEGIN
 			trim(both '{}' from sql), a.relname, a.attname,
 			gaps._entity_name(a.attribute_id, bad.v), a.domain;
 	END IF;
+	RETURN restricted;
 END
 $$;
 
@@ -1387,8 +1461,11 @@ $$;
 -- cast to its key column's type.  Validates at the trust boundary: rel is
 -- a relation of model m, entities is an array of objects, every object
 -- names the entity keys of at least one attribute of rel, and every value
--- casts; each failure is an ERROR naming the entity.
-CREATE FUNCTION gaps._closure_seed(m int, rel regclass, entities jsonb) RETURNS void
+-- casts; each failure is an ERROR naming the entity.  Returns the number
+-- of rows added.  Key names compare as sorted arrays in the C collation on
+-- both sides: the database's collation could order mixed-case names
+-- differently from name's.
+CREATE FUNCTION gaps._closure_seed(m int, rel regclass, entities jsonb) RETURNS bigint
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
@@ -1396,12 +1473,15 @@ DECLARE
 	t record;
 	bad jsonb;
 	build text;
+	n bigint;
+	total bigint := 0;
 BEGIN
 	IF rel IS NULL THEN
 		RAISE EXCEPTION 'entities are given without rel'
 			USING HINT = 'Name the relation whose entities they are.';
 	END IF;
-	IF NOT EXISTS (SELECT 1 FROM gaps.attribute a WHERE a.model_id = m AND a.rel = _closure_seed.rel) THEN
+	IF NOT EXISTS (SELECT 1 FROM gaps.attribute a
+				   WHERE a.model_id = m AND a.rel = _closure_seed.rel) THEN
 		RAISE EXCEPTION 'relation % has no attribute in the model', rel;
 	END IF;
 	IF jsonb_typeof(entities) <> 'array' THEN
@@ -1415,8 +1495,10 @@ BEGIN
 	SELECT e INTO bad FROM jsonb_array_elements(entities) e
 	WHERE NOT EXISTS (SELECT 1 FROM gaps.attribute a
 					  WHERE a.model_id = m AND a.rel = _closure_seed.rel
-						AND (SELECT array_agg(x ORDER BY x) FROM unnest(a.entity_keys::text[]) x)
-							= (SELECT array_agg(x ORDER BY x) FROM jsonb_object_keys(e) x))
+						AND (SELECT array_agg(x ORDER BY x COLLATE "C")
+							 FROM unnest(a.entity_keys::text[]) x)
+							= (SELECT array_agg(x ORDER BY x COLLATE "C")
+							   FROM jsonb_object_keys(e) x))
 	LIMIT 1;
 	IF FOUND THEN
 		RAISE EXCEPTION 'entity % does not name the entity keys of any attribute of %', bad, rel
@@ -1437,10 +1519,14 @@ BEGIN
 		BEGIN
 			EXECUTE format('INSERT INTO pg_temp.%I (attribute_id, k, r) '
 						   'SELECT DISTINCT $1, %s, 0 FROM jsonb_array_elements($2) e '
-						   'WHERE (SELECT array_agg(x ORDER BY x) FROM jsonb_object_keys(e) x) '
-						   '= (SELECT array_agg(x::text ORDER BY x) FROM unnest($3) x) '
+						   'WHERE (SELECT array_agg(x ORDER BY x COLLATE "C") '
+						   'FROM jsonb_object_keys(e) x) '
+						   '= (SELECT array_agg(x::text ORDER BY x COLLATE "C") '
+						   'FROM unnest($3) x) '
 						   'ON CONFLICT DO NOTHING', t.ctab, build)
 				USING (t.a).attribute_id, entities, (t.a).entity_keys;
+			GET DIAGNOSTICS n = ROW_COUNT;
+			total := total + n;
 		EXCEPTION WHEN data_exception THEN
 			FOR bad IN SELECT e FROM jsonb_array_elements(entities) e LOOP
 				BEGIN
@@ -1452,6 +1538,7 @@ BEGIN
 			RAISE;
 		END;
 	END LOOP;
+	RETURN total;
 END
 $$;
 
@@ -1460,11 +1547,13 @@ $$;
 -- as round r the parent entities their child rows map to (up) or the
 -- child entities whose rows map to their parent rows (not up), through
 -- the factor's mapping and both stripes' predicates, the joins
--- gaps._ground_parent makes.  Returns the number of entities added.  Each
+-- gaps._ground_parent makes.  Adds at most lim entities, all new, and
+-- returns how many.  Each
 -- side is read by key (gaps._key_match), so a round costs in proportion
 -- to the frontier when the key columns and the mapping's columns are
 -- indexed (doc/DESIGN.md, "Restricted calls").
-CREATE FUNCTION gaps._closure_edge(fid int, parent_ord int, up boolean, r int) RETURNS bigint
+CREATE FUNCTION gaps._closure_edge(fid int, parent_ord int, up boolean, r int, lim bigint)
+RETURNS bigint
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
@@ -1504,28 +1593,33 @@ BEGIN
 		on_clause := ' AND ' || gaps._key_match(pa, 'p', 'c.%2$I');
 	END IF;
 
+	-- The entities already in the closure are left out before the LIMIT,
+	-- so that a limited insert that adds fewer than lim rows has added
+	-- every new entity of the edge.
 	IF up THEN
 		EXECUTE format(
-			'INSERT INTO pg_temp.%I (attribute_id, k, r) '
-			'SELECT DISTINCT $2, %s, $4 FROM pg_temp.%I x '
-			'JOIN %s c ON x.attribute_id = $3 AND x.r = $4 - 1 AND %s '
-			'JOIN %s p ON TRUE%s%s WHERE TRUE%s '
-			'ON CONFLICT DO NOTHING',
+			'INSERT INTO pg_temp.%1$I (attribute_id, k, r) '
+			'SELECT y.a, y.k, $4 FROM (SELECT DISTINCT $2 AS a, %2$s AS k FROM pg_temp.%3$I x '
+			'JOIN %4$s c ON x.attribute_id = $3 AND x.r = $4 - 1 AND %5$s '
+			'JOIN %6$s p ON TRUE%7$s%8$s WHERE TRUE%9$s) y '
+			'WHERE NOT EXISTS (SELECT 1 FROM pg_temp.%1$I z '
+			'WHERE z.attribute_id = y.a AND z.k = y.k) LIMIT $5',
 			pk.ctab, gaps._key_row(pa, 'p', pk.ktab), ck.ctab,
 			ca.rel, gaps._key_match(ca, 'c', '(x.k).k%1$s'),
 			pa.rel, on_clause, wp.clause, wc.clause)
-			USING wc.params || wp.params, pa.attribute_id, ca.attribute_id, r;
+			USING wc.params || wp.params, pa.attribute_id, ca.attribute_id, r, lim;
 	ELSE
 		EXECUTE format(
-			'INSERT INTO pg_temp.%I (attribute_id, k, r) '
-			'SELECT DISTINCT $2, %s, $4 FROM pg_temp.%I x '
-			'JOIN %s p ON x.attribute_id = $3 AND x.r = $4 - 1 AND %s '
-			'JOIN %s c ON TRUE%s%s WHERE TRUE%s '
-			'ON CONFLICT DO NOTHING',
+			'INSERT INTO pg_temp.%1$I (attribute_id, k, r) '
+			'SELECT y.a, y.k, $4 FROM (SELECT DISTINCT $2 AS a, %2$s AS k FROM pg_temp.%3$I x '
+			'JOIN %4$s p ON x.attribute_id = $3 AND x.r = $4 - 1 AND %5$s '
+			'JOIN %6$s c ON TRUE%7$s%8$s WHERE TRUE%9$s) y '
+			'WHERE NOT EXISTS (SELECT 1 FROM pg_temp.%1$I z '
+			'WHERE z.attribute_id = y.a AND z.k = y.k) LIMIT $5',
 			ck.ctab, gaps._key_row(ca, 'c', ck.ktab), pk.ctab,
 			pa.rel, gaps._key_match(pa, 'p', '(x.k).k%1$s'),
 			ca.rel, on_clause, wc.clause, wp.clause)
-			USING wc.params || wp.params, ca.attribute_id, pa.attribute_id, r;
+			USING wc.params || wp.params, ca.attribute_id, pa.attribute_id, r, lim;
 	END IF;
 	GET DIAGNOSTICS n = ROW_COUNT;
 	RETURN n;
@@ -1541,17 +1635,38 @@ $$;
 -- the evidence (no d-separation pruning), and is closed: every factor
 -- instance has its child and all its parents inside it or none, so
 -- grounding just these entities builds those components exactly.
--- Bounded (AGENTS.md rule 16) at 10,000,000 entities and 10,000 rounds.
-CREATE FUNCTION gaps._ground_closure(m int, rel regclass, entities jsonb) RETURNS void
+--
+-- Returns true when the caller should ground the closure, and false when
+-- grounding the whole model looks cheaper; the caller then grounds
+-- everything and still reports only the requested entities (the round-0
+-- rows), which gives the same probabilities.  A round costs about one
+-- statement per factor edge and direction whatever its frontier, which a
+-- long chain of vertical factors pays once per step, while grounding the
+-- whole model costs about its number of rows.  So the closure is given up
+-- once its statements, less an allowance of 100 for the whole-model
+-- call's fixed cost, times 25 (the measured ratio of a round's statement
+-- to a row of a whole-model grounding, doc/DESIGN.md, "Restricted
+-- calls") exceed the model's rows: the sum over its attributes of their
+-- relations' pg_class.reltuples.  Without statistics on every relation
+-- (reltuples -1) the closure is never given up.
+--
+-- Bounded (AGENTS.md rule 16) at 10,000,000 entities, the requested ones
+-- included, and 10,000 rounds, each an ERROR naming the limit.  Every
+-- insert is limited to one row past the entities left, so no round writes
+-- more than the bound before it is checked.
+CREATE FUNCTION gaps._ground_closure(m int, rel regclass, entities jsonb) RETURNS boolean
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+	cap constant bigint := 10000000;
 	t record;
 	e record;
 	r int := 0;
 	added bigint;
-	total bigint := 0;
+	total bigint;
+	stmts bigint := 0;
+	modelrows float8;
 BEGIN
 	-- The closure tables exist only for restricted calls, one per key
 	-- shape like the entity tables, and are reused within a transaction.
@@ -1564,30 +1679,56 @@ BEGIN
 			EXECUTE format('TRUNCATE pg_temp.%I', t.ctab);
 		END IF;
 	END LOOP;
-	PERFORM gaps._closure_seed(m, rel, entities);
+	UPDATE pg_gaps_keys k SET (nullable, hashed) = (SELECT * FROM gaps._key_nulls(a))
+	FROM gaps.attribute a WHERE a.attribute_id = k.attribute_id;
+	IF jsonb_typeof(entities) = 'array' AND jsonb_array_length(entities) > cap THEN
+		RAISE EXCEPTION '% entities are requested, more than %', jsonb_array_length(entities), cap
+			USING HINT = 'Call without entities to ground the whole model.';
+	END IF;
+	total := gaps._closure_seed(m, rel, entities);
+	IF total > cap THEN
+		RAISE EXCEPTION 'the requested entities are % entities of the model, more than %', total, cap
+			USING HINT = 'Call without entities to ground the whole model.';
+	END IF;
+	SELECT CASE WHEN bool_and(c.reltuples >= 0) THEN sum(c.reltuples) END INTO modelrows
+	FROM gaps.attribute a JOIN pg_class c ON c.oid = a.rel WHERE a.model_id = m;
 
 	LOOP
 		r := r + 1;
+		IF r > 10000 THEN
+			RAISE EXCEPTION 'the components of the requested entities are not closed after % rounds',
+				r - 1
+				USING DETAIL = format('A restricted call grounds every entity correlated with the '
+					'requested ones, one round per step away from them; the limit is 10000 '
+					'rounds, and %s entities were found.', total),
+					HINT = 'Call without entities to ground the whole model.';
+		END IF;
 		added := 0;
 		FOR e IN SELECT fp.factor_id, fp.ord
 				 FROM gaps.factor fa JOIN gaps.factor_parent fp USING (factor_id)
 				 WHERE fa.model_id = m ORDER BY fp.factor_id, fp.ord LOOP
-			added := added + gaps._closure_edge(e.factor_id, e.ord, true, r)
-				+ gaps._closure_edge(e.factor_id, e.ord, false, r);
+			added := added + gaps._closure_edge(e.factor_id, e.ord, true, r, cap - total - added + 1);
+			added := added + gaps._closure_edge(e.factor_id, e.ord, false, r, cap - total - added + 1);
+			stmts := stmts + 2;
+			IF total + added > cap THEN
+				RAISE EXCEPTION 'the components of the requested entities hold more than % entities',
+					cap
+					USING DETAIL = format('A restricted call grounds every entity correlated with '
+						'the requested ones; the limit is %s entities, reached in round %s.',
+						cap, r),
+						HINT = 'Call without entities to ground the whole model.';
+			END IF;
 		END LOOP;
 		total := total + added;
 		EXIT WHEN added = 0;
-		IF total > 10000000 OR r >= 10000 THEN
-			RAISE EXCEPTION 'the components of the requested entities hold more than % '
-				'entities after % rounds', total, r
-				USING DETAIL = 'A restricted call grounds every entity correlated with the '
-					'requested ones; the limits are 10000000 entities and 10000 rounds.',
-					HINT = 'Call without entities to ground the whole model.';
+		IF (stmts - 100) * 25 > modelrows THEN
+			RETURN false;
 		END IF;
 	END LOOP;
 	FOR t IN SELECT DISTINCT k.ctab FROM pg_gaps_keys k LOOP
 		EXECUTE format('ANALYZE pg_temp.%I', t.ctab);
 	END LOOP;
+	RETURN true;
 END
 $$;
 
@@ -1625,6 +1766,39 @@ BEGIN
 					   a.rel, etab, gaps._key_row(a, 'c', ktab), wclause)
 			USING wparams, fid, a.attribute_id;
 	END IF;
+END
+$$;
+
+-- The insert of gaps._ground_parent for a restricted grounding, as SQL
+-- taking the same parameters as its unrestricted form: the instances of
+-- one factor parent for child attribute a and parent attribute pa, from
+-- the child entities grounded.  It joins the same rows as the
+-- unrestricted form in the other order, flat, so that each join can be an
+-- index probe; the p.ctid test keeps a missing parent row from matching a
+-- NULL key.  pjoin is the join condition of the parent rows p to the
+-- child rows c, and wclause the child stripe's predicate over c.  (PL/pgSQL
+-- because pg_gaps_keys, a temp table, does not exist when this is made.)
+CREATE FUNCTION gaps._parent_by_key_sql(a gaps.attribute, pa gaps.attribute, pjoin text,
+										wclause text)
+RETURNS text
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+	RETURN (SELECT format(
+		'INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
+		'SELECT $2, rc.v, $3, CASE '
+		'WHEN count(*) FILTER (WHERE p.ctid IS NOT NULL AND rp.v IS NULL) > 0 THEN NULL '
+		'WHEN count(DISTINCT rp.v) = 1 THEN min(rp.v) ELSE -count(DISTINCT rp.v) END '
+		'FROM pg_temp.%I rc JOIN %s c ON rc.attribute_id = $4 AND %s '
+		'LEFT JOIN %s p ON TRUE%s '
+		'LEFT JOIN pg_temp.%I rp ON p.ctid IS NOT NULL AND rp.attribute_id = $5 '
+		'AND rp.k = %s WHERE TRUE%s GROUP BY rc.v',
+		ct.etab, a.rel, gaps._key_match(a, 'c', '(rc.k).k%1$s'),
+		pa.rel, pjoin,
+		pt.etab, gaps._key_row(pa, 'p', pt.ktab), wclause)
+	FROM pg_gaps_keys ct, pg_gaps_keys pt
+	WHERE ct.attribute_id = a.attribute_id AND pt.attribute_id = pa.attribute_id);
 END
 $$;
 
@@ -1705,22 +1879,9 @@ BEGIN
 	-- rows reach (the outer LEFT JOIN keeps a child that reaches none).
 	-- Exactly one gives its v; anything else is stored as minus the number
 	-- reached, and a reached parent row with no entity as NULL, and is
-	-- reported below.  The restricted form joins the same rows in the
-	-- other order, flat, so that each join can be an index probe; the
-	-- p.ctid test keeps a missing parent row from matching a NULL key.
+	-- reported below.  The restricted form is gaps._parent_by_key_sql.
 	IF on_clause IS NOT NULL AND restricted THEN
-		EXECUTE format(
-			'INSERT INTO pg_gaps_inst (factor_id, v, ord, pv) '
-			'SELECT $2, rc.v, $3, CASE '
-			'WHEN count(*) FILTER (WHERE p.ctid IS NOT NULL AND rp.v IS NULL) > 0 THEN NULL '
-			'WHEN count(DISTINCT rp.v) = 1 THEN min(rp.v) ELSE -count(DISTINCT rp.v) END '
-			'FROM pg_temp.%I rc JOIN %s c ON rc.attribute_id = $4 AND %s '
-			'LEFT JOIN %s p ON TRUE%s%s '
-			'LEFT JOIN pg_temp.%I rp ON p.ctid IS NOT NULL AND rp.attribute_id = $5 '
-			'AND rp.k = %s WHERE TRUE%s GROUP BY rc.v',
-			ct.etab, a.rel, gaps._key_match(a, 'c', '(rc.k).k%1$s'),
-			pa.rel, on_clause, wp.clause,
-			pt.etab, gaps._key_row(pa, 'p', pt.ktab), wclause)
+		EXECUTE gaps._parent_by_key_sql(a, pa, on_clause || wp.clause, wclause)
 			USING wparams || wp.params, fid, parent_ord, a.attribute_id, pa.attribute_id;
 	ELSIF on_clause IS NOT NULL THEN
 		EXECUTE format(
@@ -1788,12 +1949,13 @@ DECLARE
 	p record;
 	w record;
 	bad record;
+	restricted boolean;
 BEGIN
 	IF entities IS NULL AND rel IS NOT NULL THEN
 		RAISE EXCEPTION 'rel % is given without entities', rel
 			USING HINT = 'Pass both to restrict the call to some entities of rel, or neither.';
 	END IF;
-	PERFORM gaps._ground_entities(m, rel, entities);
+	restricted := gaps._ground_entities(m, rel, entities);
 
 	-- Each factor: its child entities, each with its parent entities.
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_inst (
@@ -1812,11 +1974,11 @@ BEGIN
 		w := gaps._stripe_where(f.child_stripe, 'c', 1);
 
 		PERFORM gaps._ground_child(f.factor_id, a, f.etab, f.ktab, w.clause, w.params,
-								   entities IS NOT NULL);
+								   restricted);
 		FOR p IN SELECT fp.ord FROM gaps.factor_parent fp
 				 WHERE fp.factor_id = f.factor_id ORDER BY fp.ord LOOP
 			PERFORM gaps._ground_parent(f.factor_id, p.ord, a, w.clause, w.params,
-										entities IS NOT NULL);
+										restricted);
 		END LOOP;
 	END LOOP;
 
@@ -1872,8 +2034,8 @@ $$;
 -- The body of gaps.marginals (map false) and gaps.impute (map true).
 -- With entities, the jsonb array of entity keys of relation p_rel, only
 -- their components are grounded (gaps._ground_closure) and only their
--- variables are returned: every attribute of p_rel declared in the model,
--- for each requested entity that has rows.  The probabilities are those of
+-- variables are returned: for each requested entity that has rows, every
+-- attribute of p_rel whose entity keys are the entity's keys.  The probabilities are those of
 -- the unrestricted call; component numbers differ.  The two functions are
 -- SQL wrappers because PL/pgSQL cannot have an argument and an output
 -- column both named rel.
