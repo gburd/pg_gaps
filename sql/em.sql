@@ -78,34 +78,48 @@ FROM gaps.factor f,
 SELECT factor, method, iterations FROM gaps.learn_cpts('h', 0) ORDER BY factor;
 SELECT cpt FROM gaps.factor WHERE name = 'pa';
 
--- With alpha = 1, P(b | a) moves too.  The update (expected count +
+-- With alpha > 0, P(b | a) moves too.  The update (expected count +
 -- pseudocount) / (total + sum of pseudocounts) is EM for the posterior
 -- under a Dirichlet(pseudocount + 1) prior, so the log posterior,
 -- loglik + sum(pseudocount * ln(cell)), must not decrease from one
 -- iteration to the next.  learn_cpts with max_iterations = t and tol 0
--- returns the t-th iterate and its loglik; alpha = 1 puts pseudocount 1 in
--- every cell.
-CREATE TEMP TABLE path (t int, its int, obj float8);
+-- returns the t-th iterate and its loglik; alpha puts that pseudocount in
+-- every cell.  At pseudocounts other than 1 the posterior-mean and the
+-- MAP readings of the update differ, so several are checked.
+CREATE TEMP TABLE path (a float8, t int, its int, obj float8);
 DO $$
 DECLARE
 	r record;
+	a float8;
 BEGIN
-	FOR t IN 1 .. 15 LOOP
-		SELECT max(l.iterations) AS its, max(l.loglik) AS ll INTO r
-		FROM gaps.learn_cpts('h', 1, 'em', t, 0) l;
-		INSERT INTO path
-		SELECT t, r.its, r.ll + sum(ln(x))
-		FROM gaps.factor f, unnest(f.cpt) x WHERE f.model_id = gaps._model_id('h');
+	FOREACH a IN ARRAY ARRAY[0.5, 1, 3, 50] LOOP
+		FOR t IN 1 .. 10 LOOP
+			SELECT max(l.iterations) AS its, max(l.loglik) AS ll INTO r
+			FROM gaps.learn_cpts('h', a, 'em', t, 0) l;
+			INSERT INTO path
+			SELECT a, t, r.its, r.ll + sum(a * ln(x))
+			FROM gaps.factor f, unnest(f.cpt) x WHERE f.model_id = gaps._model_id('h');
+		END LOOP;
 	END LOOP;
 END
 $$;
-SELECT count(*) AS steps, bool_and(its = t) AS all_ran,
-	   bool_and(d >= -1e-12) AS monotone, sum(d) > 0.05 AS moved
-FROM (SELECT t, its, obj - lag(obj) OVER (ORDER BY t) AS d FROM path) x
-WHERE d IS NOT NULL;
--- And it converges: by 500 iterations an iteration gains less than 1e-6.
+SELECT a, count(*) AS steps, bool_and(its = t) AS all_ran,
+	   bool_and(d >= -1e-12) AS monotone, sum(d) > 1e-4 AS moved
+FROM (SELECT a, t, its, obj - lag(obj) OVER (PARTITION BY a ORDER BY t) AS d FROM path) x
+WHERE d IS NOT NULL GROUP BY a ORDER BY a;
+-- And it converges: by 500 iterations an iteration changes the objective
+-- by at most 1e-6 of its size.
 SELECT DISTINCT method, converged, iterations < 500 AS early
 FROM gaps.learn_cpts('h', 1, 'em', 500);
+
+-- A tiny positive pseudocount keeps its cells positive, and EM's
+-- objective stays finite: P(b = v | a = x) is 1e-20 / (10 + 2e-20), below
+-- the rounding of the row's other cell.
+SELECT factor, method, converged FROM gaps.learn_cpts('h', 1e-20, 'em') ORDER BY factor;
+SELECT bool_and(x > 0) AS positive, bool_and(abs(s - 1) < 1e-12) AS rows_sum_to_1
+FROM (SELECT f.name, x, sum(x) OVER (PARTITION BY f.name, (i - 1) / 2) AS s
+	  FROM gaps.factor f, unnest(f.cpt) WITH ORDINALITY u(x, i)
+	  WHERE f.model_id = gaps._model_id('h')) c;
 
 SELECT * FROM gaps.learn_cpts('h', 1, 'magic');              -- fail
 SELECT * FROM gaps.learn_cpts('h', 1, 'em', 0);              -- fail
@@ -120,6 +134,65 @@ RESET gaps.samples;
 
 DROP TABLE h;
 SELECT gaps.drop_model('h');
+
+-- With alpha = 0 the complete-data estimate can give probability 0 to a
+-- value only incomplete rows show: here P(b = v | a) = 0 for both a, and
+-- an entity with b = v and a missing is impossible under it.  EM starts
+-- instead from the counts plus 1, (11, 11 | 11, 1 | 11, 1) / ..., and by
+-- symmetry reaches P(a) = (0.5, 0.5) and P(b | a) = (10, 0.5) / 10.5 for
+-- both a in one step.
+CREATE TABLE z (id int PRIMARY KEY, a text, b text);
+INSERT INTO z SELECT g, CASE WHEN g <= 10 THEN 'x' ELSE 'y' END, 'u'
+FROM generate_series(1, 20) g;
+INSERT INTO z VALUES (21, NULL, 'v');
+SELECT gaps.create_model('z');
+SELECT gaps.declare_attribute('z', 'z', 'a', ARRAY['x', 'y']);
+SELECT gaps.declare_attribute('z', 'z', 'b', ARRAY['u', 'v']);
+SELECT gaps.add_stripe('z', 'a', 'z', 'a');
+SELECT gaps.add_stripe('z', 'b', 'z', 'b');
+SELECT gaps.add_factor('z', 'pa', 'a');
+SELECT gaps.add_factor('z', 'pb', 'b', ARRAY['a']);
+SELECT factor, method, iterations, converged,
+	   abs(loglik - (20 * ln(0.5 * 10 / 10.5) + ln(0.5 / 10.5))) < 1e-9 AS loglik_ok
+FROM gaps.learn_cpts('z', 0, 'em') ORDER BY factor;
+SELECT bool_and(abs(c - w) < 1e-12) AS hand
+FROM gaps.factor f,
+	 unnest(f.cpt, CASE f.name WHEN 'pa' THEN ARRAY[0.5, 0.5]
+				   ELSE ARRAY[10 / 10.5, 0.5 / 10.5, 10 / 10.5, 0.5 / 10.5] END) AS u(c, w)
+WHERE f.model_id = gaps._model_id('z');
+DROP TABLE z;
+SELECT gaps.drop_model('z');
+
+-- pg.ddx.io's shape: a latent class a, observed for a few labelled rows,
+-- with two children; no labelled row shows c = 3, which most unlabelled
+-- rows do.  With alpha = 0 the start is again the counts plus 1, and EM
+-- learns P(c = 3 | a) from the unlabelled rows.
+CREATE TABLE lc (id int PRIMARY KEY, a text, b text, c text);
+INSERT INTO lc SELECT g, CASE WHEN g % 2 = 0 THEN 's' ELSE 't' END,
+	   CASE WHEN g % 2 = 0 THEN '1' ELSE '2' END, CASE WHEN g % 2 = 0 THEN '1' ELSE '2' END
+FROM generate_series(1, 6) g;
+INSERT INTO lc SELECT g, NULL, CASE WHEN g % 3 = 0 THEN '1' ELSE '2' END,
+	   CASE WHEN g % 4 = 0 THEN '1' ELSE '3' END
+FROM generate_series(7, 60) g;
+SELECT gaps.create_model('lc');
+SELECT gaps.declare_attribute('lc', 'lc', 'a', ARRAY['s', 't']);
+SELECT gaps.declare_attribute('lc', 'lc', x, ARRAY['1', '2', '3'])
+FROM unnest(ARRAY['b', 'c']) x;
+SELECT gaps.add_stripe('lc', x, 'lc', x) FROM unnest(ARRAY['a', 'b', 'c']) x;
+SELECT gaps.add_factor('lc', 'pa', 'a');
+SELECT gaps.add_factor('lc', 'p' || x, x, ARRAY['a']) FROM unnest(ARRAY['b', 'c']) x;
+SELECT factor, complete_entities, method, converged FROM gaps.learn_cpts('lc', 0, 'em')
+ORDER BY factor;
+-- P(c = 3) under the learned model: the share of rows with c = 3, 40 / 60,
+-- since EM's fixed points match the observed marginal of a child that is
+-- never missing.
+SELECT round((pa.cpt[1] * pc.cpt[3] + pa.cpt[2] * pc.cpt[6])::numeric, 6) AS p_c3,
+	   round(40 / 60.0, 6) AS observed
+FROM gaps.factor pa, gaps.factor pc
+WHERE pa.model_id = gaps._model_id('lc') AND pa.name = 'pa'
+  AND pc.model_id = pa.model_id AND pc.name = 'pc';
+DROP TABLE lc;
+SELECT gaps.drop_model('lc');
 
 -- On complete data the E-step returns the counts, so EM stops after one
 -- iteration with the counting answer.

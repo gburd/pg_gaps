@@ -479,9 +479,13 @@ pseudocount) / (row total + sum of pseudocounts).
 That update is not EM for the posterior mean.  It is EM for the
 posterior mode under Dirichlet(pseudocount + 1), whose log density is
 sum(pseudocount * ln(cell)) up to a constant, so the quantity it never
-decreases is loglik + sum(pseudocount * ln(cell)), and that is what the
-stopping rule watches: an iteration that gains less than `tol` ends the
-loop (`sql/em.sql` checks the climb on t5's model with `alpha` = 1).  On
+decreases is loglik + sum(pseudocount * ln(cell)) (a cell with pseudocount 0 adds 0
+ln(cell) = 0, even at 0), and that is what the stopping rule watches.
+The tolerance is relative: the loop ends when an iteration changes the
+objective by at most `tol` * max(1, |objective|).  An absolute rule would
+fire on rounding noise at pg.ddx.io's scale, where loglik is about -1e6
+and the summed log Z carries about 1e-10 relative error (`sql/em.sql`
+checks the climb on t5's model at pseudocounts 0.5, 1, 3 and 50).  On
 complete data the E-step returns the counts, so 'em' gives the 'counts'
 answer after one iteration.  Treating the prior as a posterior-mean
 prior over EM would need a variational or sampling E-step; a mode under
@@ -490,15 +494,29 @@ keeps one meaning of the pseudocounts in both methods.  Pseudocounts of
 zero allow a cell to reach 0, and with a positive one a cell stays
 positive.
 
-EM finds a local maximum.  The start (the complete-data estimate)
-decides which one, and a factor whose child is never observed together
-with its parents starts uniform, which is a saddle when the latent
-variable's values are interchangeable; nothing here breaks that
-symmetry, so such a factor needs a prior or a few labelled rows.  The
-output says `method` 'em', `iterations` (M-steps), `loglik` (log
-P(evidence) under the returned CPTs) and `converged` (false when
-`max_iterations` stopped it).  A component too large for exact inference
-is an `ERROR`; there is no sampled E-step.
+EM finds a local maximum.  The start decides which one.  It is the
+complete-data estimate, except where that estimate makes the evidence
+impossible: with a pseudocount of 0, a value that no complete row shows
+gets probability 0, and an incomplete row that has it then has
+probability 0 under every CPT EM can reach (a cell at 0 stays 0).  That
+is pg.ddx.io's shape, a child value that no labelled email shows for
+some author state.  Then EM starts instead from the counts plus
+max(pseudocount, 1), the add-one estimate, for the start only: every
+cell of it is positive, so the evidence is possible, and the iterations
+use the caller's pseudocounts as before (`sql/em.sql` has t5's shape and
+a latent-class one), and learn_cpts says so with a NOTICE.  Smoothing
+the start only when it is needed keeps the documented start, and the
+'counts' answer on complete data, everywhere else.  Any positive
+smoothing makes the evidence possible; add-one is the conventional one
+(Laplace's rule), and the choice moves the start, so it can change which
+local maximum EM reaches and how fast.  A factor whose child is never
+observed together with its parents starts uniform, which is a saddle
+when the latent variable's values are interchangeable; nothing here
+breaks that symmetry, so such a factor needs a prior or a few labelled
+rows.  The output says `method` 'em', `iterations` (M-steps, 0 for
+'counts'), `loglik` (log P(evidence) under the returned CPTs) and
+`converged` (false when `max_iterations` stopped it).  A component too
+large for exact inference is an `ERROR`; there is no sampled E-step.
 
 **Entity-set predicates** are a conjunction of `column op constant` terms
 stored as rows, with `op` one of `=`, `<>`, `<`, `<=`, `>`, `>=`.  Each use

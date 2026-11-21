@@ -16,10 +16,19 @@ EM for CPTs with missing values: `gaps.learn_cpts(model, alpha, method
 => 'em', max_iterations => 50, tol => 1e-6)` learns from entities whose
 child or parents are missing, starting from the complete-data estimate
 and using the factor's prior as in the default method; it is EM for the
-posterior mode under Dirichlet(pseudocount + 1), stopped when the log
-posterior gains less than `tol`.  `learn_cpts` gains the columns
-`method`, `iterations`, `loglik` and `converged` (NULL for 'counts').
-Exact inference only.  `gaps._expected_counts` is its E-step.
+posterior mode under Dirichlet(pseudocount + 1), stopped when an
+iteration changes the log posterior by at most `tol` times its size.
+When the complete-data estimate gives probability 0 to an observed value
+(alpha 0), EM starts from the add-one estimate instead.  `learn_cpts`
+gains the columns `method`, `iterations` (0 for 'counts'), `loglik` and
+`converged` (NULL for 'counts').  Exact inference only.
+`gaps._expected_counts` is its E-step.
+
+`learn_cpts` no longer takes time quadratic in the number of entities:
+its counting query self-joined an unanalyzed temp table, which the
+planner ran as a nested loop.  40,800 rows took 7.8 minutes and take
+0.84 s (`bench/RESULTS_LEARN_2026-11-21.md`).  `learn_cpts` no longer
+rounds a cell with a tiny positive pseudocount to 0.
 
 Gibbs sampling for components too large for exact inference: set
 `gaps.samples` (default 0, never) and `gaps.seed`.  `marginals` and
