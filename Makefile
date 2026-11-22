@@ -25,7 +25,7 @@ PGFILEDESC = "pg_gaps - probabilistic graphical models over incomplete relations
 
 PG_CPPFLAGS = -DPG_GAPS_VERSION=\"$(EXTVERSION)\" -I$(srcdir)/src
 
-REGRESS = pg_gaps catalog infer learn em validate rows subset views bins param composite
+REGRESS = pg_gaps catalog infer learn em validate rows subset views bins param composite extreme
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

@@ -3,18 +3,20 @@
  * gx_param.c
  *	  The CPTs of one ground instance of a parameterised factor (gx_param.h).
  *
- * Three steps per instance:
+ * Three steps per instance, after gx_param_size has checked every bound:
  *
- *	1. Fold the observed parents into the parameters: for logistic, add
- *	   their weights to each class's score; for noisy-OR, multiply their
- *	   (1 - p) into the probability that the child is off.
+ *	1. Fold the observed parents into the parameters, in logs: for
+ *	   logistic, add their weights to each class's score; for noisy-OR, add
+ *	   their log(1 - p) to the log of the probability that the child is
+ *	   off.  Both sums are compensated (Neumaier), so a thousand equal
+ *	   terms sum to within a few units in the last place.
  *	2. Build the auxiliary chains over the missing members of aggregating
  *	   slots (the OR chain for noisy-OR, a count chain per slot for
  *	   logistic).
  *	3. Build the child's CPT over its missing non-aggregating parents and
- *	   the chains' last variables.
- *
- * Every table is checked against env->max_cells before it is allocated.
+ *	   the chains' last variables, keeping the folded part, which is the
+ *	   same in every row, in the column offsets (lscale), and then shifting
+ *	   each column so that its largest entry is 0.
  *
  * Copyright (c) 2026, Gregory Burd
  *
@@ -34,9 +36,55 @@ typedef struct pctx
 	const gx_pinst *in;
 	gx_pcpt    *out;
 	int			nout;			/* CPTs built so far */
-	size_t		total;			/* their cells */
 	int			err;
 } pctx;
+
+/* log(DBL_MIN): a probability below it is subnormal. */
+#define LOG_DBL_MIN (-708.39641853226410622)
+
+/*
+ * A compensated (Neumaier) sum.  A term of -INFINITY (log 0) makes the sum
+ * -INFINITY for good, where the compensation would turn it into NaN.
+ */
+typedef struct csum
+{
+	double		s;
+	double		c;
+} csum;
+
+static void
+csum_add(csum *a, double x)
+{
+	double		t = a->s + x;
+
+	if (!isfinite(t))
+	{
+		a->s = t;
+		a->c = 0.0;
+		return;
+	}
+	if (fabs(a->s) >= fabs(x))
+		a->c += (a->s - t) + x;
+	else
+		a->c += (x - t) + a->s;
+	a->s = t;
+}
+
+static double
+csum_get(const csum *a)
+{
+	return isfinite(a->s) ? a->s + a->c : a->s;
+}
+
+/*
+ * log(1 - exp(x)) for x <= 0, accurate at both ends (Maechler's
+ * log1mexp): -INFINITY at x = 0 and 0 at x = -INFINITY.
+ */
+static double
+log1mexp(double x)
+{
+	return x > -0.693147180559945309417 ? log(-expm1(x)) : log1p(-exp(x));
+}
 
 static void *
 pa_alloc(pctx *c, size_t size)
@@ -53,10 +101,9 @@ pa_alloc(pctx *c, size_t size)
 
 /*
  * Start CPT number c->nout for child, with nparents parents and a table of
- * cells = (product of the parents' cardinalities) x card cells, which the
- * caller has checked against env->max_cells.  The instance's tables
- * together are held to env->max_total_cells, checked here before each is
- * allocated.  Returns it, or NULL with c->err set.
+ * cells = (product of the parents' cardinalities) x card cells, which
+ * gx_param_size has checked against the bounds, and card log offsets, all
+ * 0.  Returns it, or NULL with c->err set.
  */
 static gx_pcpt *
 new_cpt(pctx *c, int child, int card, int nparents, size_t cells)
@@ -65,29 +112,53 @@ new_cpt(pctx *c, int child, int card, int nparents, size_t cells)
 
 	if (c->err)
 		return NULL;
-	if (cells > c->env->max_total_cells - c->total || c->total > c->env->max_total_cells)
-	{
-		c->err = GX_ETOOBIG;
-		return NULL;
-	}
-	c->total += cells;
-
 	t->child = child;
 	t->card = card;
 	t->nparents = nparents;
 	t->ncells = cells;
 	t->parents = pa_alloc(c, sizeof(int) * (size_t) (nparents ? nparents : 1));
 	t->vals = pa_alloc(c, sizeof(double) * cells);
+	t->lscale = pa_alloc(c, sizeof(double) * (size_t) card);
 	if (c->err)
 	{
 		if (t->parents)
 			c->env->free(c->env->arg, t->parents);
 		if (t->vals)
 			c->env->free(c->env->arg, t->vals);
+		if (t->lscale)
+			c->env->free(c->env->arg, t->lscale);
 		return NULL;
 	}
+	for (int x = 0; x < card; x++)
+		t->lscale[x] = 0.0;
 	c->nout++;
 	return t;
+}
+
+/*
+ * Shift each column x of the child's table t so that its largest entry is
+ * 0, moving the shift into t->lscale[x].  A column of zeros (-INFINITY
+ * everywhere) is left as it is.
+ */
+static void
+shift_columns(gx_pcpt *t)
+{
+	size_t		k = (size_t) t->card;
+	size_t		rows = t->ncells / k;
+
+	for (size_t x = 0; x < k; x++)
+	{
+		double		mx = -INFINITY;
+
+		for (size_t r = 0; r < rows; r++)
+			if (t->vals[r * k + x] > mx)
+				mx = t->vals[r * k + x];
+		if (mx == -INFINITY)
+			continue;
+		for (size_t r = 0; r < rows; r++)
+			t->vals[r * k + x] -= mx;
+		t->lscale[x] += mx;
+	}
 }
 
 /*
@@ -245,7 +316,9 @@ gx_param_naux(const gx_pfactor *f, const gx_pinst *in)
 
 /*
  * Check instance in against f: slot ranges in order, one member in every
- * slot that does not aggregate, values in range.
+ * slot that does not aggregate, values in range, and the variables of an
+ * aggregating slot strictly increasing.  A variable twice in one slot
+ * would be two independent parents with one value, which is no model.
  */
 static int
 check_inst(const gx_pfactor *f, const gx_pinst *in)
@@ -259,10 +332,128 @@ check_inst(const gx_pfactor *f, const gx_pinst *in)
 		if (n < 0 || (!f->slot_agg[s] && n != 1))
 			return GX_EINVAL;
 		for (int i = in->off[s]; i < in->off[s + 1]; i++)
+		{
 			if (in->value[i] < -1 || in->value[i] >= f->slot_card[s])
 				return GX_EINVAL;
+			if (i > in->off[s] && in->var[i] <= in->var[i - 1])
+				return GX_EINVAL;
+		}
 	}
 	return GX_OK;
+}
+
+/*
+ * The product of the cardinalities of the distinct missing variables of
+ * the slots that do not aggregate, times k, or SIZE_MAX when it exceeds
+ * limit.  Like distinct_missing, without its arrays; slots are few.
+ */
+static size_t
+direct_cells(const gx_pfactor *f, const gx_pinst *in, size_t k, size_t limit)
+{
+	size_t		cells = k;
+
+	for (int s = 0; s < f->nslots; s++)
+	{
+		int			i = in->off[s];
+		int			seen = 0;
+
+		if (f->slot_agg[s] || in->value[i] >= 0)
+			continue;
+		for (int s2 = 0; s2 < s && !seen; s2++)
+			seen = !f->slot_agg[s2] && in->value[in->off[s2]] < 0 &&
+				in->var[in->off[s2]] == in->var[i];
+		if (!seen)
+			cells = mul_bounded(cells, (size_t) f->slot_card[s], limit);
+	}
+	return cells;
+}
+
+/*
+ * The chains' tables of instance in: their cells (vals and lscale) are
+ * added to *cells, their auxiliary variables' values to *values, and the
+ * product of the cardinalities of the chain ends to *ends.  GX_ETOOBIG
+ * when one table is over env->max_cells.
+ */
+static int
+chain_size(const gx_env *env, const gx_pfactor *f, const gx_pinst *in, size_t *cells,
+		   size_t *values, size_t *ends)
+{
+	size_t		lim = env->max_cells;
+	int			links = 0;
+
+	for (int s = 0; s < f->nslots; s++)
+	{
+		int			v = f->slot_card[s];
+		int			m = missing_in_slot(in, s);
+
+		if (!f->slot_agg[s] || m == 0)
+			continue;
+		if (f->kind == GX_NOISY_OR)
+		{
+			/* One chain over every slot: its first link has one parent. */
+			for (int j = 0; j < m; j++)
+			{
+				size_t		t = mul_bounded((size_t) (links++ == 0 ? 2 : 4), (size_t) v,
+											lim);
+
+				if (t == SIZE_MAX)
+					return GX_ETOOBIG;
+				*cells += t + 2;
+				*values += 2;
+			}
+			*ends = 2;
+			continue;
+		}
+		for (int j = 0; j < m; j++)
+		{
+			size_t		prevn = ncounts(j, v, lim);
+			size_t		nextn = ncounts(j + 1, v, lim);
+			size_t		t = mul_bounded(mul_bounded(prevn, (size_t) v, lim), nextn, lim);
+
+			if (nextn == SIZE_MAX || t == SIZE_MAX || nextn > INT32_MAX)
+				return GX_ETOOBIG;
+			*cells += t + nextn;
+			*values += nextn;
+		}
+		*ends = mul_bounded(*ends, ncounts(m, v, lim), lim);
+		if (*ends == SIZE_MAX)
+			return GX_ETOOBIG;
+	}
+	return GX_OK;
+}
+
+int
+gx_param_size(const gx_env *env, const gx_pfactor *f, const gx_pinst *in, size_t *cells,
+			  size_t *hold)
+{
+	size_t		values = 0,
+				ends = 1,
+				child;
+	int			rc;
+
+	*cells = 0;
+	*hold = SIZE_MAX;
+	if (gx_param_check(f) != GX_OK || check_inst(f, in) != GX_OK)
+		return GX_EINVAL;
+	if ((rc = chain_size(env, f, in, cells, &values, &ends)) != GX_OK)
+		return rc;
+	child = mul_bounded(direct_cells(f, in, (size_t) f->card, env->max_cells), ends,
+						env->max_cells);
+	if (child == SIZE_MAX)
+		return GX_ETOOBIG;
+	*cells += child + (size_t) f->card;
+
+	/*
+	 * Each table is at most max_cells, which the GUCs keep below 2^31, and
+	 * there are at most INT32_MAX of them, so none of this overflows.  An
+	 * instance with no chain may be sampled instead of solved, which holds
+	 * its tables and their copy in the cache key and little more.
+	 */
+	if (env->samples > 0 && values == 0)
+		*hold = 2 * *cells;
+	else
+		*hold = GX_PARAM_HOLD * *cells + GX_PARAM_HOLD_VALUE * values + GX_PARAM_HOLD_BASE;
+	return *hold > env->max_total_cells ? GX_ETOOBIG : GX_OK;
 }
 
 /*
@@ -289,17 +480,11 @@ or_chain(pctx *c)
 		for (int i = in->off[s]; i < in->off[s + 1] && !c->err; i++)
 		{
 			int			np = z < 0 ? 1 : 2;
-			size_t		cells = mul_bounded((size_t) np * 2, (size_t) yc,
-											c->env->max_cells);
+			size_t		cells = (size_t) np * 2 * (size_t) yc;
 			gx_pcpt    *t;
 
 			if (in->value[i] >= 0)
 				continue;
-			if (cells == SIZE_MAX)
-			{
-				c->err = GX_ETOOBIG;
-				break;
-			}
 			if ((t = new_cpt(c, aux, 2, np, cells)) == NULL)
 				break;
 			/* Parents (z_prev, y), y fastest; z_prev on forces on. */
@@ -309,11 +494,18 @@ or_chain(pctx *c)
 			for (int prev = 0; prev < np; prev++)
 				for (int y = 0; y < yc; y++)
 				{
-					double		on = (np == 2 && prev == 1) ? 1.0 : (y > 0 ? p : 0.0);
 					size_t		cell = ((size_t) prev * (size_t) yc + (size_t) y) * 2;
 
-					t->vals[cell] = 1.0 - on;
-					t->vals[cell + 1] = on;
+					if (np == 2 && prev == 1)
+					{
+						t->vals[cell] = -INFINITY;
+						t->vals[cell + 1] = 0.0;
+					}
+					else
+					{
+						t->vals[cell] = y > 0 ? log1p(-p) : 0.0;
+						t->vals[cell + 1] = y > 0 ? log(p) : -INFINITY;
+					}
 				}
 			z = aux++;
 		}
@@ -347,23 +539,18 @@ count_chain(pctx *c, int s, int *aux, size_t *ncard)
 		size_t		prevn = *ncard;
 		size_t		nextn = ncounts(j + 1, v, c->env->max_cells);
 		int			np = cvar < 0 ? 1 : 2;
-		size_t		cells = mul_bounded(mul_bounded(prevn, (size_t) v, c->env->max_cells),
-										nextn, c->env->max_cells);
+		size_t		cells = prevn * (size_t) v * nextn;
 		gx_pcpt    *t;
 
 		if (in->value[i] >= 0)
 			continue;
-		if (nextn == SIZE_MAX || cells == SIZE_MAX || nextn > INT32_MAX)
-		{
-			c->err = GX_ETOOBIG;
-			break;
-		}
 		if ((t = new_cpt(c, *aux, (int) nextn, np, cells)) == NULL)
 			break;
 		if (cvar >= 0)
 			t->parents[0] = cvar;
 		t->parents[np - 1] = in->var[i];
-		memset(t->vals, 0, sizeof(double) * cells);
+		for (size_t x = 0; x < cells; x++)
+			t->vals[x] = -INFINITY;
 
 		/* Walk the vectors of c_(j-1) in rank order; add each value y. */
 		memset(cnt, 0, sizeof(int) * (size_t) v);
@@ -377,7 +564,7 @@ count_chain(pctx *c, int s, int *aux, size_t *ncard)
 				cnt[y]++;
 				to = count_rank(cnt, v, j + 1);
 				cnt[y]--;
-				t->vals[(r * (size_t) v + (size_t) y) * nextn + to] = 1.0;
+				t->vals[(r * (size_t) v + (size_t) y) * nextn + to] = 0.0;
 			}
 			if (r + 1 < prevn)
 				count_next(cnt, v);
@@ -486,10 +673,16 @@ score_tables(pctx *c, int np, const int *pcard, const int *slot_d, const int *ch
 
 /*
  * Fill the child's CPT t (its parents' cardinalities in pcard) for a
- * logistic factor: per parent row, the softmax of base[k - 2] (class k's
- * score from the bias and the observed members) plus each parent value's
- * contribution (score_tables).  Returns GX_OK, or GX_EINVAL when a score
- * is not finite.
+ * logistic factor, in logs: per parent row r, log P(k | r) = b_k + s_k(r)
+ * - log(sum_j exp(b_j + s_j(r))), where b_k is class k's score from the
+ * bias and the observed members (the same in every row, b_1 = 0) and
+ * s_k(r) the row's contribution (score_tables).  With B the largest b_j,
+ * this is (b_k - B) + s_k(r) - L(r), L(r) = log(sum_j exp(b_j - B +
+ * s_j(r))).  The first term goes into t->lscale[k]; the rest is computed
+ * from quantities the size of the row contributions, so the differences
+ * between rows, all the posterior of the missing parents depends on when
+ * the child is observed, keep their precision however large B is.
+ * Returns GX_OK, or GX_EINVAL when a score is not finite.
  */
 static int
 fill_logistic(pctx *c, gx_pcpt *t, const double *base, const int *slot_d,
@@ -509,34 +702,48 @@ fill_logistic(pctx *c, gx_pcpt *t, const double *base, const int *slot_d,
 	sc = pa_alloc(c, sizeof(double) * (size_t) k);
 	if (c->err)
 		goto done;
+	t->lscale[0] = 0.0;
+	for (size_t kk = 0; kk < k1; kk++)
+	{
+		if (!isfinite(base[kk]))
+			rc = GX_EINVAL;
+		t->lscale[kk + 1] = base[kk];
+	}
+	{
+		double		bmax = 0.0;
+
+		for (int kk = 0; kk < k; kk++)
+			bmax = fmax(bmax, t->lscale[kk]);
+		for (int kk = 0; kk < k; kk++)
+			t->lscale[kk] -= bmax;
+	}
 	memset(val, 0, sizeof(int) * (size_t) (np ? np : 1));
 	for (size_t r = 0; r < rows && rc == GX_OK; r++)
 	{
-		double		mx = 0.0,
-					sum = 0.0;
+		double		mx = -INFINITY,
+					sum = 0.0,
+					lse;
 
 		if ((r & 4095) == 4095 && c->env->interrupt)
 			c->env->interrupt(c->env->arg);
 		sc[0] = 0.0;
 		for (size_t kk = 0; kk < k1; kk++)
 		{
-			double		s_k = base[kk];
+			double		s_k = 0.0;
 
 			for (int p = 0; p < np; p++)
 				s_k += add[p][(size_t) val[p] * k1 + kk];
-			if (!isfinite(s_k))
+			if (!isfinite(s_k) || !isfinite(s_k + t->lscale[kk + 1]))
 				rc = GX_EINVAL;
 			sc[kk + 1] = s_k;
-			if (s_k > mx)
-				mx = s_k;
 		}
 		for (int kk = 0; kk < k; kk++)
-		{
-			sc[kk] = exp(sc[kk] - mx);
-			sum += sc[kk];
-		}
+			mx = fmax(mx, sc[kk] + t->lscale[kk]);
 		for (int kk = 0; kk < k; kk++)
-			t->vals[r * (size_t) k + (size_t) kk] = sc[kk] / sum;
+			sum += exp(sc[kk] + t->lscale[kk] - mx);
+		lse = mx + log(sum);
+		for (int kk = 0; kk < k; kk++)
+			t->vals[r * (size_t) k + (size_t) kk] = sc[kk] - lse;
 
 		/* Next parent combination, the last parent fastest. */
 		for (int p = np - 1; p >= 0; p--)
@@ -557,12 +764,14 @@ done:
 }
 
 /*
- * Fill the child's CPT t for a noisy-OR factor.  off is P(child off) from
- * the leak and the observed members; the last parent is the OR chain's end
- * when has_z.
+ * Fill the child's CPT t for a noisy-OR factor, in logs.  loff is the log
+ * of P(child off) from the leak and the observed members; the last parent
+ * is the OR chain's end when has_z.  The off column's entries are loff
+ * plus the row's log(1 - p) terms, with loff kept in t->lscale[0]; the on
+ * column's are log(1 - P(off)), which needs loff and goes in whole.
  */
 static void
-fill_noisy_or(pctx *c, gx_pcpt *t, double off, const int *slot_d, int has_z,
+fill_noisy_or(pctx *c, gx_pcpt *t, double loff, const int *slot_d, int has_z,
 			  const int *pcard)
 {
 	const gx_pfactor *f = c->f;
@@ -572,20 +781,22 @@ fill_noisy_or(pctx *c, gx_pcpt *t, double off, const int *slot_d, int has_z,
 
 	if (val == NULL)
 		return;
+	/* P(off) = 0 exactly (sure_off) is a column of zeros, with offset 0. */
+	t->lscale[0] = loff == -INFINITY ? 0.0 : loff;
 	memset(val, 0, sizeof(int) * (size_t) (np ? np : 1));
 	for (size_t r = 0; r < rows; r++)
 	{
-		double		q = off;
+		csum		q = {0.0, 0.0};
+		double		lq;
 
 		if ((r & 4095) == 4095 && c->env->interrupt)
 			c->env->interrupt(c->env->arg);
 		for (int s = 0; s < f->nslots; s++)
 			if (slot_d[s] >= 0 && val[slot_d[s]] > 0)
-				q *= 1.0 - f->params[1 + s];
-		if (has_z && val[np - 1] == 1)
-			q = 0.0;
-		t->vals[r * 2] = q;
-		t->vals[r * 2 + 1] = 1.0 - q;
+				csum_add(&q, log1p(-f->params[1 + s]));
+		lq = (has_z && val[np - 1] == 1) || loff == -INFINITY ? -INFINITY : csum_get(&q);
+		t->vals[r * 2] = lq;
+		t->vals[r * 2 + 1] = log1mexp(loff + lq);
 		for (int p = np - 1; p >= 0; p--)
 		{
 			if (++val[p] < pcard[p])
@@ -597,20 +808,29 @@ fill_noisy_or(pctx *c, gx_pcpt *t, double off, const int *slot_d, int has_z,
 }
 
 /*
- * Step 1: the observed members' contribution.  For logistic, base[k - 2]
- * is class k's bias plus the weights of the observed members' values; for
- * noisy-OR, *off is (1 - leak) times (1 - p) per active observed member.
+ * Step 1: the observed members' contribution, in logs.  For logistic,
+ * base[k - 2] is class k's bias plus the weights of the observed members'
+ * values; for noisy-OR, base[0] is log(1 - leak) plus log(1 - p) per active
+ * observed member.  Both are compensated sums, in acc (one per entry of
+ * base).  For noisy-OR, *sure_off is set when some term is log(0) (P(off)
+ * is exactly 0) and *maybe_on cleared when every term is log(1) (P(off)
+ * is exactly 1).
  */
 static void
 fold_observed(const gx_pfactor *f, const gx_pinst *in, const int *slot_off,
-			  double *base, double *off)
+			  double *base, csum *acc, int *sure_off, int *maybe_on)
 {
 	size_t		stride = (size_t) slot_off[f->nslots] + 1;
+	int			nk = f->kind == GX_LOGISTIC ? f->card - 1 : 1;
 
-	if (f->kind == GX_NOISY_OR)
-		*off = 1.0 - f->params[0];
-	for (int kk = 2; f->kind == GX_LOGISTIC && kk <= f->card; kk++)
-		base[kk - 2] = f->params[(size_t) (kk - 2) * stride];
+	for (int kk = 0; kk < nk; kk++)
+	{
+		acc[kk].s = f->kind == GX_LOGISTIC ? f->params[(size_t) kk * stride]
+			: log1p(-f->params[0]);
+		acc[kk].c = 0.0;
+	}
+	*sure_off = f->kind == GX_NOISY_OR && f->params[0] == 1.0;
+	*maybe_on = f->kind == GX_NOISY_OR && f->params[0] > 0.0;
 	for (int s = 0; s < f->nslots; s++)
 		for (int i = in->off[s]; i < in->off[s + 1]; i++)
 		{
@@ -619,16 +839,133 @@ fold_observed(const gx_pfactor *f, const gx_pinst *in, const int *slot_off,
 			if (y < 0)
 				continue;
 			if (f->kind == GX_NOISY_OR && y > 0)
-				*off *= 1.0 - f->params[1 + s];
-			for (int kk = 2; f->kind == GX_LOGISTIC && kk <= f->card; kk++)
-				base[kk - 2] += weight(f, slot_off, kk, s, y);
+			{
+				csum_add(&acc[0], log1p(-f->params[1 + s]));
+				*sure_off |= f->params[1 + s] == 1.0;
+				*maybe_on |= f->params[1 + s] > 0.0;
+			}
+			for (int kk = 0; f->kind == GX_LOGISTIC && kk < nk; kk++)
+				csum_add(&acc[kk], weight(f, slot_off, kk + 2, s, y));
 		}
+	for (int kk = 0; kk < nk; kk++)
+		base[kk] = csum_get(&acc[kk]);
 }
 
 /*
- * Steps 2 and 3 once the scratch arrays exist: the chains, then the
- * child's CPT.  Returns GX_OK or an error, with c->err also set for
- * allocation failures.
+ * The guard on the child's table t: an entry is -INFINITY (zero) only
+ * where its exact value is zero, and nothing is NaN.  Every logistic entry
+ * is positive.  A noisy-OR row's off entry is zero exactly when some term
+ * of it is log(0): sure_off from the leak and the observed members, a
+ * missing direct parent that is active with p = 1, or the OR chain's end
+ * on; its on entry is zero exactly when every term is log(1): maybe_on
+ * clear, no active direct parent with p > 0, and the chain's end off.
+ * Returns GX_OK or GX_ELOST.
+ */
+static int
+guard_child(pctx *c, const gx_pcpt *t, const int *slot_d, int has_z, const int *pcard,
+			int sure_off, int maybe_on)
+{
+	const gx_pfactor *f = c->f;
+	int			np = t->nparents;
+	size_t		k = (size_t) t->card;
+	size_t		rows = t->ncells / k;
+	int		   *val = pa_alloc(c, sizeof(int) * (size_t) (np ? np : 1));
+	int			rc = GX_OK;
+
+	if (val == NULL)
+		return c->err;
+	memset(val, 0, sizeof(int) * (size_t) (np ? np : 1));
+	for (size_t r = 0; r < rows && rc == GX_OK; r++)
+	{
+		int			zero_off = sure_off,
+					on = maybe_on;
+
+		for (int s = 0; f->kind == GX_NOISY_OR && s < f->nslots; s++)
+			if (slot_d[s] >= 0 && val[slot_d[s]] > 0)
+			{
+				zero_off |= f->params[1 + s] == 1.0;
+				on |= f->params[1 + s] > 0.0;
+			}
+		if (has_z && val[np - 1] == 1)
+			zero_off = on = 1;
+		for (size_t x = 0; x < k; x++)
+		{
+			double		v = t->vals[r * k + x];
+			int			may_be_zero = f->kind == GX_NOISY_OR && (x == 0 ? zero_off : !on);
+
+			if (isnan(v) || (v == -INFINITY && !may_be_zero))
+				rc = GX_ELOST;
+
+			/*
+			 * The on entry is the one computed from a probability, 1 -
+			 * P(off): below DBL_MIN that probability was subnormal and
+			 * had lost bits.
+			 */
+			if (f->kind == GX_NOISY_OR && x == 1 && v > -INFINITY &&
+				v + t->lscale[1] < LOG_DBL_MIN)
+				rc = GX_ELOST;
+		}
+		for (int p = np - 1; p >= 0; p--)
+		{
+			if (++val[p] < pcard[p])
+				break;
+			val[p] = 0;
+		}
+	}
+	for (size_t x = 0; x < k; x++)
+		if (!isfinite(t->lscale[x]))
+			rc = GX_ELOST;
+	c->env->free(c->env->arg, val);
+	return rc;
+}
+
+/*
+ * Step 2: the chains, whose ends follow the direct parents in pvar and
+ * pcard (np of them on entry); returns the new count of parents, with
+ * *has_z set for an OR chain, or -1 with c->err set.
+ */
+static int
+build_chains(pctx *c, int np, int *pvar, int *pcard, int *chain_pos, int *has_z)
+{
+	const gx_pfactor *f = c->f;
+	int			aux = c->in->first_aux;
+
+	for (int s = 0; s < f->nslots; s++)
+		chain_pos[s] = -1;
+	*has_z = 0;
+	if (f->kind == GX_NOISY_OR)
+	{
+		int			z = or_chain(c);
+
+		if (z >= 0)
+		{
+			pvar[np] = z;
+			pcard[np++] = 2;
+			*has_z = 1;
+		}
+		return c->err ? -1 : np;
+	}
+	for (int s = 0; s < f->nslots && !c->err; s++)
+	{
+		size_t		ncard;
+		int			cv;
+
+		if (!f->slot_agg[s])
+			continue;
+		cv = count_chain(c, s, &aux, &ncard);
+		if (cv >= 0)
+		{
+			chain_pos[s] = np;
+			pvar[np] = cv;
+			pcard[np++] = (int) ncard;
+		}
+	}
+	return c->err ? -1 : np;
+}
+
+/*
+ * Steps 1 to 3 once the scratch arrays exist.  Returns GX_OK or an error,
+ * with c->err also set for allocation failures.
  */
 static int
 ground_inst(pctx *c, int *ws)
@@ -640,84 +977,52 @@ ground_inst(pctx *c, int *ws)
 	int		   *chain_pos = slot_d + ns;	/* ns */
 	int		   *pvar = chain_pos + ns;	/* ns + 1 */
 	int		   *pcard = pvar + ns + 1;	/* ns + 1 */
-	double		base[1] = {0.0};
-	double	   *basep = base;
-	double		off = 1.0;
-	int			np;
-	int			has_z = 0;
+	int			nk = f->kind == GX_LOGISTIC ? f->card - 1 : 1;
+	double	   *base;
+	csum	   *acc;
+	int			np,
+				has_z,
+				sure_off,
+				maybe_on;
 	size_t		cells;
 	gx_pcpt    *t;
-	int			rc;
+	int			rc = GX_OK;
 
 	slot_off[0] = 0;
 	for (int s = 0; s < ns; s++)
 		slot_off[s + 1] = slot_off[s] + f->slot_card[s];
-	if (f->kind == GX_LOGISTIC && f->card > 1)
-	{
-		basep = pa_alloc(c, sizeof(double) * (size_t) (f->card - 1));
-		if (basep == NULL)
-			return c->err;
-	}
-	fold_observed(f, c->in, slot_off, basep, &off);
-	np = distinct_missing(f, c->in, pvar, pcard, slot_d);
-
-	/* Step 2: the chains; their ends follow the direct parents. */
-	for (int s = 0; s < ns; s++)
-		chain_pos[s] = -1;
-	if (f->kind == GX_NOISY_OR)
-	{
-		int			z = or_chain(c);
-
-		if (z >= 0)
-		{
-			pvar[np] = z;
-			pcard[np++] = 2;
-			has_z = 1;
-		}
-	}
-	else
-	{
-		int			aux = c->in->first_aux;
-
-		for (int s = 0; s < ns && !c->err; s++)
-		{
-			size_t		ncard;
-			int			cv;
-
-			if (!f->slot_agg[s])
-				continue;
-			cv = count_chain(c, s, &aux, &ncard);
-			if (cv >= 0)
-			{
-				chain_pos[s] = np;
-				pvar[np] = cv;
-				pcard[np++] = (int) ncard;
-			}
-		}
-	}
+	base = pa_alloc(c, sizeof(double) * (size_t) (nk ? nk : 1));
+	acc = pa_alloc(c, sizeof(csum) * (size_t) (nk ? nk : 1));
 	if (c->err)
 		goto out;
+	fold_observed(f, c->in, slot_off, base, acc, &sure_off, &maybe_on);
+	np = distinct_missing(f, c->in, pvar, pcard, slot_d);
+	if ((np = build_chains(c, np, pvar, pcard, chain_pos, &has_z)) < 0)
+		goto out;
 
-	/* Step 3: the child's CPT. */
+	/* Step 3: the child's CPT; gx_param_size has bounded its size. */
 	cells = (size_t) f->card;
 	for (int p = 0; p < np; p++)
-		cells = mul_bounded(cells, (size_t) pcard[p], c->env->max_cells);
-	if (cells == SIZE_MAX)
-	{
-		c->err = GX_ETOOBIG;
-		goto out;
-	}
+		cells *= (size_t) pcard[p];
 	if ((t = new_cpt(c, c->in->child, f->card, np, cells)) == NULL)
 		goto out;
 	memcpy(t->parents, pvar, sizeof(int) * (size_t) np);
 	if (f->kind == GX_NOISY_OR)
-		fill_noisy_or(c, t, off, slot_d, has_z, pcard);
-	else if ((rc = fill_logistic(c, t, basep, slot_d, chain_pos, slot_off, pcard)) != GX_OK
-			 && !c->err)
+		fill_noisy_or(c, t, sure_off ? -INFINITY : base[0], slot_d, has_z, pcard);
+	else
+		rc = fill_logistic(c, t, base, slot_d, chain_pos, slot_off, pcard);
+	if (rc == GX_OK && !c->err)
+	{
+		shift_columns(t);
+		rc = guard_child(c, t, slot_d, has_z, pcard, sure_off, maybe_on);
+	}
+	if (rc != GX_OK && !c->err)
 		c->err = rc;
 out:
-	if (basep != base)
-		c->env->free(c->env->arg, basep);
+	if (base)
+		c->env->free(c->env->arg, base);
+	if (acc)
+		c->env->free(c->env->arg, acc);
 	return c->err;
 }
 
@@ -725,12 +1030,14 @@ int
 gx_param_ground(const gx_env *env, const gx_pfactor *f, const gx_pinst *in,
 				gx_pcpt *out)
 {
-	pctx		c = {env, f, in, out, 0, 0, GX_OK};
+	pctx		c = {env, f, in, out, 0, GX_OK};
+	size_t		cells,
+				hold;
 	int		   *ws;
 	int			rc;
 
-	if (gx_param_check(f) != GX_OK || check_inst(f, in) != GX_OK)
-		return GX_EINVAL;
+	if ((rc = gx_param_size(env, f, in, &cells, &hold)) != GX_OK)
+		return rc;
 	ws = pa_alloc(&c, sizeof(int) * (size_t) (5 * f->nslots + 3));
 	if (ws == NULL)
 		return GX_ENOMEM;
@@ -748,5 +1055,6 @@ gx_param_free(const gx_env *env, gx_pcpt *out, int n)
 	{
 		env->free(env->arg, out[i].parents);
 		env->free(env->arg, out[i].vals);
+		env->free(env->arg, out[i].lscale);
 	}
 }

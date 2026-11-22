@@ -25,6 +25,7 @@ disagreement, printing the model's seed.
 
 import argparse
 import json
+import math
 import random
 import sys
 import warnings
@@ -157,6 +158,7 @@ def check_model(cur, name, seed):
         parents,
         cpt_off,
         cpts,
+        cpt_lscale,
         var_attr,
     ) = cur.fetchone()
     n = len(card)
@@ -178,6 +180,11 @@ def check_model(cur, name, seed):
         for p in ps:
             nrows *= card[p]
         flat = cpts[cpt_off[j] - 1 : cpt_off[j] - 1 + nrows * k]
+        if cpt_lscale[j]:
+            # A log CPT (a parameterised factor's): add each child value's
+            # offset and leave the logs.
+            scale = cpts[cpt_lscale[j] - 1 : cpt_lscale[j] - 1 + k]
+            flat = [math.exp(x + scale[i % k]) for i, x in enumerate(flat)]
         # pgmpy's table is child-by-parent-combination, parents in order with
         # the last varying fastest: transpose our row-major layout.
         table = [[flat[r * k + x] for r in range(nrows)] for x in range(k)]

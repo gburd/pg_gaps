@@ -20,7 +20,12 @@ row per instance rather than 5^15.  `learn_cpts` keeps them fixed (method
 aggregate (`aggregate => ARRAY[true, ...]`): a child then maps to any
 number of parent entities there, which share the slot's parameters, and
 grounding expands them into an OR chain or count chains of internal
-auxiliary variables, so inference stays exact.
+auxiliary variables, so inference stays exact.  Their tables reach the engine
+as logs with a log offset per child value, so a person with thousands of
+labelled e-mails gets the exact posterior where folding into a plain
+double underflowed; an entry that cannot be represented is an error
+naming the factor.  An instance, and a factor's instances together, are
+sized against the limits before any table is built.
 
 Binned attributes: `gaps.declare_attribute(..., edges => float8[])`
 declares a numeric column (smallint, integer, bigint, numeric, real or

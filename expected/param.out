@@ -228,7 +228,7 @@ SELECT gaps.add_factor('em15', 'llm', 'llm',
 SELECT cardinality(g.cpts) AS cells FROM gaps._ground(gaps._model_id('em15')) g;
  cells 
 -------
-    87
+    99
 (1 row)
 
 WITH hand AS (
@@ -255,7 +255,7 @@ UPDATE em15 SET x1 = NULL, x2 = NULL, x3 = NULL, x4 = NULL, x5 = NULL, x6 = NULL
 	x8 = NULL, x9 = NULL, x10 = NULL, x11 = NULL, x12 = NULL, x13 = NULL, x14 = NULL,
 	x15 = NULL WHERE id = 3;
 SELECT count(*) FROM gaps.marginals('em15');                        -- fail: too big
-ERROR:  a parameterised factor's tables for variable 93 need a table of more than gaps.max_factor_cells (1048576) cells, or more than gaps.max_total_cells (67108864) together
+ERROR:  factor "llm": the instance of variable 93 needs a table of more than gaps.max_factor_cells (1048576) cells
 SELECT gaps.drop_model('em15');
  drop_model 
 ------------
@@ -829,10 +829,12 @@ ERROR:  factor "bad" is a CPT and cannot have an aggregating parent
 SELECT gaps.add_factor('ga', 'bad', 'ps', ARRAY['ms'], kind => 'noisy_or',
 	params => ARRAY[0.1, 0.2], aggregate => ARRAY[true, false]);     -- fail: length
 ERROR:  aggregate must have one true or false per parent of factor "bad"
--- A component holding the chains' deterministic tables is never sampled:
--- with the exact bound too small for it, sampling is refused.  A noisy-OR
--- over 12 missing mails: its tables hold 145 cells, elimination needs
--- more than 400.
+-- A component holding the chains' deterministic tables is never sampled.
+-- Grounding holds each instance to an estimate of what solving it needs,
+-- so with the bound too small for exact inference the instance is refused
+-- before it is built, sampling or not; the engine's own refusal to sample
+-- a component with a zero is checked in test/engine.  A noisy-OR over 12
+-- missing mails: its tables hold 145 cells, elimination more than 400.
 SELECT gaps.drop_model('ga');
  drop_model 
 ------------
@@ -899,8 +901,8 @@ SELECT count(*) AS marginals FROM gaps.marginals('ga');
 
 SET gaps.max_total_cells = 400;
 SET gaps.samples = 100;
-SELECT count(*) FROM gaps.marginals('ga');                           -- fail: not positive
-ERROR:  the component containing variable 2 is too large for exact inference and cannot be sampled
+SELECT count(*) FROM gaps.marginals('ga');                           -- fail: too big, early
+ERROR:  factor "comb": solving the instance of variable 1 would hold about 1096 cells, more than gaps.max_total_cells (400)
 RESET gaps.samples;
 RESET gaps.max_total_cells;
 -- A count chain over many members is bounded: a logistic slot over 31
@@ -965,7 +967,7 @@ SELECT gaps.map_factor('gl', 'comb', 1, 'pid', 'pid');
 
 SET gaps.max_factor_cells = 100000;
 SELECT count(*) FROM gaps.marginals('gl');                           -- fail: too big
-ERROR:  a parameterised factor's tables for variable 1 need a table of more than gaps.max_factor_cells (100000) cells, or more than gaps.max_total_cells (67108864) together
+ERROR:  factor "comb": the instance of variable 1 needs a table of more than gaps.max_factor_cells (100000) cells
 RESET gaps.max_factor_cells;
 SELECT gaps.drop_model('gl');
  drop_model 

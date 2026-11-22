@@ -17,7 +17,12 @@
  * checks Gibbs sampling against exact inference (check_gibbs_case), and
  * the expected counts of gx_expected_counts against enumeration, on each
  * random network and on a first-order network built from it
- * (check_counts_case, check_counts_firstorder).
+ * (check_counts_case, check_counts_firstorder).  A third of the random
+ * networks store some CPTs as log CPTs with offsets (to_log).
+ * Parameterised factors are checked against the dense CPT of their
+ * formula, marginals and log P(evidence) (check_param_case, one case in
+ * eight with extreme parameters), and against closed forms at 800 to
+ * 10,000 observed parents (check_param_extreme).
  * Exits non-zero on the first failure and prints the case's seed.
  */
 #include "engine/gx.h"
@@ -118,6 +123,7 @@ typedef struct net
 	int			npar[MAXV];
 	int			par[MAXV][3];
 	double		vals[MAXV][8 * 8 * 8 * 8];
+	double		lscale[MAXV][4];
 	gx_cpt		cpts[MAXV];
 	gx_bn		bn;
 } net;
@@ -193,12 +199,38 @@ gen(net *n, double zero_frac, double ev_frac)
 		n->cpts[i].nparents = n->npar[v];
 		n->cpts[i].parents = n->par[v];
 		n->cpts[i].vals = n->vals[v];
+		n->cpts[i].lscale = NULL;
 	}
 	n->bn.nvars = n->nvars;
 	n->bn.card = n->card;
 	n->bn.evidence = n->ev;
 	n->bn.ncpts = n->nvars;
 	n->bn.cpts = n->cpts;
+}
+
+/*
+ * Store about half of n's CPTs as log CPTs (gx.h), each child value with a
+ * random offset in [-50, 50] taken out of its entries, which leaves the
+ * network the same: answers and log P(evidence) must not change.
+ */
+static void
+to_log(net *n)
+{
+	for (int i = 0; i < n->nvars; i++)
+	{
+		int			v = n->cpts[i].child;
+		size_t		cells = (size_t) n->card[v];
+
+		if (rnd(2))
+			continue;
+		for (int j = 0; j < n->npar[v]; j++)
+			cells *= (size_t) n->card[n->par[v][j]];
+		for (int x = 0; x < n->card[v]; x++)
+			n->lscale[v][x] = (rnd(10001) - 5000) / 100.0;
+		for (size_t k = 0; k < cells; k++)
+			n->vals[v][k] = log(n->vals[v][k]) - n->lscale[v][k % (size_t) n->card[v]];
+		n->cpts[i].lscale = n->lscale[v];
+	}
 }
 
 static void
@@ -353,13 +385,13 @@ check_errors(void)
 	int			p1[1] = {0};
 	double		v4[4] = {0.5, 0.5, 0.5, 0.5};
 	double		v2[2] = {0.5, 0.5};
-	gx_cpt		cyc[2] = {{0, 1, p0, v4}, {1, 1, p1, v4}};
-	gx_cpt		dup[2] = {{0, 0, NULL, v2}, {0, 0, NULL, v2}};
-	gx_cpt		self[2] = {{0, 1, p1, v4}, {1, 0, NULL, v2}};
+	gx_cpt		cyc[2] = {{0, 1, p0, v4, NULL}, {1, 1, p1, v4, NULL}};
+	gx_cpt		dup[2] = {{0, 0, NULL, v2, NULL}, {0, 0, NULL, v2, NULL}};
+	gx_cpt		self[2] = {{0, 1, p1, v4, NULL}, {1, 0, NULL, v2, NULL}};
 	gx_bn		bn = {2, card, ev, 2, cyc};
 	int			bad;
 	double		negv[2] = {1.5, -0.5};
-	gx_cpt		neg[2] = {{0, 0, NULL, negv}, {1, 0, NULL, v2}};
+	gx_cpt		neg[2] = {{0, 0, NULL, negv, NULL}, {1, 0, NULL, v2, NULL}};
 
 	if (gx_check(&env, &bn, &bad) != GX_ECYCLE)
 		FAIL("a 2-cycle was not rejected as GX_ECYCLE");
@@ -375,7 +407,7 @@ check_errors(void)
 	ev[0] = 2;
 	bn.cpts = dup + 0;
 	{
-		gx_cpt		ok[2] = {{0, 0, NULL, v2}, {1, 0, NULL, v2}};
+		gx_cpt		ok[2] = {{0, 0, NULL, v2, NULL}, {1, 0, NULL, v2, NULL}};
 
 		bn.cpts = ok;
 		if (gx_check(&env, &bn, &bad) != GX_EINVAL || bad != 0)
@@ -417,14 +449,14 @@ check_bound(void)
 		par[i] = i;
 		cpts[i] = (gx_cpt)
 		{
-			i, 0, NULL, v2
+			i, 0, NULL, v2, NULL
 		};
 	}
 	for (size_t i = 0; i < ((size_t) 1 << 21); i++)
 		big[i] = 0.5;
 	cpts[N - 1] = (gx_cpt)
 	{
-		N - 1, N - 1, par, big
+		N - 1, N - 1, par, big, NULL
 	};
 	small.max_cells = 1 << 16;
 	memset(&r, 0, sizeof(r));
@@ -462,11 +494,11 @@ check_sharing(void)
 		par[2 * k + 1] = 2 * k;
 		cpts[2 * k] = (gx_cpt)
 		{
-			2 * k, 0, NULL, prior
+			2 * k, 0, NULL, prior, NULL
 		};
 		cpts[2 * k + 1] = (gx_cpt)
 		{
-			2 * k + 1, 1, &par[2 * k + 1], cond
+			2 * k + 1, 1, &par[2 * k + 1], cond, NULL
 		};
 	}
 	memset(&r, 0, sizeof(r));
@@ -518,7 +550,7 @@ check_underflow(void)
 		par[i] = i - 1;
 		cpts[i] = (gx_cpt)
 		{
-			i, i == 0 ? 0 : 1, i == 0 ? NULL : &par[i], i == 0 ? prior : noisy
+			i, i == 0 ? 0 : 1, i == 0 ? NULL : &par[i], i == 0 ? prior : noisy, NULL
 		};
 	}
 	ev[N - 1] = 1;
@@ -582,7 +614,7 @@ check_many_children(int K, double lo, double hi)
 		ev[i] = i ? 1 : -1;
 		cpts[i] = (gx_cpt)
 		{
-			i, i ? 1 : 0, i ? &zero : NULL, i ? cond : prior
+			i, i ? 1 : 0, i ? &zero : NULL, i ? cond : prior, NULL
 		};
 	}
 	memset(&r, 0, sizeof(r));
@@ -636,25 +668,25 @@ check_opposing(int K)
 	}
 	cpts[0] = (gx_cpt)
 	{
-		0, 0, NULL, prior
+		0, 0, NULL, prior, NULL
 	};
 	cpts[1] = (gx_cpt)
 	{
-		1, 1, &py, copy
+		1, 1, &py, copy, NULL
 	};
 	cpts[2] = (gx_cpt)
 	{
-		2, 1, &py, copy
+		2, 1, &py, copy, NULL
 	};
 	for (int i = 0; i < K; i++)
 		cpts[3 + i] = (gx_cpt)
 	{
-		3 + i, 1, &pa, fa
+		3 + i, 1, &pa, fa, NULL
 	};
 	for (int i = 0; i < K - 1; i++)
 		cpts[3 + K + i] = (gx_cpt)
 	{
-		3 + K + i, 1, &pb, fb
+		3 + K + i, 1, &pb, fb, NULL
 	};
 	memset(&r, 0, sizeof(r));
 	if (gx_infer(&env, &bn, &r) != GX_OK)
@@ -700,7 +732,7 @@ check_star(int N)
 		nobs += ev[i] >= 0 && ev[i] == 1;
 		cpts[i] = (gx_cpt)
 		{
-			i, i ? 1 : 0, i ? &zero : NULL, i ? cond : prior
+			i, i ? 1 : 0, i ? &zero : NULL, i ? cond : prior, NULL
 		};
 	}
 
@@ -788,8 +820,8 @@ check_alloc_failure(int samples)
 	double		c3[12];
 	double		c5[4] = {0.7, 0.3, 0.2, 0.8};
 	gx_cpt		cpts[8] = {
-		{0, 0, NULL, pr}, {1, 1, p0, c1}, {2, 1, p0, c2}, {3, 2, p12, c3},
-		{4, 0, NULL, pr}, {5, 1, p3, c5}, {6, 0, NULL, pr}, {7, 1, p6, c5}
+		{0, 0, NULL, pr, NULL}, {1, 1, p0, c1, NULL}, {2, 1, p0, c2, NULL}, {3, 2, p12, c3, NULL},
+		{4, 0, NULL, pr, NULL}, {5, 1, p3, c5, NULL}, {6, 0, NULL, pr, NULL}, {7, 1, p6, c5, NULL}
 	};
 	gx_bn		bn = {8, card, ev, 8, cpts};
 	gx_env		fenv = {fa_alloc, fa_free, NULL, NULL, (size_t) 1 << 20, (size_t) 1 << 26, 0,
@@ -1048,7 +1080,7 @@ check_gibbs_nomix(void)
 	{
 		card[v] = 2;
 		ev[v] = -1;
-		cpts[v] = v == 0 ? (gx_cpt) {0, 0, NULL, prior} : (gx_cpt) {v, 1, &hub, agree};
+		cpts[v] = v == 0 ? (gx_cpt) {0, 0, NULL, prior, NULL} : (gx_cpt) {v, 1, &hub, agree, NULL};
 	}
 	g.samples = GIBBS_N;
 	g.sample_always = 1;
@@ -1101,9 +1133,9 @@ check_gibbs_seed(void)
 			ev[b + i] = -1;
 			par[b + i] = b + i - 1;
 		}
-		cpts[b] = (gx_cpt) {b, 0, NULL, pr};
-		cpts[b + 1] = (gx_cpt) {b + 1, 1, &par[b + 1], k == 2 ? c1b : c1};
-		cpts[b + 2] = (gx_cpt) {b + 2, 1, &par[b + 2], c2};
+		cpts[b] = (gx_cpt) {b, 0, NULL, pr, NULL};
+		cpts[b + 1] = (gx_cpt) {b + 1, 1, &par[b + 1], k == 2 ? c1b : c1, NULL};
+		cpts[b + 2] = (gx_cpt) {b + 2, 1, &par[b + 2], c2, NULL};
 	}
 	g.no_sharing = 1;
 	g.samples = GIBBS_N;
@@ -1179,7 +1211,7 @@ check_gibbs_fallback(void)
 			par[v][np++] = v - 1;
 		cpts[v] = (gx_cpt)
 		{
-			v, np, par[v], np == 0 ? prior : np == 1 ? one : two
+			v, np, par[v], np == 0 ? prior : np == 1 ? one : two, NULL
 		};
 	}
 	if (gx_infer(&env, &bn, &exact) != GX_OK || exact.comp_samples[0] != 0)
@@ -1409,7 +1441,7 @@ check_counts_firstorder(uint64_t cseed)
 				par[g][np++] = (r - 1) * T + v;
 			cpts[g] = (gx_cpt)
 			{
-				g, np, par[g], (vert && r > 0) ? vvals[v] : t.vals[v]
+				g, np, par[g], (vert && r > 0) ? vvals[v] : t.vals[v], NULL
 			};
 			group[g] = (vert && r > 0) ? T + v : v;
 		}
@@ -1481,8 +1513,8 @@ check_counts_fixed(void)
 		ev[2 * k] = -1;
 		ev[2 * k + 1] = k % 2;
 		par[2 * k + 1] = 2 * k;
-		cpts[2 * k] = (gx_cpt) {2 * k, 0, NULL, prior};
-		cpts[2 * k + 1] = (gx_cpt) {2 * k + 1, 1, &par[2 * k + 1], cond};
+		cpts[2 * k] = (gx_cpt) {2 * k, 0, NULL, prior, NULL};
+		cpts[2 * k + 1] = (gx_cpt) {2 * k + 1, 1, &par[2 * k + 1], cond, NULL};
 		group[2 * k] = 0;
 		group[2 * k + 1] = 1;
 	}
@@ -1539,6 +1571,7 @@ check_counts_fixed(void)
 #define PMAXM 8					/* explicit members, all slots together */
 
 static long param_aux_cases;		/* compared cases with auxiliary variables */
+static long param_extreme_cases;	/* compared cases with extreme parameters */
 #define PMAXS 3					/* slots */
 
 /* A random parameterised factor and one instance of it. */
@@ -1552,14 +1585,15 @@ typedef struct pcase
 	int			mvar[PMAXM];	/* member -> distinct variable 0..nd-1 */
 	int			mval[PMAXM];	/* the member's evidence, or -1 */
 	int			nd;				/* distinct member variables */
+	int			extreme;		/* parameters near the limits of a double */
 	int			dcard[PMAXM];
 	int			dev[PMAXM];
 } pcase;
 
 /*
  * The formula, written out over every explicit member, independently of
- * gx_param.c: P(child = k | the members' values val[] by distinct
- * variable).
+ * gx_param.c: log P(child = k | the members' values val[] by distinct
+ * variable), in logs so that extreme parameters keep their precision.
  */
 static double
 pformula(const pcase *pc, const int *val, int k)
@@ -1568,18 +1602,21 @@ pformula(const pcase *pc, const int *val, int k)
 
 	if (f->kind == GX_NOISY_OR)
 	{
-		double		off = 1.0 - f->params[0];
+		double		loff = log1p(-f->params[0]);
 
 		for (int s = 0; s < f->nslots; s++)
 			for (int i = pc->off[s]; i < pc->off[s + 1]; i++)
 				if (val[pc->mvar[i]] > 0)
-					off *= 1.0 - f->params[1 + s];
-		return k == 0 ? off : 1.0 - off;
+					loff += log1p(-f->params[1 + s]);
+		if (k == 0)
+			return loff;
+		return loff > -0.6931471805599453 ? log(-expm1(loff)) : log1p(-exp(loff));
 	}
 	else
 	{
 		int			width = 1;
 		double		sc[4],
+					mx,
 					z = 0.0;
 
 		for (int s = 0; s < f->nslots; s++)
@@ -1599,9 +1636,12 @@ pformula(const pcase *pc, const int *val, int k)
 				base += pc->slot_card[s];
 			}
 		}
+		mx = sc[0];
+		for (int c = 1; c < f->card; c++)
+			mx = fmax(mx, sc[c]);
 		for (int c = 0; c < f->card; c++)
-			z += exp(sc[c]);
-		return exp(sc[k]) / z;
+			z += exp(sc[c] - mx);
+		return sc[k] - mx - log(z);
 	}
 }
 
@@ -1646,29 +1686,91 @@ pgen(pcase *pc)
 			}
 			pc->mvar[nm] = reuse;
 		}
+
+		/* An aggregating slot's variables are increasing, as grounding gives them. */
+		for (int i = pc->off[s] + 1; i < nm; i++)
+			for (int j = i; j > pc->off[s] && pc->mvar[j - 1] > pc->mvar[j]; j--)
+			{
+				int			t = pc->mvar[j];
+
+				pc->mvar[j] = pc->mvar[j - 1];
+				pc->mvar[j - 1] = t;
+			}
 	}
 	pc->off[f->nslots] = nm;
 	for (int i = 0; i < nm; i++)
 		pc->mval[i] = pc->dev[pc->mvar[i]];
 	f->slot_card = pc->slot_card;
 	f->slot_agg = pc->slot_agg;
+	/*
+	 * One case in eight has extreme parameters: noisy-OR probabilities
+	 * within 1e-12 of 0 or 1, logistic weights up to 1e3 (so a score of
+	 * several thousand), where the tables must not lose their precision.
+	 */
+	pc->extreme = rnd(8) == 0;
 	if (f->kind == GX_NOISY_OR)
 	{
 		f->nparams = 1 + f->nslots;
 		for (int i = 0; i < f->nparams; i++)
+		{
 			pc->params[i] = rnd(8) == 0 ? (double) rnd(2) : rnd(1000) / 1000.0;
+			if (pc->extreme && rnd(2))
+				pc->params[i] = rnd(2) ? 1e-12 * (1 + rnd(9)) : 1.0 - 1e-12 * (1 + rnd(9));
+		}
 	}
 	else
 	{
 		int			width = 1;
+		double		scale = pc->extreme ? 1000.0 : 1.0;
 
 		for (int s = 0; s < f->nslots; s++)
 			width += pc->slot_card[s];
 		f->nparams = (f->card - 1) * width;
 		for (int i = 0; i < f->nparams; i++)
-			pc->params[i] = (rnd(6001) - 3000) / 1000.0;
+			pc->params[i] = scale * (rnd(6001) - 3000) / 1000.0;
 	}
 	f->params = pc->params;
+}
+
+/*
+ * log P(evidence) of the dense network a and the parameterised one b,
+ * from gx_expected_counts with every CPT its own group, agree to 1e-12
+ * relative: the log offsets of b's tables are part of it.
+ */
+static void
+check_param_loglik(const gx_bn *a, const gx_bn *b, uint64_t cseed)
+{
+	const gx_bn *bns[2] = {a, b};
+	double		ll[2];
+
+	for (int k = 0; k < 2; k++)
+	{
+		const gx_bn *bn = bns[k];
+		int		   *group = malloc(sizeof(int) * (size_t) bn->ncpts);
+		size_t	   *gsize = malloc(sizeof(size_t) * (size_t) bn->ncpts);
+		size_t		total = 0;
+		double	   *counts;
+		gx_counts	ec;
+
+		for (int i = 0; i < bn->ncpts; i++)
+		{
+			group[i] = i;
+			gsize[i] = (size_t) bn->card[bn->cpts[i].child];
+			for (int j = 0; j < bn->cpts[i].nparents; j++)
+				gsize[i] *= (size_t) bn->card[bn->cpts[i].parents[j]];
+			total += gsize[i];
+		}
+		counts = calloc(total, sizeof(double));
+		ec = (gx_counts) {group, bn->ncpts, gsize, counts, 0, 0, 0, 0};
+		if (gx_expected_counts(&env, bn, &ec) != GX_OK)
+			FAIL("param: expected counts failed on the %s network", k ? "parameterised" : "dense");
+		ll[k] = ec.loglik;
+		free(counts);
+		free(group);
+		free(gsize);
+	}
+	if (fabs(ll[0] - ll[1]) > 1e-12 * fmax(1.0, fabs(ll[0])))
+		FAIL("param: loglik dense %.17g, parameterised %.17g", ll[0], ll[1]);
 }
 
 /*
@@ -1687,6 +1789,7 @@ check_param_case(uint64_t cseed)
 				ev[PMAXM + 1 + 64];
 	double		prior[PMAXM][4];
 	double	   *dense;
+	static const double dense_scale[4] = {0.0, 0.0, 0.0, 0.0};
 	int			dpar[PMAXM];
 	gx_cpt		cpts[PMAXM + 1 + 64];
 	gx_pcpt		pcpts[64 + 1];
@@ -1716,14 +1819,17 @@ check_param_case(uint64_t cseed)
 			sum += (prior[d][x] = 0.05 + rnd(1000) / 1000.0);
 		for (int x = 0; x < card[d]; x++)
 			prior[d][x] /= sum;
-		cpts[d] = (gx_cpt) {d, 0, NULL, prior[d]};
+		cpts[d] = (gx_cpt) {d, 0, NULL, prior[d], NULL};
 		dpar[d] = d;
 		rows *= (size_t) card[d];
 	}
 	card[child] = pc.f.card;
 	ev[child] = rnd(2) ? -1 : rnd(pc.f.card);
 
-	/* The dense CPT, every member variable a parent, the last fastest. */
+	/*
+	 * The dense CPT, every member variable a parent, the last fastest, as
+	 * a log CPT with no offsets.
+	 */
 	dense = malloc(sizeof(double) * rows * (size_t) pc.f.card);
 	memset(vals, 0, sizeof(vals));
 	for (size_t r = 0; r < rows; r++)
@@ -1737,7 +1843,7 @@ check_param_case(uint64_t cseed)
 			vals[d] = 0;
 		}
 	}
-	cpts[child] = (gx_cpt) {child, pc.nd, dpar, dense};
+	cpts[child] = (gx_cpt) {child, pc.nd, dpar, dense, dense_scale};
 	a = (gx_bn) {pc.nd + 1, card, ev, pc.nd + 1, cpts};
 
 	/* The parameterised instance; its variables are the same numbers. */
@@ -1768,9 +1874,10 @@ check_param_case(uint64_t cseed)
 				card[t->child] = t->card;
 				ev[t->child] = -1;
 				for (size_t x = 0; x < t->ncells; x++)
-					zero_aux |= t->vals[x] == 0.0;
+					zero_aux |= t->vals[x] == -INFINITY;
 			}
-			bc[pc.nd + i] = (gx_cpt) {t->child, t->nparents, t->parents, t->vals};
+			bc[pc.nd + i] = (gx_cpt) {t->child, t->nparents, t->parents, t->vals,
+				t->lscale};
 			for (int p = 0; p < t->nparents; p++)
 				if (t->parents[p] < child && pc.dev[t->parents[p]] >= 0)
 					FAIL("param: CPT %d has observed parent %d", i, t->parents[p]);
@@ -1795,9 +1902,11 @@ check_param_case(uint64_t cseed)
 								 v, x, M(&ra, v, x), M(&rb, v, x));
 			free_result(&a, &ra);
 			free_result(&b, &rb);
+			check_param_loglik(&a, &b, cseed);
 			nchecks++;
 			if (naux > 1)
 				param_aux_cases++;
+			param_extreme_cases += pc.extreme;
 		}
 
 		/* Deterministic auxiliary CPTs rule out sampling. */
@@ -1898,6 +2007,179 @@ check_param_fixed(void)
 	}
 }
 
+/* log(1 + exp(x)), without overflow. */
+static double
+softplus(double x)
+{
+	return x > 0 ? x + log1p(exp(-x)) : log1p(exp(x));
+}
+
+/* log(exp(a) + exp(b)). */
+static double
+log_add(double a, double b)
+{
+	double		m = fmax(a, b);
+
+	return m == -INFINITY ? m : m + log(exp(a - m) + exp(b - m));
+}
+
+#define XM 2					/* missing members in check_param_extreme */
+
+/*
+ * A closed form against a person with n observed active members ("llm",
+ * prior 0.3) and XM missing ones in an aggregating slot, a missing direct
+ * parent y (prior 0.5), and the child observed at its first value, the
+ * shape whose tables underflowed when the observed members were folded
+ * into a plain double.  noisy-OR (leak 0.05, p_y 0.3, p_e = arg): y's
+ * posterior is (1 - p_y) / (2 - p_y) whatever n is.  logistic (bias -1,
+ * w_e = arg per active member, w_y 0.5): the score reaches n x arg.  The
+ * marginals of y and of a missing member, and log P(evidence) from
+ * gx_expected_counts, must match the closed form to 1e-12 relative.
+ */
+static void
+check_param_extreme(int kind, int n, double arg)
+{
+	uint64_t	cseed = (uint64_t) n;
+	int			nv0 = 2 + n + XM,
+				nslot = n + XM;
+	int		   *card = malloc(sizeof(int) * (size_t) (nv0 + 64)),
+			   *ev = malloc(sizeof(int) * (size_t) (nv0 + 64)),
+			   *var = malloc(sizeof(int) * (size_t) (nslot + 1)),
+			   *val = malloc(sizeof(int) * (size_t) (nslot + 1)),
+			   *group = malloc(sizeof(int) * (size_t) (nv0 + 64));
+	gx_cpt	   *cpts = malloc(sizeof(gx_cpt) * (size_t) (nv0 + 64));
+	size_t	   *gsize = malloc(sizeof(size_t) * (size_t) (nv0 + 64));
+	double		pa[2] = {0.7, 0.3},
+				py[2] = {0.5, 0.5};
+	double		nor[3] = {0.05, arg, 0.3},
+				lgs[5] = {-1.0, 0.0, arg, 0.0, 0.5};
+	int			sc[2] = {2, 2},
+				off[3] = {0, nslot, nslot + 1};
+	unsigned char agg[2] = {1, 0};
+	gx_pfactor	f = {kind, 2, 2, sc, agg, kind == GX_NOISY_OR ? 3 : 5,
+	kind == GX_NOISY_OR ? nor : lgs};
+	gx_pinst	in = {0, off, var, val, nv0};
+	gx_pcpt		t[XM + 1];
+	gx_bn		bn;
+	gx_result	r;
+	gx_counts	ec;
+	double	   *counts;
+	double		want_y,
+				want_m,
+				want_ll;
+	int			naux,
+				nv;
+	size_t		ncounts = 0;
+
+	/* Step 1: the network.  0 the child, 1 y, then the members. */
+	card[0] = card[1] = 2;
+	ev[0] = 0;
+	ev[1] = -1;
+	cpts[1] = (gx_cpt) {1, 0, NULL, py, NULL};
+	for (int i = 0; i < nslot; i++)
+	{
+		card[2 + i] = 2;
+		ev[2 + i] = i < n ? 1 : -1;
+		cpts[2 + i] = (gx_cpt) {2 + i, 0, NULL, pa, NULL};
+		var[i] = 2 + i;
+		val[i] = ev[2 + i];
+	}
+	var[nslot] = 1;
+	val[nslot] = -1;
+	naux = gx_param_naux(&f, &in);
+	if (naux != XM || gx_param_ground(&env, &f, &in, t) != GX_OK)
+		FAIL("extreme: gx_param_ground failed (%d auxiliary variables)", naux);
+	for (int i = 0; i <= naux; i++)
+	{
+		int			slot = i < naux ? nv0 + i : 0;
+
+		if (i < naux)
+		{
+			card[slot] = t[i].card;
+			ev[slot] = -1;
+		}
+		cpts[slot] = (gx_cpt) {t[i].child, t[i].nparents, t[i].parents, t[i].vals, t[i].lscale};
+	}
+	nv = nv0 + naux;
+	bn = (gx_bn) {nv, card, ev, nv, cpts};
+
+	/* Step 2: the closed form. */
+	if (kind == GX_NOISY_OR)
+	{
+		double		q = 0.7 + 0.3 * (1.0 - arg);
+
+		want_y = 0.7 / 1.7;
+		want_m = 0.3 * (1.0 - arg) / q;
+		want_ll = n * log(0.3) + log(0.5) + log1p(-0.05) + n * log1p(-arg) + XM * log(q) +
+			log(1.7);
+	}
+	else
+	{
+		double		lj[2] = {-INFINITY, -INFINITY},
+					lm = -INFINITY,
+					b = -1.0 + arg * n;
+
+		/*
+		 * Sum over y and the count c of active missing members.  log P(off)
+		 * = -softplus(b + d) = -b - d - log1p(exp(-(b + d))) for b + d > 0,
+		 * kept relative to the common -b, which at a score of 1e4 would
+		 * otherwise cost the sum its last four digits.
+		 */
+		for (int y = 0; y < 2; y++)
+			for (int c = 0; c <= XM; c++)
+			{
+				double		d = arg * c + 0.5 * y;
+				double		lw = log(c == 1 ? 2.0 : 1.0) + c * log(0.3) + (XM - c) * log(0.7)
+					+ (b + d > 0 ? -d - log1p(exp(-(b + d))) : b - softplus(b + d));
+
+				lj[y] = log_add(lj[y], lw);
+				if (c > 0)
+					lm = log_add(lm, lw + log(c / (double) XM));
+			}
+		want_ll = n * log(0.3) + log(0.5) - b + log_add(lj[0], lj[1]);
+		want_y = exp(lj[1] - log_add(lj[0], lj[1]));
+		want_m = exp(lm - log_add(lj[0], lj[1]));
+	}
+
+	/* Step 3: the marginals. */
+	memset(&r, 0, sizeof(r));
+	if (gx_check(&env, &bn, &ec.bad_var) != GX_OK || gx_infer(&env, &bn, &r) != GX_OK)
+		FAIL("extreme: inference failed, kind %d, n %d, %g", kind, n, arg);
+	if (fabs(M(&r, 1, 1) - want_y) > 1e-12 * want_y ||
+		fabs(M(&r, 2 + n, 1) - want_m) > 1e-12 * want_m)
+		FAIL("extreme: kind %d, n %d, %g: P(y on) %.17g, want %.17g; member %.17g, want %.17g",
+			 kind, n, arg, M(&r, 1, 1), want_y, M(&r, 2 + n, 1), want_m);
+	free_result(&bn, &r);
+
+	/* Step 4: log P(evidence), every CPT its own group. */
+	for (int i = 0; i < nv; i++)
+	{
+		group[i] = i;
+		gsize[i] = (size_t) card[cpts[i].child];
+		for (int j = 0; j < cpts[i].nparents; j++)
+			gsize[i] *= (size_t) card[cpts[i].parents[j]];
+		ncounts += gsize[i];
+	}
+	counts = calloc(ncounts, sizeof(double));
+	ec = (gx_counts) {group, nv, gsize, counts, 0, 0, 0, 0};
+	if (gx_expected_counts(&env, &bn, &ec) != GX_OK)
+		FAIL("extreme: expected counts failed, kind %d, n %d, %g", kind, n, arg);
+	if (fabs(ec.loglik - want_ll) > 1e-12 * fabs(want_ll))
+		FAIL("extreme: kind %d, n %d, %g: loglik %.17g, want %.17g", kind, n, arg,
+			 ec.loglik, want_ll);
+	nchecks += 2;
+
+	gx_param_free(&env, t, naux + 1);
+	free(counts);
+	free(card);
+	free(ev);
+	free(var);
+	free(val);
+	free(group);
+	free(cpts);
+	free(gsize);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1922,6 +2204,13 @@ main(int argc, char **argv)
 	check_gibbs_nomix();
 	check_counts_fixed();
 	check_param_fixed();
+	check_param_extreme(GX_NOISY_OR, 800, 0.6);	/* 0.4^800 is subnormal */
+	check_param_extreme(GX_NOISY_OR, 1000, 0.6);
+	check_param_extreme(GX_NOISY_OR, 10000, 0.6);
+	check_param_extreme(GX_NOISY_OR, 1000, 0.99);
+	check_param_extreme(GX_NOISY_OR, 10000, 0.99);
+	check_param_extreme(GX_LOGISTIC, 1000, 10.0);
+	check_param_extreme(GX_LOGISTIC, 10000, 1.0);
 	for (long i = 0; i < cases; i++)
 	{
 		net			n;
@@ -1931,6 +2220,8 @@ main(int argc, char **argv)
 
 		rng = cseed;
 		gen(&n, zero, evf);
+		if (i % 3 == 1)
+			to_log(&n);
 		check_case(&n, cseed);
 		check_counts_case(&n, cseed);
 		check_counts_firstorder(cseed);
@@ -1952,8 +2243,14 @@ main(int argc, char **argv)
 
 		FAIL("no parameterised case had two or more auxiliary variables");
 	}
-	printf("engine: parameterised factors: %ld cases with auxiliary chains\n",
-		   param_aux_cases);
+	if (cases >= 100 && param_extreme_cases == 0)
+	{
+		uint64_t	cseed = seed;
+
+		FAIL("no parameterised case had extreme parameters");
+	}
+	printf("engine: parameterised factors: %ld cases with auxiliary chains, %ld extreme\n",
+		   param_aux_cases, param_extreme_cases);
 	printf("engine: expected counts: %ld families with two or more missing, %ld cache hits\n",
 		   counts_multi_missing, counts_cache_hits);
 	printf("engine: %ld checks passed (seed %llu, %ld random cases)\n",

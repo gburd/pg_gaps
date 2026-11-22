@@ -48,7 +48,7 @@ class Network:
     instance's family and the factor (cpt_off) it belongs to."""
 
     def __init__(self, row):
-        card, evidence, child, parent_off, parents, cpt_off, _, _ = row
+        card, evidence, child, parent_off, parents, cpt_off, _, _, _ = row
         self.card = card
         self.ev = {v: evidence[v] - 1 for v in range(len(card)) if evidence[v] > 0}
         self.inst = []

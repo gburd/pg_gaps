@@ -136,61 +136,61 @@ bad_arg(const char *msg)
 			 errmsg_internal("%s", msg)));
 }
 
-/* A growable int or float8 buffer for the output arrays. */
+/* A growable int buffer for the output arrays. */
 typedef struct obuf
 {
 	size_t		n;
 	size_t		cap;
-	size_t		elem;
-	void	   *data;
+	int		   *data;
 } obuf;
 
-/* Room for k more elements; the output must fit in one SQL array. */
-static void *
-obuf_room(obuf *b, size_t k)
-{
-	if (b->n + k > MaxArraySize)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("a parameterised factor's ground CPTs need more than %d array elements",
-						(int) MaxArraySize)));
-	if (b->n + k > b->cap)
-	{
-		size_t		cap = Max(b->cap * 2, b->n + k);
-
-		cap = Max(cap, 16);
-		b->data = b->data ? repalloc_huge(b->data, cap * b->elem)
-			: MemoryContextAllocHuge(CurrentMemoryContext, cap * b->elem);
-		b->cap = cap;
-	}
-	return (char *) b->data + b->n * b->elem;
-}
-
+/* Append x; the buffers are bounded by the cells checked in pass 1. */
 static void
 obuf_int(obuf *b, int x)
 {
-	*(int *) obuf_room(b, 1) = x;
-	b->n++;
+	if (b->n == b->cap)
+	{
+		size_t		cap = Max(b->cap * 2, 16);
+
+		b->data = b->data ? repalloc_huge(b->data, cap * sizeof(int))
+			: MemoryContextAllocHuge(CurrentMemoryContext, cap * sizeof(int));
+		b->cap = cap;
+	}
+	b->data[b->n++] = x;
+}
+
+/*
+ * A one-dimensional array of n elements of type (int4 or float8), with
+ * its data uninitialized, for the caller to fill: built in place, so the
+ * output is never held twice.  The caller has checked n.
+ */
+static ArrayType *
+new_array(size_t n, Oid type)
+{
+	size_t		elem = type == INT4OID ? sizeof(int32) : sizeof(float8);
+	Size		bytes = ARR_OVERHEAD_NONULLS(1) + n * elem;
+	ArrayType  *a;
+
+	if (n == 0)
+		return construct_empty_array(type);
+	a = MemoryContextAllocHuge(CurrentMemoryContext, bytes);
+	SET_VARSIZE(a, bytes);
+	a->ndim = 1;
+	a->dataoffset = 0;
+	a->elemtype = type;
+	*ARR_DIMS(a) = (int) n;
+	*ARR_LBOUND(a) = 1;
+	return a;
 }
 
 static Datum
-obuf_array(obuf *b, Oid type)
+obuf_array(obuf *b)
 {
-	Datum	   *d = palloc(sizeof(Datum) * (b->n ? b->n : 1));
+	ArrayType  *a = new_array(b->n, INT4OID);
 
-	for (size_t i = 0; i < b->n; i++)
-		d[i] = type == INT4OID ? Int32GetDatum(((int *) b->data)[i])
-			: Float8GetDatum(((double *) b->data)[i]);
-
-	/*
-	 * construct_array, not construct_array_builtin, which in PostgreSQL 17
-	 * does not know FLOAT8OID.
-	 */
-	return PointerGetDatum(type == INT4OID
-						   ? construct_array(d, (int) b->n, INT4OID, sizeof(int32), true,
-											 TYPALIGN_INT)
-						   : construct_array(d, (int) b->n, FLOAT8OID, sizeof(float8),
-											 FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
+	if (b->n)
+		memcpy(ARR_DATA_PTR(a), b->data, sizeof(int) * b->n);
+	return PointerGetDatum(a);
 }
 
 /* The output: gaps._infer's arrays for the instances' CPTs. */
@@ -201,60 +201,82 @@ typedef struct pout
 	obuf		parent_off;
 	obuf		parents;
 	obuf		cpt_off;
-	obuf		cpts;
+	obuf		cpt_lscale;
+	double	   *cpts;			/* the data of cpts_array */
+	size_t		ncpts;			/* elements written */
+	ArrayType  *cpts_array;
 } pout;
 
 /*
- * Turn an error code of gx_param_ground into an ERROR, naming the
- * instance's child variable.
+ * Turn an error code of gx_param_ground or gx_param_size for the instance
+ * of variable child into an ERROR naming the factor.  hold is
+ * gx_param_size's estimate of what solving the instance holds.
  */
 static void
-report(int rc, int child)
+report(int rc, const char *fname, int child, size_t hold)
 {
+	if (rc == GX_ETOOBIG && hold == SIZE_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("factor \"%s\": the instance of variable %d needs a table of more than "
+						"gaps.max_factor_cells (%d) cells", fname, child,
+						gaps_max_factor_cells),
+				 errhint("Raise gaps.max_factor_cells, or give the instance fewer missing "
+						 "parents.")));
 	if (rc == GX_ETOOBIG)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("a parameterised factor's tables for variable %d need a table of more "
-						"than gaps.max_factor_cells (%d) cells, or more than "
-						"gaps.max_total_cells (%d) together", child, gaps_max_factor_cells,
-						gaps_max_total_cells),
-				 errhint("Raise the limits, or give the instance fewer missing parents.")));
+				 errmsg("factor \"%s\": solving the instance of variable %d would hold "
+						"about %zu cells, more than gaps.max_total_cells (%d)", fname, child,
+						hold, gaps_max_total_cells),
+				 errhint("Raise gaps.max_total_cells, or give the instance fewer missing "
+						 "parents.")));
+	if (rc == GX_ELOST)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("factor \"%s\": a positive probability in the table of variable %d "
+						"is not representable", fname, child),
+				 errdetail("Its parameters are so extreme that a value comes out as zero "
+						   "or below the smallest normal double.")));
 	if (rc == GX_ENOMEM)
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of memory grounding a parameterised factor")));
+				 errmsg("out of memory grounding factor \"%s\"", fname)));
 	if (rc != GX_OK)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("parameterised factor instance of variable %d is malformed, or a "
-						"logistic score is not finite", child)));
+				 errmsg("factor \"%s\": the instance of variable %d is malformed, or a "
+						"logistic score is not finite", fname, child),
+				 errdetail("An aggregating slot's member variables must be distinct.")));
 }
 
 /*
- * Ground one instance and append its CPTs to o.  The instance's CPTs land
- * in one component, so gx_param_ground bounds their total by
- * gaps.max_total_cells as well as each by gaps.max_factor_cells.
+ * Ground one instance and append its CPTs to o: each table's values, then
+ * its log offsets, in o->cpts, whose room pass 1 reserved.
  */
 static void
-emit_instance(const gx_env *env, const gx_pfactor *f, const gx_pinst *in, pout *o)
+emit_instance(const gx_env *env, const gx_pfactor *f, const gx_pinst *in,
+			  const char *fname, pout *o)
 {
 	int			naux = gx_param_naux(f, in);
 	gx_pcpt    *t = palloc(sizeof(gx_pcpt) * (size_t) (naux + 1));
 	int			rc;
 
 	rc = gx_param_ground(env, f, in, t);
-	report(rc, in->child);
+	report(rc, fname, in->child, 0);
 	for (int i = 0; i <= naux; i++)
 	{
 		if (i < naux)
 			obuf_int(&o->aux_card, t[i].card);
 		obuf_int(&o->child, t[i].child);
-		obuf_int(&o->cpt_off, (int) o->cpts.n + 1);
-		memcpy(obuf_room(&o->cpts, t[i].ncells), t[i].vals, sizeof(double) * t[i].ncells);
-		o->cpts.n += t[i].ncells;
-		memcpy(obuf_room(&o->parents, (size_t) t[i].nparents), t[i].parents,
-			   sizeof(int) * (size_t) t[i].nparents);
-		o->parents.n += (size_t) t[i].nparents;
+		obuf_int(&o->cpt_off, (int) o->ncpts + 1);
+		memcpy(o->cpts + o->ncpts, t[i].vals, sizeof(double) * t[i].ncells);
+		o->ncpts += t[i].ncells;
+		obuf_int(&o->cpt_lscale, (int) o->ncpts + 1);
+		memcpy(o->cpts + o->ncpts, t[i].lscale, sizeof(double) * (size_t) t[i].card);
+		o->ncpts += (size_t) t[i].card;
+		for (int p = 0; p < t[i].nparents; p++)
+			obuf_int(&o->parents, t[i].parents[p]);
 		obuf_int(&o->parent_off, (int) o->parents.n + 1);
 	}
 	gx_param_free(env, t, naux + 1);
@@ -262,32 +284,13 @@ emit_instance(const gx_env *env, const gx_pfactor *f, const gx_pinst *in, pout *
 }
 
 /*
- * gaps._param_cpts(kind text, child_card int, slot_card int[],
- *					slot_agg boolean[], params float8[], first_aux int,
- *					inst_child int[], inst_off int[], member_var int[],
- *					member_ev int[])
- * RETURNS (aux_card int[], child int[], parent_off int[], parents int[],
- *			cpt_off int[], cpts float8[])
- *
- * The factor has one parent slot per element of slot_card (the slot's
- * domain size) and slot_agg (whether it aggregates).  Instance i has child
- * variable inst_child[i]; its slot s holds the members inst_off[i * ns +
- * s] .. inst_off[i * ns + s + 1] - 1 (1-based) of member_var and member_ev
- * (the member's evidence as in gaps._infer: 0 missing, else the 1-based
- * value), with ns slots.  Auxiliary variables are numbered from first_aux,
- * instance by instance, and aux_card gives their cardinalities in order.
- * Per instance, the auxiliary variables' CPTs come first, then the
- * child's.  parent_off has one more element than child, from 1; cpt_off
- * and parent_off are 1-based into the returned cpts and parents.
- */
-/*
- * Read and check the factor's description, arguments 0 to 4 of
+ * Read and check the factor's description, arguments 1 to 5 of
  * gaps._param_cpts, into f; the arrays are palloc'd.
  */
 static void
 read_factor(FunctionCallInfo fcinfo, gx_pfactor *f)
 {
-	char	   *kind = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *kind = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	int		   *slot_card;
 	unsigned char *slot_agg;
 	double	   *params;
@@ -296,10 +299,10 @@ read_factor(FunctionCallInfo fcinfo, gx_pfactor *f)
 
 	f->kind = strcmp(kind, "logistic") == 0 ? GX_LOGISTIC
 		: strcmp(kind, "noisy_or") == 0 ? GX_NOISY_OR : 0;
-	f->card = PG_GETARG_INT32(1);
-	ns = get_ints(fcinfo, 2, "slot_card", &slot_card);
-	nagg = get_bools(fcinfo, 3, "slot_agg", &slot_agg);
-	f->nparams = get_floats(fcinfo, 4, "params", &params);
+	f->card = PG_GETARG_INT32(2);
+	ns = get_ints(fcinfo, 3, "slot_card", &slot_card);
+	nagg = get_bools(fcinfo, 4, "slot_agg", &slot_agg);
+	f->nparams = get_floats(fcinfo, 5, "params", &params);
 	if (nagg != ns)
 		bad_arg("slot_card and slot_agg must have the same length");
 	f->nslots = ns;
@@ -310,28 +313,147 @@ read_factor(FunctionCallInfo fcinfo, gx_pfactor *f)
 		bad_arg("malformed parameterised factor (kind, domain sizes or parameters)");
 }
 
+/* The instances of gaps._param_cpts, arguments 6 to 10, checked. */
+typedef struct pinsts
+{
+	int			first_aux;
+	int			ninst;
+	int		   *ichild;
+	int		   *ioff;
+	int		   *mvar;
+	int		   *mval;
+} pinsts;
+
+static void
+read_instances(FunctionCallInfo fcinfo, int ns, pinsts *pi)
+{
+	int		   *mev;
+	int			noff,
+				nm,
+				nmev;
+
+	pi->first_aux = PG_GETARG_INT32(6);
+	pi->ninst = get_ints(fcinfo, 7, "inst_child", &pi->ichild);
+	noff = get_ints(fcinfo, 8, "inst_off", &pi->ioff);
+	nm = get_ints(fcinfo, 9, "member_var", &pi->mvar);
+	nmev = get_ints(fcinfo, 10, "member_ev", &mev);
+	if (nmev != nm || (int64) noff != (int64) pi->ninst * ns + 1 || pi->ioff[0] != 1 ||
+		pi->ioff[noff - 1] != nm + 1)
+		bad_arg("inst_off must run from 1 to the number of members plus 1, one entry "
+				"per slot of each instance and one more");
+	for (int i = 1; i < noff; i++)
+		if (pi->ioff[i] < pi->ioff[i - 1])
+			bad_arg("inst_off must not decrease");
+	pi->mval = palloc(sizeof(int) * (nm ? nm : 1));
+	for (int i = 0; i < nm; i++)
+		pi->mval[i] = mev[i] - 1;
+	if (pi->first_aux < 1)
+		bad_arg("first_aux must be positive");
+}
+
+/* Instance i of pi as the engine takes it, offsets into offp (ns + 1). */
+static void
+instance(const pinsts *pi, int ns, int i, int *offp, gx_pinst *in)
+{
+	int			base = pi->ioff[i * ns] - 1;
+
+	for (int s = 0; s <= ns; s++)
+		offp[s] = pi->ioff[i * ns + s] - 1 - base;
+	in->child = pi->ichild[i];
+	in->off = offp;
+	in->var = pi->mvar + base;
+	in->value = pi->mval + base;
+	in->first_aux = 0;
+}
+
+/*
+ * Pass 1: size every instance (gx_param_size, which applies the
+ * per-instance bounds) and the factor's tables together, and refuse
+ * before anything is built.  Returns the total number of float8s.
+ */
+static size_t
+size_factor(const gx_env *env, const gx_pfactor *f, const pinsts *pi, const char *fname)
+{
+	int		   *offp = palloc(sizeof(int) * (f->nslots + 1));
+	size_t		total = 0;
+	int64		naux = 0;
+
+	for (int i = 0; i < pi->ninst; i++)
+	{
+		gx_pinst	in;
+		size_t		cells,
+					hold;
+		int			rc;
+
+		CHECK_FOR_INTERRUPTS();
+		instance(pi, f->nslots, i, offp, &in);
+		rc = gx_param_size(env, f, &in, &cells, &hold);
+		report(rc, fname, in.child, hold);
+		total += cells;
+		naux += gx_param_naux(f, &in);
+		if (total > env->max_total_cells)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("factor \"%s\": its instances' tables need more than "
+							"gaps.max_total_cells (%d) cells", fname, gaps_max_total_cells),
+					 errdetail("The first %d of its %d instances need %zu.", i + 1, pi->ninst,
+							   total),
+					 errhint("Raise gaps.max_total_cells, or give its instances fewer "
+							 "missing parents.")));
+	}
+	if (total > MaxArraySize || !AllocSizeIsValid(ARR_OVERHEAD_NONULLS(1) + total * 8))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("factor \"%s\": its instances' tables need %zu cells, more than one "
+						"array can hold", fname, total)));
+	if ((int64) pi->first_aux + naux > PG_INT32_MAX)
+		bad_arg("too many auxiliary variables");
+	pfree(offp);
+	return total;
+}
+
+/*
+ * gaps._param_cpts(factor text, kind text, child_card int, slot_card int[],
+ *					slot_agg boolean[], params float8[], first_aux int,
+ *					inst_child int[], inst_off int[], member_var int[],
+ *					member_ev int[])
+ * RETURNS (aux_card int[], child int[], parent_off int[], parents int[],
+ *			cpt_off int[], cpts float8[], cpt_lscale int[])
+ *
+ * factor names the factor in errors.  It has one parent slot per element
+ * of slot_card (the slot's domain size) and slot_agg (whether it
+ * aggregates).  Instance i has child variable inst_child[i]; its slot s
+ * holds the members inst_off[i * ns + s] .. inst_off[i * ns + s + 1] - 1
+ * (1-based) of member_var and member_ev (the member's evidence as in
+ * gaps._infer: 0 missing, else the 1-based value), with ns slots; an
+ * aggregating slot's member variables must be strictly increasing.
+ * Auxiliary variables are numbered from first_aux, instance by instance,
+ * and aux_card gives their cardinalities in order.  Per instance, the
+ * auxiliary variables' CPTs come first, then the child's.  Every CPT is a
+ * log CPT (engine/gx_param.h): cpt_off is the offset of its log values in
+ * cpts and cpt_lscale that of its child's card log offsets, which follow
+ * them.  parent_off has one more element than child, from 1; all offsets
+ * are 1-based into the returned cpts and parents.
+ *
+ * Every instance is sized before anything is built, and the factor's
+ * tables together are held to gaps.max_total_cells, so a factor that
+ * cannot be grounded fails before it allocates.
+ */
 Datum
 gaps_param_cpts(PG_FUNCTION_ARGS)
 {
 	gx_pfactor	f;
 	gx_env		env = {pg_alloc, pg_free, pg_interrupt, NULL, 0, 0, 0, 0, 0, 0};
-	int		   *ichild,
-			   *ioff,
-			   *mvar,
-			   *mev,
-			   *mval;
-	int			ns,
-				ninst,
-				noff,
-				nm,
-				nmev,
-				first_aux;
+	pinsts		pi;
+	char	   *fname;
+	int		   *offp;
+	size_t		total;
 	pout		o;
 	TupleDesc	desc;
-	Datum		values[6];
-	bool		nulls[6] = {0};
+	Datum		values[7];
+	bool		nulls[7] = {0};
 
-	for (int i = 0; i < 10; i++)
+	for (int i = 0; i < 11; i++)
 		if (PG_ARGISNULL(i))
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -339,62 +461,38 @@ gaps_param_cpts(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "gaps._param_cpts must return a record");
 
+	fname = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	read_factor(fcinfo, &f);
-	ns = f.nslots;
-
-	/* The instances: offsets in order and in range, members' evidence. */
-	first_aux = PG_GETARG_INT32(5);
-	ninst = get_ints(fcinfo, 6, "inst_child", &ichild);
-	noff = get_ints(fcinfo, 7, "inst_off", &ioff);
-	nm = get_ints(fcinfo, 8, "member_var", &mvar);
-	nmev = get_ints(fcinfo, 9, "member_ev", &mev);
-	if (nmev != nm || (int64) noff != (int64) ninst * ns + 1 || ioff[0] != 1 ||
-		ioff[noff - 1] != nm + 1)
-		bad_arg("inst_off must run from 1 to the number of members plus 1, one entry "
-				"per slot of each instance and one more");
-	for (int i = 1; i < noff; i++)
-		if (ioff[i] < ioff[i - 1])
-			bad_arg("inst_off must not decrease");
-	mval = palloc(sizeof(int) * (nm ? nm : 1));
-	for (int i = 0; i < nm; i++)
-		mval[i] = mev[i] - 1;
-	if (first_aux < 1)
-		bad_arg("first_aux must be positive");
-
+	read_instances(fcinfo, f.nslots, &pi);
 	env.max_cells = (size_t) gaps_max_factor_cells;
 	env.max_total_cells = (size_t) gaps_max_total_cells;
-	memset(&o, 0, sizeof(o));
-	o.aux_card.elem = o.child.elem = o.parent_off.elem = o.parents.elem =
-		o.cpt_off.elem = sizeof(int);
-	o.cpts.elem = sizeof(double);
-	obuf_int(&o.parent_off, 1);
+	env.samples = gaps_samples;
+	total = size_factor(&env, &f, &pi, fname);
 
-	for (int i = 0; i < ninst; i++)
+	/* Pass 2: build each instance's tables into the output. */
+	memset(&o, 0, sizeof(o));
+	o.cpts_array = new_array(total, FLOAT8OID);
+	o.cpts = total ? (double *) ARR_DATA_PTR(o.cpts_array) : NULL;
+	obuf_int(&o.parent_off, 1);
+	offp = palloc(sizeof(int) * (f.nslots + 1));
+	for (int i = 0; i < pi.ninst; i++)
 	{
-		int		   *offp = palloc(sizeof(int) * (ns + 1));
 		gx_pinst	in;
-		int			base = ioff[i * ns] - 1;
 
 		CHECK_FOR_INTERRUPTS();
-		for (int s = 0; s <= ns; s++)
-			offp[s] = ioff[i * ns + s] - 1 - base;
-		in.child = ichild[i];
-		in.off = offp;
-		in.var = mvar + base;
-		in.value = mval + base;
-		if ((int64) first_aux + (int64) o.aux_card.n + gx_param_naux(&f, &in) > PG_INT32_MAX)
-			bad_arg("too many auxiliary variables");
-		in.first_aux = first_aux + (int) o.aux_card.n;
-		emit_instance(&env, &f, &in, &o);
-		pfree(offp);
+		instance(&pi, f.nslots, i, offp, &in);
+		in.first_aux = pi.first_aux + (int) o.aux_card.n;
+		emit_instance(&env, &f, &in, fname, &o);
 	}
+	Assert(o.ncpts == total);
 
-	values[0] = obuf_array(&o.aux_card, INT4OID);
-	values[1] = obuf_array(&o.child, INT4OID);
-	values[2] = obuf_array(&o.parent_off, INT4OID);
-	values[3] = obuf_array(&o.parents, INT4OID);
-	values[4] = obuf_array(&o.cpt_off, INT4OID);
-	values[5] = obuf_array(&o.cpts, FLOAT8OID);
+	values[0] = obuf_array(&o.aux_card);
+	values[1] = obuf_array(&o.child);
+	values[2] = obuf_array(&o.parent_off);
+	values[3] = obuf_array(&o.parents);
+	values[4] = obuf_array(&o.cpt_off);
+	values[5] = PointerGetDatum(o.cpts_array);
+	values[6] = obuf_array(&o.cpt_lscale);
 	desc = BlessTupleDesc(desc);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(desc, values, nulls)));
 }

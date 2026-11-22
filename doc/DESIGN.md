@@ -609,16 +609,44 @@ factor and `params` on a CPT one.
 Grounding knows each instance's evidence, so for each instance it builds
 the table over the instance's missing parents only, folding the observed
 parents into the scores (logistic) or the product (noisy-OR), and hands
-the engine an ordinary CPT (`src/engine/gx_param.c`, called through
-`gaps._param_cpts`).  That table is P(child | missing parents, observed
-parents = e), a valid conditional, so the engine needs no change and
-everything it does (components, sharing, bounds, EM's E-step) applies.
-Its size is the product of the missing parents' domains times the child's,
-checked against `gaps.max_factor_cells` before it is built; when every
-input is observed, as in pg.ddx.io's use, it is one row.  A variable that
-fills two parent slots is one parent of the table.  The tables of a
-model's parameterised factors follow all its CPTs in the network's `cpts`
-array.
+the engine that table (`src/engine/gx_param.c`, called through
+`gaps._param_cpts`).  It is P(child | missing parents, observed parents =
+e), a valid conditional, so everything the engine does (components,
+sharing, bounds, EM's E-step) applies.  Its size is the product of the
+missing parents' domains times the child's, checked against
+`gaps.max_factor_cells` before it is built; when every input is observed,
+as in pg.ddx.io's use, it is one row.  A variable that fills two parent
+slots is one parent of the table.  The tables of a model's parameterised
+factors follow all its CPTs in the network's `cpts` array.
+
+The tables are log CPTs.  A person with a thousand labelled e-mails
+multiplies P(off) by (1 - p) a thousand times (noisy-OR), or adds a
+thousand weights to a score (logistic): the folded value is far below the
+smallest double, and with the child observed, the posterior of its
+missing parents depends only on the ratios between the rows of the
+observed column, which a linear table has lost.  (The first version
+returned 0.400 for a true 0.4118 at 810 e-mails, and an error that the
+data had probability zero at 900.)  So the observed parents are folded in
+logs, with compensated sums (log1p(-p) per active member; the scores are
+logs already), and each table goes to the engine as natural logs with a
+log offset per child value: `gaps._infer` and `gaps._expected_counts`
+take `cpt_lscale`, per CPT 0 for a table of probabilities or the offset
+in `cpts` of its child's offsets (`src/engine/gx.h`).  The part that is
+the same in every row (the folded observed parents) sits in the offsets,
+and each column is then shifted so its largest entry is 0, so no entry
+loses precision.  When the child is observed, the engine leaves its
+offset out of the reduced factor and adds it to log P(evidence) only, so
+marginals do not depend on it, EM's objective includes it, and two
+components whose tables differ only in that offset share one cache entry
+(the cache key holds the reduced factors).  A logistic entry is positive
+by definition, and a noisy-OR one zero exactly when a term is log 0 or
+every term log 1; an entry that comes out zero anywhere else, or a
+noisy-OR "on" probability below the smallest normal double (it is 1 -
+P(off), computed from a probability), is an `ERROR` naming the factor and
+the variable rather than a silent zero.  `cpt_rows` turns the logs back
+into probabilities.  `test/engine` checks 800 to 10,000 observed members
+against closed forms to 1e-12 for marginals and log P(evidence), and
+`sql/extreme.sql` does the same through SQL.
 
 **Aggregating parents.**  A person has many e-mails, and a combiner over
 them has a different number of parents per person.  A parent slot of a
@@ -645,14 +673,31 @@ are folded in as for any parent):
   through c_n.  A slot of n missing binary members costs O(n^2) cells,
   ternary O(n^3).
 
-Each auxiliary table is held to `gaps.max_factor_cells` and an instance's
-tables together to `gaps.max_total_cells`, both checked before
-allocation; past either the call is an `ERROR` naming the variable and
-the limits.  The auxiliary variables are missing, belong to no attribute,
+Every instance is sized before any table is built (`gx_param_size`):
+each auxiliary table is held to `gaps.max_factor_cells`, and the
+instance to an estimate of what solving its component holds, 5 cells per
+cell of its tables plus 8 per auxiliary value plus 64, against
+`gaps.max_total_cells`.  The engine was measured to hold 4.0 to 4.1 cells
+per cell for count chains and up to 6 for the small tables of an OR
+chain, so on single instances from 1 to 140 members the estimate is 1.24
+to 2.1 times what exact inference needed: an instance the engine cannot
+solve is refused with the factor's name instead of after seconds of work.
+A factor's instances together are held to `gaps.max_total_cells` too,
+before anything is allocated, and the output array is built in place.
+Past any bound the call is an `ERROR` naming the factor, the variable or
+the size, and the limit.  The estimate counts the instance's own tables;
+its members' other factors in the same component are bounded by the
+engine as usual.  When `gaps.samples` is set, an instance without
+auxiliary variables (which could be sampled) is held to twice its cells
+instead.  An aggregating slot's member variables must be distinct
+(`gaps._param_cpts` takes them strictly increasing, as grounding produces
+them): one variable twice would be two independent firings of one
+value.  The auxiliary variables are missing, belong to no attribute,
 and are never returned or learned.  Their tables contain zeros, so a
 component holding them is solved exactly or refused, never sampled: the
-existing positivity rule (`GX_ENOTPOS`) refuses it, and `sql/param.sql`
-checks that it does.
+existing positivity rule (`GX_ENOTPOS`) refuses it, and `test/engine`
+checks that it does (in SQL, the per-instance estimate usually refuses
+such an instance first).
 
 A restricted call (`marginals(model, rel, entities)`) reaches an
 aggregating slot's parents and children through the same closure as any

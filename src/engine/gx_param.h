@@ -31,6 +31,16 @@
  * aggregating slot (gx_param_naux).  Their CPTs have zeros, so a component
  * holding them is never Gibbs sampled (gx_infer refuses one with a zero).
  *
+ * Every table is returned as a log CPT (gx.h): natural logs, offset per
+ * child value.  Many observed parents push a child's entries far below
+ * the smallest double (noisy-OR's (1 - p)^n, a logistic score of 1e4), and
+ * when the child is observed the posterior of its missing parents depends
+ * only on the ratios between the rows of one column.  So the observed
+ * parents are folded in log space, and each column is shifted so that its
+ * largest entry is 0, its shift returned in lscale; no entry loses
+ * precision, and the engine adds the shift of the observed value to
+ * log P(evidence) alone.
+ *
  * Like gx.h, this includes no PostgreSQL headers.
  *
  * Copyright (c) 2026, Gregory Burd
@@ -44,6 +54,31 @@
 
 #define GX_LOGISTIC 1
 #define GX_NOISY_OR 2
+
+/*
+ * A return code beyond gx.h's: an entry whose exact value is positive came
+ * out as zero.  The tables are computed in logs, so this guards against a
+ * mistake rather than an expected loss.
+ */
+#define GX_ELOST	8
+
+/*
+ * Solving the component of an instance holds about four cells per cell of
+ * the instance's tables (each reduced factor, its copy in the cache key,
+ * and the messages along a chain; measured 4.0 to 4.1 for count chains
+ * and up to 6 for the small tables of an OR chain, whose variables'
+ * working arrays weigh more).  An instance is held to GX_PARAM_HOLD x its
+ * cells plus GX_PARAM_HOLD_VALUE per value of its auxiliary variables plus
+ * GX_PARAM_HOLD_BASE against env->max_total_cells, so that one the engine cannot solve is
+ * refused here, before its tables are built.  When env->samples > 0, an
+ * instance without auxiliary variables is held to 2 x its cells instead,
+ * what sampling it needs.  The estimate covers the instance's own tables;
+ * its members' other factors in the same component add to what the engine
+ * holds, and are bounded by the engine itself.
+ */
+#define GX_PARAM_HOLD 5
+#define GX_PARAM_HOLD_VALUE 8
+#define GX_PARAM_HOLD_BASE 64
 
 /*
  * A parameterised factor.  Parameters, by kind:
@@ -87,7 +122,10 @@ typedef struct gx_pinst
 	int			first_aux;
 } gx_pinst;
 
-/* One CPT of an instance, in gx.h's layout, allocated with env->alloc. */
+/*
+ * One CPT of an instance, a log CPT in gx.h's layout (vals and lscale are
+ * logs), allocated with env->alloc.
+ */
 typedef struct gx_pcpt
 {
 	int			child;
@@ -96,6 +134,7 @@ typedef struct gx_pcpt
 	int		   *parents;
 	size_t		ncells;
 	double	   *vals;
+	double	   *lscale;			/* card entries */
 } gx_pcpt;
 
 /*
@@ -109,16 +148,31 @@ extern int	gx_param_check(const gx_pfactor *f);
 extern int	gx_param_naux(const gx_pfactor *f, const gx_pinst *in);
 
 /*
+ * The cells of instance in's tables, vals and lscale together, into
+ * *cells, and the cells solving them is estimated to hold (GX_PARAM_HOLD)
+ * into *hold, without building them.  Applies gx_param_ground's bounds,
+ * so returns GX_OK, GX_EINVAL (a malformed factor or instance: a slot
+ * range out of order, a slot that does not aggregate without exactly one
+ * member, a value out of range, or an aggregating slot whose variables
+ * are not strictly increasing, which also refuses one variable twice) or
+ * GX_ETOOBIG, exactly as gx_param_ground would.  On GX_ETOOBIG, *hold is
+ * the estimate, or SIZE_MAX when a single table is over env->max_cells.
+ */
+extern int	gx_param_size(const gx_env *env, const gx_pfactor *f, const gx_pinst *in,
+						  size_t *cells, size_t *hold);
+
+/*
  * The CPTs of instance in of factor f, which must pass gx_param_check:
  * one per auxiliary variable in their numbering order, then the child's,
  * gx_param_naux(f, in) + 1 in all, into out, which has room for them.
  * The child's parents are its missing non-aggregating parents in slot
  * order, then the last auxiliary variable of the chain (noisy-OR) or of
  * each aggregating slot's chain (logistic), in slot order.  Returns GX_OK,
- * GX_EINVAL (a malformed instance, or a logistic score that overflows),
+ * GX_EINVAL (as gx_param_size, or a logistic score that overflows),
  * GX_ETOOBIG (a CPT larger than env->max_cells, or the instance's CPTs
- * together larger than env->max_total_cells, either found before the table
- * is allocated) or GX_ENOMEM.  On error, the CPTs built so far are freed.
+ * together over the GX_PARAM_HOLD bound, found before anything is
+ * allocated), GX_ELOST or GX_ENOMEM.  On error, the CPTs built so far
+ * are freed.
  */
 extern int	gx_param_ground(const gx_env *env, const gx_pfactor *f,
 							const gx_pinst *in, gx_pcpt *out);

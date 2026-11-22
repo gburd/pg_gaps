@@ -927,18 +927,21 @@ BEGIN
 			factor, n, lim;
 	END IF;
 	-- A parameterised factor's table, computed as grounding would for an
-	-- instance with every parent missing (gaps._param_cpts).
+	-- instance with every parent missing (gaps._param_cpts), which returns
+	-- its logs and then a log offset per child value.
 	IF fr.kind <> 'cpt' THEN
 		SELECT count(*)::int, coalesce(array_agg(gaps._card(fp.parent_stripe) ORDER BY fp.ord),
 									   '{}')
 		INTO np, pcards
 		FROM gaps.factor_parent fp WHERE fp.factor_id = fr.factor_id;
-		SELECT (gaps._param_cpts(fr.kind, k, pcards, array_fill(false, ARRAY[np]), fr.params,
-								 np + 2, ARRAY[np + 1],
+		SELECT (gaps._param_cpts(fr.name, fr.kind, k, pcards, array_fill(false, ARRAY[np]),
+								 fr.params, np + 2, ARRAY[np + 1],
 								 ARRAY(SELECT g FROM generate_series(1, np + 1) g),
 								 ARRAY(SELECT g FROM generate_series(1, np) g),
 								 array_fill(0, ARRAY[np]))).cpts
 		INTO fr.cpt;
+		fr.cpt := ARRAY(SELECT exp(fr.cpt[c + 1] + fr.cpt[n + 1 + c % k])
+						FROM generate_series(0, n::int - 1) c ORDER BY c);
 	END IF;
 
 	-- Cell c holds parent row c / k and child value c % k; within a parent
@@ -1363,6 +1366,7 @@ LANGUAGE C STRICT STABLE;
 
 CREATE FUNCTION gaps._infer(card int[], evidence int[], child int[], parent_off int[],
 							parents int[], cpt_off int[], cpts float8[],
+							cpt_lscale int[] DEFAULT '{}',
 							OUT var int, OUT value int, OUT probability float8,
 							OUT component int, OUT map_value int, OUT map_probability float8,
 							OUT samples int)
@@ -1375,10 +1379,11 @@ LANGUAGE C STRICT VOLATILE;
 -- CPT (1-based, parents then child, child fastest), the expected number of
 -- its instances whose child and parents take that cell's values, given
 -- the evidence.  loglik, the same on every row, is log P(evidence).
--- Exact only (src/gaps_infer.c).
+-- Exact only (src/gaps_infer.c).  cpt_lscale marks log CPTs, as for
+-- gaps._infer.
 CREATE FUNCTION gaps._expected_counts(card int[], evidence int[], child int[],
 									  parent_off int[], parents int[], cpt_off int[],
-									  cpts float8[],
+									  cpts float8[], cpt_lscale int[] DEFAULT '{}',
 									  OUT cpt_off int, OUT cell int, OUT n float8,
 									  OUT loglik float8)
 RETURNS SETOF record
@@ -2370,27 +2375,29 @@ BEGIN
 END
 $$;
 
--- The tables of a parameterised factor's instances (src/gaps_param.c).
-CREATE FUNCTION gaps._param_cpts(kind text, child_card int, slot_card int[],
+-- The tables of a parameterised factor's instances, log CPTs
+-- (src/gaps_param.c); factor names the factor in errors.
+CREATE FUNCTION gaps._param_cpts(factor text, kind text, child_card int, slot_card int[],
 	slot_agg boolean[], params float8[], first_aux int, inst_child int[], inst_off int[],
 	member_var int[], member_ev int[],
 	OUT aux_card int[], OUT child int[], OUT parent_off int[], OUT parents int[],
-	OUT cpt_off int[], OUT cpts float8[])
+	OUT cpt_off int[], OUT cpts float8[], OUT cpt_lscale int[])
 AS 'MODULE_PATHNAME', 'gaps_param_cpts'
 LANGUAGE C STRICT VOLATILE;
 
 -- A step of gaps._ground, after its instances are in pg_gaps_inst and its
 -- variables in pg_gaps_rv: the tables of every instance of parameterised
--- factor fid, as gaps._param_cpts returns them, with cpt_off shifted so
--- that the factor's tables start at element cpt_base of the network's
--- cpts and auxiliary variables numbered from first_aux.  Each instance's
+-- factor fid, as gaps._param_cpts returns them, with cpt_off and
+-- cpt_lscale shifted so that the factor's tables start at element
+-- cpt_base of the network's cpts and auxiliary variables numbered from
+-- first_aux.  Each instance's
 -- table is over its missing parents only, the observed ones folded in, so
 -- its size does not grow with the observed parents (doc/DESIGN.md,
 -- "Parameterised factors").  The instances' slots are gathered with one
 -- join and one sort over pg_gaps_inst, never a scan per instance.
 CREATE FUNCTION gaps._param_ground(fid int, first_aux int, cpt_base int,
 	OUT aux_card int[], OUT child int[], OUT parent_off int[], OUT parents int[],
-	OUT cpt_off int[], OUT cpts float8[])
+	OUT cpt_off int[], OUT cpts float8[], OUT cpt_lscale int[])
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
@@ -2432,69 +2439,30 @@ BEGIN
 	FROM pg_gaps_inst j JOIN pg_gaps_rv rv ON rv.v = j.pv
 	WHERE j.factor_id = fid AND j.ord > 0;
 
-	SELECT * INTO r FROM gaps._param_cpts(fr.kind, gaps._card(fr.child_stripe), scard, sagg,
-										   fr.params, first_aux, ichild, ioff, mvar, mev);
+	SELECT * INTO r FROM gaps._param_cpts(fr.name, fr.kind, gaps._card(fr.child_stripe), scard,
+										   sagg, fr.params, first_aux, ichild, ioff, mvar, mev);
 	aux_card := r.aux_card;
 	child := r.child;
 	parent_off := r.parent_off;
 	parents := r.parents;
 	cpt_off := ARRAY(SELECT x + cpt_base - 1 FROM unnest(r.cpt_off) x);
+	cpt_lscale := ARRAY(SELECT x + cpt_base - 1 FROM unnest(r.cpt_lscale) x);
 	cpts := r.cpts;
 END
 $$;
 
--- Ground a model.  Returns one row per random variable, numbered 1..n,
--- with what gaps._infer needs and each variable's attribute.  All reads of
--- user tables happen here, through dynamic SQL run as the caller.
---
--- Entities are identified by their key as a typed composite
--- (gaps._key_tables), and every later step carries only variable
--- numbers.  The temp tables stay behind for the transaction: pg_gaps_rv
--- (v, attribute_id, card, ev), pg_gaps_inst (the factor instances),
--- pg_gaps_keys, and the entity tables, from which gaps._missing_names and
--- gaps._entity_name build jsonb names.
---
--- Validity checks (doc/DESIGN.md, "Validity" and "Mappings"):
---   - every RV of every declared attribute is the child of exactly one CPT;
---   - every CPT is set;
---   - every child entity maps to exactly one parent entity per parent;
---   - the rows of one entity agree on its observed value, which is in the
---     attribute's domain.
--- Directed cycles are found by the engine (gx_check).
-CREATE FUNCTION gaps._ground(m int, rel regclass DEFAULT NULL, entities jsonb DEFAULT NULL,
-	OUT card int[], OUT evidence int[], OUT child int[], OUT parent_off int[],
-	OUT parents int[], OUT cpt_off int[], OUT cpts float8[],
-	OUT var_attr int[])
-LANGUAGE plpgsql
+-- A step of gaps._ground: refuse a factor of a model in ms (gaps._models)
+-- with a parent stripe of a model outside ms.  gaps.add_factor makes sure,
+-- but gaps.model_member rows can be deleted directly, and pg_restore loads
+-- them in a transaction of their own, so this is checked at grounding
+-- rather than by a trigger.
+CREATE FUNCTION gaps._members_check(ms int[]) RETURNS void
+LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-	a gaps.attribute;
-	f record;
-	p record;
-	w record;
 	bad record;
-	restricted boolean;
-	fids int[] := '{}';
-	offs int[] := '{}';
-	ms int[];
-	pg record;
-	p_aux int[] := '{}';
-	p_child int[] := '{}';
-	p_poff int[] := '{}';
-	p_par int[] := '{}';
-	p_coff int[] := '{}';
 BEGIN
-	IF entities IS NULL AND rel IS NOT NULL THEN
-		RAISE EXCEPTION 'rel % is given without entities', rel
-			USING HINT = 'Pass both to restrict the call to some entities of rel, or neither.';
-	END IF;
-	-- A composite grounds the union of its members and its own factors.
-	-- Every parent stripe must be of a model in it: gaps.add_factor makes
-	-- sure, but gaps.model_member rows can be deleted directly, and
-	-- pg_restore loads them in a transaction of their own, so this is
-	-- checked here rather than by a trigger.
-	ms := gaps._models(m);
 	SELECT fa.name, s.name AS sname, x.name AS fmodel, sm.name AS smodel INTO bad
 	FROM gaps.factor fa JOIN gaps.factor_parent fp USING (factor_id)
 		JOIN gaps.stripe s ON s.stripe_id = fp.parent_stripe
@@ -2506,9 +2474,24 @@ BEGIN
 		RAISE EXCEPTION 'factor "%" of model "%" has parent stripe "%" of model "%", which is not '
 			'one of its members', bad.name, bad.fmodel, bad.sname, coalesce(bad.smodel, '?');
 	END IF;
-	restricted := gaps._ground_entities(m, rel, entities);
+END
+$$;
 
-	-- Each factor: its child entities, each with its parent entities.
+-- A step of gaps._ground, after gaps._ground_entities: every factor of
+-- the models in ms, its child entities into pg_gaps_inst, each with its
+-- parent entities; then the coverage check, that every RV is the child of
+-- exactly one factor.
+CREATE FUNCTION gaps._ground_factors(ms int[], restricted boolean) RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	a gaps.attribute;
+	f record;
+	p record;
+	w record;
+	bad record;
+BEGIN
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_inst (
 		factor_id int, v int, ord int, pv int) ON COMMIT DROP;
 	TRUNCATE pg_gaps_inst;
@@ -2533,7 +2516,6 @@ BEGIN
 		END LOOP;
 	END LOOP;
 
-	-- Coverage: every RV is the child of exactly one factor.
 	SELECT r.v, r.attribute_id, at.relname, at.attname, count(DISTINCT i.factor_id) AS n
 	INTO bad
 	FROM pg_gaps_rv r JOIN gaps.attribute at USING (attribute_id)
@@ -2546,6 +2528,87 @@ BEGIN
 			bad.relname, bad.attname, gaps._entity_name(bad.attribute_id, bad.v), bad.n
 			USING HINT = 'Every probabilistic value, present or missing, needs one CPT.';
 	END IF;
+END
+$$;
+
+-- A step of gaps._ground: each parameterised factor of the models in ms,
+-- its tables for each of its instances (gaps._param_ground), concatenated
+-- in factor order, with their auxiliary variables numbered from first_aux
+-- and their values from element cpt_base of the network's cpts.
+-- parent_off is relative to the start of parents and has no leading 1.
+CREATE FUNCTION gaps._param_tables(ms int[], first_aux int, cpt_base int,
+	OUT aux_card int[], OUT child int[], OUT parent_off int[], OUT parents int[],
+	OUT cpt_off int[], OUT cpts float8[], OUT cpt_lscale int[])
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	f record;
+	pg record;
+BEGIN
+	aux_card := '{}';
+	child := '{}';
+	parent_off := '{}';
+	parents := '{}';
+	cpt_off := '{}';
+	cpts := '{}';
+	cpt_lscale := '{}';
+	FOR f IN SELECT fa.factor_id FROM gaps.factor fa
+			 WHERE fa.model_id = ANY (ms) AND fa.kind <> 'cpt' ORDER BY fa.factor_id LOOP
+		pg := gaps._param_ground(f.factor_id, first_aux + cardinality(aux_card),
+								 cpt_base + cardinality(cpts));
+		parent_off := parent_off
+			|| ARRAY(SELECT x + cardinality(parents) FROM unnest(pg.parent_off[2:]) x);
+		aux_card := aux_card || pg.aux_card;
+		child := child || pg.child;
+		parents := parents || pg.parents;
+		cpt_off := cpt_off || pg.cpt_off;
+		cpt_lscale := cpt_lscale || pg.cpt_lscale;
+		cpts := cpts || pg.cpts;
+	END LOOP;
+END
+$$;
+
+-- Ground a model.  Returns one row per random variable, numbered 1..n,
+-- with what gaps._infer needs and each variable's attribute.  All reads of
+-- user tables happen here, through dynamic SQL run as the caller.
+--
+-- Entities are identified by their key as a typed composite
+-- (gaps._key_tables), and every later step carries only variable
+-- numbers.  The temp tables stay behind for the transaction: pg_gaps_rv
+-- (v, attribute_id, card, ev), pg_gaps_inst (the factor instances),
+-- pg_gaps_keys, and the entity tables, from which gaps._missing_names and
+-- gaps._entity_name build jsonb names.
+--
+-- Validity checks (doc/DESIGN.md, "Validity" and "Mappings"):
+--   - every RV of every declared attribute is the child of exactly one CPT;
+--   - every CPT is set;
+--   - every child entity maps to exactly one parent entity per parent;
+--   - the rows of one entity agree on its observed value, which is in the
+--     attribute's domain.
+-- Directed cycles are found by the engine (gx_check).
+CREATE FUNCTION gaps._ground(m int, rel regclass DEFAULT NULL, entities jsonb DEFAULT NULL,
+	OUT card int[], OUT evidence int[], OUT child int[], OUT parent_off int[],
+	OUT parents int[], OUT cpt_off int[], OUT cpts float8[], OUT cpt_lscale int[],
+	OUT var_attr int[])
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	f record;
+	fids int[] := '{}';
+	offs int[] := '{}';
+	ms int[];
+	pt record;
+BEGIN
+	IF entities IS NULL AND rel IS NOT NULL THEN
+		RAISE EXCEPTION 'rel % is given without entities', rel
+			USING HINT = 'Pass both to restrict the call to some entities of rel, or neither.';
+	END IF;
+	-- A composite grounds the union of its members and its own factors.
+	ms := gaps._models(m);
+	PERFORM gaps._members_check(ms);
+	PERFORM gaps._ground_factors(ms, gaps._ground_entities(m, rel, entities));
 
 	-- Assemble the arrays, in variable order; each CPT appears once in cpts
 	-- and every instance of its factor points at it.
@@ -2556,10 +2619,9 @@ BEGIN
 
 	-- The tables: first every CPT factor's CPT once, in factor order,
 	-- which all its instances point at; then each parameterised factor's
-	-- tables for each of its instances (gaps._param_ground), with their
-	-- auxiliary variables numbered after the entities.  NB: gaps._estep
-	-- relies on this order, rebuilding the CPT factors' prefix and keeping
-	-- the rest.
+	-- log tables for each of its instances, with their auxiliary variables
+	-- numbered after the entities.  NB: gaps._estep relies on this order,
+	-- rebuilding the CPT factors' prefix and keeping the rest.
 	cpts := '{}';
 	FOR f IN SELECT fa.factor_id, fa.cpt FROM gaps.factor fa
 			 WHERE fa.model_id = ANY (ms) AND fa.kind = 'cpt' ORDER BY fa.factor_id LOOP
@@ -2567,21 +2629,10 @@ BEGIN
 		offs := offs || (cardinality(cpts) + 1);
 		cpts := cpts || f.cpt;
 	END LOOP;
-	FOR f IN SELECT fa.factor_id FROM gaps.factor fa
-			 WHERE fa.model_id = ANY (ms) AND fa.kind <> 'cpt' ORDER BY fa.factor_id LOOP
-		pg := gaps._param_ground(f.factor_id, cardinality(card) + cardinality(p_aux) + 1,
-								 cardinality(cpts) + 1);
-		p_poff := p_poff
-			|| ARRAY(SELECT x + cardinality(p_par) FROM unnest(pg.parent_off[2:]) x);
-		p_aux := p_aux || pg.aux_card;
-		p_child := p_child || pg.child;
-		p_par := p_par || pg.parents;
-		p_coff := p_coff || pg.cpt_off;
-		cpts := cpts || pg.cpts;
-	END LOOP;
+	pt := gaps._param_tables(ms, cardinality(card) + 1, cardinality(cpts) + 1);
 
 	-- One ordered pass over the CPT factors' instances: every child
-	-- variable (ord 0, the coverage check above guarantees exactly one per
+	-- variable (ord 0, the coverage check guarantees exactly one per
 	-- variable) is followed by its parents in order, so child[],
 	-- parent_off[] and parents[] all come out of a single sort.
 	WITH fc AS (
@@ -2592,24 +2643,27 @@ BEGIN
 				   OVER (ORDER BY i.v, i.ord ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
 				   AS nparents_before
 		FROM pg_gaps_inst i JOIN fc USING (factor_id))
-	SELECT array_agg(s.v ORDER BY s.v) FILTER (WHERE s.ord = 0),
-		   array_agg((1 + coalesce(s.nparents_before, 0))::int ORDER BY s.v)
-			   FILTER (WHERE s.ord = 0)
+	SELECT coalesce(array_agg(s.v ORDER BY s.v) FILTER (WHERE s.ord = 0), '{}'),
+		   coalesce(array_agg((1 + coalesce(s.nparents_before, 0))::int ORDER BY s.v)
+					FILTER (WHERE s.ord = 0), '{}')
 			   || (1 + count(*) FILTER (WHERE s.ord > 0))::int,
-		   array_agg(s.off::int ORDER BY s.v) FILTER (WHERE s.ord = 0),
+		   coalesce(array_agg(s.off::int ORDER BY s.v) FILTER (WHERE s.ord = 0), '{}'),
 		   coalesce(array_agg(s.pv ORDER BY s.v, s.ord) FILTER (WHERE s.ord > 0), '{}')
 	INTO child, parent_off, cpt_off, parents
 	FROM seq s;
 
 	-- The parameterised tables follow, and their auxiliary variables,
-	-- which are missing and belong to no attribute.
-	parent_off := parent_off || ARRAY(SELECT x + cardinality(parents) FROM unnest(p_poff) x);
-	parents := parents || p_par;
-	child := coalesce(child, '{}') || p_child;
-	cpt_off := coalesce(cpt_off, '{}') || p_coff;
-	card := card || p_aux;
-	evidence := evidence || array_fill(0, ARRAY[cardinality(p_aux)]);
-	var_attr := var_attr || array_fill(NULL::int, ARRAY[cardinality(p_aux)]);
+	-- which are missing and belong to no attribute.  The CPT factors'
+	-- tables are probabilities (cpt_lscale 0), the others log CPTs.
+	cpt_lscale := array_fill(0, ARRAY[cardinality(child)]) || pt.cpt_lscale;
+	parent_off := parent_off || ARRAY(SELECT x + cardinality(parents) FROM unnest(pt.parent_off) x);
+	parents := parents || pt.parents;
+	child := child || pt.child;
+	cpt_off := cpt_off || pt.cpt_off;
+	cpts := cpts || pt.cpts;
+	card := card || pt.aux_card;
+	evidence := evidence || array_fill(0, ARRAY[cardinality(pt.aux_card)]);
+	var_attr := var_attr || array_fill(NULL::int, ARRAY[cardinality(pt.aux_card)]);
 END
 $$;
 
@@ -2642,7 +2696,7 @@ BEGIN
 				   r.probability, r.component,
 				   CASE WHEN r.samples IS NULL THEN 'exact' ELSE 'gibbs' END, r.samples
 			FROM gaps._infer(g.card, g.evidence, g.child, g.parent_off, g.parents,
-							 g.cpt_off, g.cpts) r
+							 g.cpt_off, g.cpts, g.cpt_lscale) r
 				JOIN gaps._missing_names(m, p_entities IS NOT NULL) v ON v.v = r.var
 				JOIN gaps.attribute a ON a.attribute_id = v.attribute_id;
 	ELSE
@@ -2652,7 +2706,7 @@ BEGIN
 				   CASE WHEN r.samples IS NULL THEN 'exact' ELSE 'gibbs-marginal-argmax' END,
 				   r.samples
 			FROM gaps._infer(g.card, g.evidence, g.child, g.parent_off, g.parents,
-							 g.cpt_off, g.cpts) r
+							 g.cpt_off, g.cpts, g.cpt_lscale) r
 				JOIN gaps._missing_names(m, p_entities IS NOT NULL) v ON v.v = r.var
 				JOIN gaps.attribute a ON a.attribute_id = v.attribute_id
 			WHERE r.value = 1;
@@ -2725,9 +2779,10 @@ $$;
 -- parameterised factors, which gaps._ground lays out after every CPT and
 -- EM keeps as they are; the expected counts of their cpt_off values are
 -- computed and never read, since no factor in pg_gaps_learn has those
--- offsets.
+-- offsets.  cpt_lscale is gaps._ground's: the fixed tables are log CPTs,
+-- and their contribution to log P(evidence) is in the result.
 CREATE FUNCTION gaps._estep(card int[], evidence int[], child int[], parent_off int[],
-	parents int[], cpt_off int[], fixed float8[]) RETURNS float8
+	parents int[], cpt_off int[], fixed float8[], cpt_lscale int[]) RETURNS float8
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
@@ -2740,7 +2795,7 @@ BEGIN
 	TRUNCATE pg_gaps_ec;
 	INSERT INTO pg_gaps_ec
 	SELECT * FROM gaps._expected_counts(card, evidence, child, parent_off,
-										 parents, cpt_off, cpts);
+										 parents, cpt_off, cpts, cpt_lscale);
 	SELECT coalesce(max(e.loglik), 0) INTO loglik FROM pg_gaps_ec e;
 	RETURN loglik;
 END
@@ -2762,7 +2817,8 @@ $$;
 -- the start only (doc/DESIGN.md, "Learning with missing values").  Every
 -- cell of that start is positive, so the evidence is possible under it.
 CREATE FUNCTION gaps._em(card int[], evidence int[], child int[], parent_off int[],
-	parents int[], cpt_off int[], fixed float8[], max_iterations int, tol float8,
+	parents int[], cpt_off int[], fixed float8[], cpt_lscale int[], max_iterations int,
+	tol float8,
 	OUT iterations int, OUT loglik float8, OUT converged boolean, OUT add_one boolean)
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -2778,7 +2834,8 @@ BEGIN
 	converged := false;
 	add_one := false;
 	BEGIN
-		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed);
+		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed,
+							  cpt_lscale);
 	EXCEPTION WHEN data_exception THEN
 		-- Only gaps._expected_counts' "probability zero" error (22000
 		-- itself, not the rest of its class: a directed cycle is 22023)
@@ -2796,7 +2853,8 @@ BEGIN
 		SET cpt = gaps._normalize((SELECT array_agg(greatest(u.a, 1) + u.n ORDER BY u.i)
 								   FROM unnest(l.pseudo, l.n) WITH ORDINALITY u(a, n, i)),
 								  l.k);
-		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed);
+		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed,
+							  cpt_lscale);
 	END;
 	LOOP
 		-- The objective the update climbs: the log posterior under
@@ -2832,7 +2890,8 @@ BEGIN
 								  l.k)
 		FROM x WHERE x.factor_id = l.factor_id;
 		iterations := iterations + 1;
-		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed);
+		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed,
+							  cpt_lscale);
 	END LOOP;
 END
 $$;
@@ -3001,7 +3060,7 @@ BEGIN
 									  g.cpt_off,
 									  g.cpts[(SELECT coalesce(sum(cardinality(l.cpt)), 0)
 											  FROM pg_gaps_learn l)::int + 1:],
-									  max_iterations, tol);
+									  g.cpt_lscale, max_iterations, tol);
 		iterations := r.iterations;
 		loglik := r.loglik;
 		converged := r.converged;

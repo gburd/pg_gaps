@@ -464,10 +464,12 @@ SELECT gaps.add_factor('ga', 'bad', 'ps', ARRAY['ms'],
 	aggregate => ARRAY[true]);                                       -- fail: a CPT
 SELECT gaps.add_factor('ga', 'bad', 'ps', ARRAY['ms'], kind => 'noisy_or',
 	params => ARRAY[0.1, 0.2], aggregate => ARRAY[true, false]);     -- fail: length
--- A component holding the chains' deterministic tables is never sampled:
--- with the exact bound too small for it, sampling is refused.  A noisy-OR
--- over 12 missing mails: its tables hold 145 cells, elimination needs
--- more than 400.
+-- A component holding the chains' deterministic tables is never sampled.
+-- Grounding holds each instance to an estimate of what solving it needs,
+-- so with the bound too small for exact inference the instance is refused
+-- before it is built, sampling or not; the engine's own refusal to sample
+-- a component with a zero is checked in test/engine.  A noisy-OR over 12
+-- missing mails: its tables hold 145 cells, elimination more than 400.
 SELECT gaps.drop_model('ga');
 TRUNCATE person, mail;
 INSERT INTO person VALUES (1, 'v1');
@@ -484,7 +486,7 @@ SELECT gaps.map_factor('ga', 'comb', 1, 'pid', 'pid');
 SELECT count(*) AS marginals FROM gaps.marginals('ga');
 SET gaps.max_total_cells = 400;
 SET gaps.samples = 100;
-SELECT count(*) FROM gaps.marginals('ga');                           -- fail: not positive
+SELECT count(*) FROM gaps.marginals('ga');                           -- fail: too big, early
 RESET gaps.samples;
 RESET gaps.max_total_cells;
 -- A count chain over many members is bounded: a logistic slot over 31
