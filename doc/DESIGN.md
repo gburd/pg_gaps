@@ -467,12 +467,14 @@ transactional, dumpable (each table and sequence is registered with
 
 ```
 gaps.model          (model_id, name, owner regrole)
+gaps.model_member   (model_id, member_id, ord)  -- composite model's members
 gaps.attribute      (attribute_id, model_id, rel regclass, relname, attname,
                      typname, entity_keys name[], domain text[], edges float8[])
 gaps.stripe         (stripe_id, model_id, name, attribute_id)
 gaps.stripe_qual    (stripe_id, ord, attname, op, value)   -- ANDed, on Ad
-gaps.factor         (factor_id, model_id, name, child_stripe, cpt float8[])
-gaps.factor_parent  (factor_id, ord, parent_stripe)
+gaps.factor         (factor_id, model_id, name, child_stripe, cpt float8[],
+                     prior float8[], kind text, params float8[])
+gaps.factor_parent  (factor_id, ord, parent_stripe, aggregate boolean)
 gaps.factor_map     (factor_id, ord, child_att, parent_att) -- equalities
 ```
 
@@ -579,6 +581,149 @@ as long as the factor, survives dump and restore, and is visible through
 `cpt_rows`), and an argument would make every caller pass the same
 arrays again.
 
+**Parameterised factors.**  `gaps.factor.kind` is `'cpt'` (the default),
+`'logistic'` or `'noisy_or'`; the last two have `params` instead of a CPT
+and a prior, and their tables are computed at grounding, never stored, so
+a factor over 15 five-valued inputs needs 1 + 15 x 5 weights where its CPT
+would need 5^15 rows.  pg.ddx.io's best authorship model is such a
+logistic, and naive Bayes over the same inputs loses 0.086 AUC.
+`add_factor` takes `kind` and `params` as two more arguments after `cpt`,
+so every existing call keeps working and new ones pass them by name.
+
+- `logistic`: a child of K values, value 1 the reference with score 0.
+  Value k > 1 scores its bias plus one weight per parent for that parent's
+  value; P(child = k) is the softmax of the scores.  `params` has (K - 1) x
+  (1 + the sum of the parents' domain sizes) entries, class-major: for
+  each k > 1, its bias, then the weights of parent 1's values, then parent
+  2's, and so on.  With K = 2 this is logistic regression over one-hot
+  inputs.  Every weight must be finite.
+- `noisy_or`: a binary child whose second value is "on"; a parent is
+  active when its value is not its first.  P(child off) = (1 - leak) x the
+  product of (1 - p_i) over active parents.  `params` is the leak, then
+  p_i per parent, each in [0, 1].
+
+The trigger and every grounding check the kind, the length, finiteness
+and the probability range, and refuse a CPT or prior on a parameterised
+factor and `params` on a CPT one.
+
+Grounding knows each instance's evidence, so for each instance it builds
+the table over the instance's missing parents only, folding the observed
+parents into the scores (logistic) or the product (noisy-OR), and hands
+the engine that table (`src/engine/gx_param.c`, called through
+`gaps._param_cpts`).  It is P(child | missing parents, observed parents =
+e), a valid conditional, so everything the engine does (components,
+sharing, bounds, EM's E-step) applies.  Its size is the product of the
+missing parents' domains times the child's, checked against
+`gaps.max_factor_cells` before it is built; when every input is observed,
+as in pg.ddx.io's use, it is one row.  A variable that fills two parent
+slots is one parent of the table.  The tables of a model's parameterised
+factors follow all its CPTs in the network's `cpts` array.
+
+The tables are log CPTs.  A person with a thousand labelled e-mails
+multiplies P(off) by (1 - p) a thousand times (noisy-OR), or adds a
+thousand weights to a score (logistic): the folded value is far below the
+smallest double, and with the child observed, the posterior of its
+missing parents depends only on the ratios between the rows of the
+observed column, which a linear table has lost.  (The first version
+returned 0.400 for a true 0.4118 at 810 e-mails, and an error that the
+data had probability zero at 900.)  So the observed parents are folded in
+logs, with compensated sums (log1p(-p) per active member; the scores are
+logs already), and each table goes to the engine as natural logs with a
+log offset per child value: `gaps._infer` and `gaps._expected_counts`
+take `cpt_lscale`, per CPT 0 for a table of probabilities or the offset
+in `cpts` of its child's offsets (`src/engine/gx.h`).  The part that is
+the same in every row (the folded observed parents) sits in the offsets,
+and each column is then shifted so its largest entry is 0, so no entry
+loses precision.  When the child is observed, the engine leaves its
+offset out of the reduced factor and adds it to log P(evidence) only, so
+marginals do not depend on it, EM's objective includes it, and two
+components whose tables differ only in that offset share one cache entry
+(the cache key holds the reduced factors).  A logistic entry is positive
+by definition, and a noisy-OR one zero exactly when a term is log 0 or
+every term log 1; an entry that comes out zero anywhere else, or a
+noisy-OR "on" probability below the smallest normal double (it is 1 -
+P(off), computed from a probability), is an `ERROR` naming the factor and
+the variable rather than a silent zero.  `cpt_rows` turns the logs back
+into probabilities.  `test/engine` checks 800 to 10,000 observed members
+against closed forms to 1e-12 for marginals and log P(evidence), and
+`sql/extreme.sql` does the same through SQL.
+
+**Aggregating parents.**  A person has many e-mails, and a combiner over
+them has a different number of parents per person.  A parent slot of a
+parameterised factor may aggregate (`gaps.factor_parent.aggregate`,
+`add_factor(..., aggregate => ARRAY[...])`, one flag per parent): a child
+entity may then map to any number of parent entities there, zero
+included, where an ordinary slot needs exactly one.  The slot's parents
+are exchangeable and share its parameters (one p for noisy-OR, one weight
+per value for logistic), so `params` has the same length as for one
+parent.  Only parameterised factors may aggregate; the trigger refuses an
+aggregating slot on a CPT factor.
+
+Exact inference stays tractable through auxiliary variables built with
+the instance (`gx_param.c`), over its missing members only (observed ones
+are folded in as for any parent):
+
+- noisy-OR: an OR chain z_1 .. z_n over every missing member of every
+  aggregating slot, z_j = z_(j-1) OR (member j fires), each link a table
+  of 2 x |member| x 2 cells; the child's table has z_n as one parent.
+- logistic: per aggregating slot, a count chain c_1 .. c_n where c_j is
+  the vector of counts of each value among the first j missing members,
+  one value per such vector (C(j + V - 1, V - 1) of them for V values).
+  Each link is deterministic; the child's scores depend on the slot only
+  through c_n.  A slot of n missing binary members costs O(n^2) cells,
+  ternary O(n^3).
+
+Every instance is sized before any table is built (`gx_param_size`):
+each auxiliary table is held to `gaps.max_factor_cells`, and the
+instance to an estimate of what solving its component holds, 5 cells per
+cell of its tables plus 8 per auxiliary value plus 64, against
+`gaps.max_total_cells`.  The engine was measured to hold 4.0 to 4.1 cells
+per cell for count chains and up to 6 for the small tables of an OR
+chain, so on single instances from 1 to 140 members the estimate is 1.24
+to 2.1 times what exact inference needed: an instance the engine cannot
+solve is refused with the factor's name instead of after seconds of work.
+A factor's instances together are held to `gaps.max_total_cells` too,
+before anything is allocated, and the output array is built in place.
+Past any bound the call is an `ERROR` naming the factor, the variable or
+the size, and the limit.  The estimate counts the instance's own tables;
+its members' other factors in the same component are bounded by the
+engine as usual.  When `gaps.samples` is set, an instance without
+auxiliary variables (which could be sampled) is held to twice its cells
+instead.  An aggregating slot's member variables must be distinct
+(`gaps._param_cpts` takes them strictly increasing, as grounding produces
+them): one variable twice would be two independent firings of one
+value.  The auxiliary variables are missing, belong to no attribute,
+and are never returned or learned.  Their tables contain zeros, so a
+component holding them is solved exactly or refused, never sampled: the
+existing positivity rule (`GX_ENOTPOS`) refuses it, and `test/engine`
+checks that it does (in SQL, the per-instance estimate usually refuses
+such an instance first).
+
+A restricted call (`marginals(model, rel, entities)`) reaches an
+aggregating slot's parents and children through the same closure as any
+mapping, in both directions (the closure ignores how many entities a
+mapping reaches), and the chains are built from the grounded instance, so
+they come with it; `sql/param.sql` checks restricted rows equal
+unrestricted ones bit for bit.
+
+`learn_cpts` does not learn parameterised factors: they keep their
+`params`, their rows report method `'fixed (<kind>)'` with no count, and
+EM conditions on their tables as they are while it learns the CPTs
+(`gaps._estep` takes them as a fixed tail of the CPT array, so their
+expected counts are computed and never read).  Fitting logistic weights or
+noisy-OR probabilities is deferred.  `cpt_rows` returns a parameterised
+factor's table computed with every parent missing, bounded by
+`gaps.max_factor_cells` like any other, so a factor over many parents is
+an `ERROR` naming its size there while it still grounds.  For an
+aggregating slot it shows the table for one parent in the slot.
+`gaps.validate` reads only a factor's parents and mappings, so it treats
+every kind alike.
+
+Deferred: learning parameterised factors (logistic regression, noisy-OR
+EM; pg.ddx.io fits weights outside for now), continuous inputs to a
+logistic (inputs are binned attributes), and a combiner that is a parent
+of members' latents, which the members must declare themselves.
+
 **Learning with missing values.**  `learn_cpts(model, alpha, method =>
 'em', max_iterations => 50, tol => 1e-6)` runs expectation maximization,
 so an entity with a missing child or parent still informs the factor
@@ -633,6 +778,67 @@ rows.  The output says `method` 'em', `iterations` (M-steps, 0 for
 'counts'), `loglik` (log P(evidence) under the returned CPTs) and
 `converged` (false when `max_iterations` stopped it).  A component too
 large for exact inference is an `ERROR`; there is no sampled E-step.
+
+**Composite models.**  pg.ddx.io runs three networks (e-mail, commit
+message, patch), each a latent author state per row with observed
+children, and wants one answer per person.  Combining the three
+posteriors in SQL is rule 21's failure: they are not independent when the
+networks share a person.  A composite model holds member models
+(`gaps.add_member(model, member)`, rows of `gaps.model_member`) and adds
+factors of its own; its ground network is the union of its members'
+networks and its own factors, solved as one network by one call.
+
+- Members are referenced, not copied: a new CPT in a member is what the
+  composite uses at its next call.  A member may be a composite itself;
+  the trigger on `gaps.model_member` refuses a cycle of membership.  The
+  foreign key on the member is `ON DELETE RESTRICT`, so dropping a model
+  in use is an error, and `pg_dump` keeps the table like the rest of the
+  catalog (`test/dump`).
+- A composite's factors name a member's stripe as `member.stripe`; its
+  own stripes keep plain names, which are looked up first, so a stripe
+  of its own whose name contains a dot hides a member's of that name.
+  A composite cannot change a member's factors: what the combination
+  needs to cause is declared in the member.
+- Validity is checked on the union, as for one model: coverage, mappings,
+  evidence, cycles, and `gaps.validate`'s structural proof all run over
+  every model in it (`gaps._models`).  Two models of a composite may not
+  declare one column; grounding refuses that, naming both.  A factor
+  whose parent stripe has left the union (its member row deleted by hand)
+  is refused at grounding rather than by a trigger, since `pg_restore`
+  loads `gaps.model_member` in a transaction of its own.
+- Row-level security: grounding reads every member as the caller, so a
+  member the caller cannot see is an `ERROR` naming it, never silently
+  left out.  `gaps.model_member` follows its composite's visibility, and
+  its trigger refuses a member the caller cannot see, since the foreign
+  key check ignores row-level security and a hidden member would let any
+  role block its owner's `drop_model`.
+- `learn_cpts` refuses a composite (it would write members' CPTs); learn
+  each member on its own.  The row estimate of `marginals` and `impute`
+  sums over the composite's and its members' attributes.
+
+**The combiner's direction.**  In pg.ddx.io's example the combiner's
+child is the person's state and its parents are the member latents of all
+the person's rows, through aggregating slots, one per member:
+person.pid = email.pid one-to-many.  That direction is chosen because it
+leaves the members untouched: each member stays a valid model with its
+own priors, a composite only adds a factor over latents that already
+exist, and the person's state is the one variable a combiner introduces.
+The other direction (person state causes each row's latent) is the
+classical hierarchical model and is often the better story, but it makes
+the person's state a parent inside every member, which the members must
+then declare themselves (a composite cannot change a member's factors);
+it needs no new mechanism, only that each member declares a vertical
+factor to the person.  With the chosen direction, a person's latents are
+independent of each other until the person's state is observed: a
+labelled person is evidence about every row at once, which is exactly
+what separate inference misses.  `sql/composite.sql` shows both sides:
+for an unlabelled person, combining the members' separate marginals in
+SQL by the same noisy-OR gives the composite's answer (a common child
+that is not observed leaves its parents independent), and for a person
+labelled 'llm' the composite moves an e-mail's latent from 0.783 to
+0.824, which no member sees on its own.  So the SQL combination is right
+only by accident, for one kind of question, and the composite is right
+for both.
 
 **Binned attributes.**  `declare_attribute(..., edges => ARRAY[e1, ...,
 en])` declares a numeric column whose values pg_gaps discretises on

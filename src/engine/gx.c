@@ -127,6 +127,9 @@ cells_bounded(const int *card, const int *vars, int nv, size_t limit)
  * ----------------------------------------------------------------
  */
 
+/* How far above 0 a log-scaled CPT entry may round (check_cpt). */
+#define LSCALE_SLACK 1e-9
+
 /*
  * Check one CPT: child, parents and entries.  Sets *bad_var on failure.
  * mark[] is all-zero on entry and on return; it finds duplicate parents
@@ -178,9 +181,31 @@ check_cpt(const gx_bn *bn, const gx_cpt *c, unsigned char *mark, int *bad_var)
 	if (n > SIZE_MAX / (size_t) bn->card[c->child])
 		return rc;
 	n *= (size_t) bn->card[c->child];
-	for (size_t k = 0; k < n; k++)
-		if (!isfinite(c->vals[k]) || c->vals[k] < 0.0)
-			return rc;
+	if (c->lscale)
+	{
+		/* Logs: -INFINITY is a zero, NaN and +INFINITY are not values. */
+		for (int x = 0; x < bn->card[c->child]; x++)
+			if (!isfinite(c->lscale[x]))
+				return rc;
+		/*
+		 * Each entry, offset plus value, is a log probability, so at most
+		 * 0 (with LSCALE_SLACK for rounding).  A larger one is not a
+		 * valid table; letting it through could overflow log P(evidence)
+		 * to +Infinity.
+		 */
+		for (size_t k = 0; k < n; k++)
+		{
+			int			x = (int) (k % (size_t) bn->card[c->child]);
+
+			if (isnan(c->vals[k]) || c->vals[k] == INFINITY ||
+				c->lscale[x] + c->vals[k] > LSCALE_SLACK)
+				return rc;
+		}
+	}
+	else
+		for (size_t k = 0; k < n; k++)
+			if (!isfinite(c->vals[k]) || c->vals[k] < 0.0)
+				return rc;
 	*bad_var = -1;
 	return GX_OK;
 }
@@ -1948,13 +1973,28 @@ uf_find(int *parent, int x)
 }
 
 /*
+ * The log of entry idx of CPT cpt, whose child takes value x there.  For a
+ * log CPT, with_scale says whether its offset for x is included.
+ */
+static double
+cpt_log(const gx_cpt *cpt, size_t idx, int x, int with_scale)
+{
+	if (cpt->lscale == NULL)
+		return log(cpt->vals[idx]);
+	return with_scale ? cpt->lscale[x] + cpt->vals[idx] : cpt->vals[idx];
+}
+
+/*
  * Reduce CPT cpt by the evidence into a factor over its missing variables,
  * in local indices (loc[] maps global to local).  The factor's variables
- * keep the CPT's order: parents, then the child.
+ * keep the CPT's order: parents, then the child.  When the child of a log
+ * CPT is observed, its offset is the same in every cell; it is left out of
+ * the factor and added to *lconst instead, so the factor keeps the table's
+ * precision and components that differ only in such offsets share.
  */
 static int
 reduce_cpt(ctx *c, const gx_cpt *cpt, const int *loc, const int *lcard,
-		   factor *f, int *gval)
+		   factor *f, int *gval, double *lconst)
 {
 	const gx_bn *bn = c->bn;
 	int			nall = cpt->nparents + 1;
@@ -1979,6 +2019,8 @@ reduce_cpt(ctx *c, const gx_cpt *cpt, const int *loc, const int *lcard,
 	}
 	if (factor_init(c, f, lcard, vars, nv) != GX_OK)
 		goto done;
+	if (cpt->lscale && bn->evidence[cpt->child] >= 0)
+		*lconst += cpt->lscale[bn->evidence[cpt->child]];
 
 	/* Walk the factor's cells; observed variables stay at their values. */
 	for (size_t cell = 0; cell < f->ncells; cell++)
@@ -1991,7 +2033,7 @@ reduce_cpt(ctx *c, const gx_cpt *cpt, const int *loc, const int *lcard,
 
 			idx = idx * (size_t) bn->card[g] + (size_t) gval[g];
 		}
-		f->vals[cell] = log(cpt->vals[idx]);
+		f->vals[cell] = cpt_log(cpt, idx, gval[cpt->child], bn->evidence[cpt->child] < 0);
 		for (int i = nv - 1; i >= 0; i--)
 		{
 			if (++gval[globals[i]] < bn->card[globals[i]])
@@ -2005,9 +2047,9 @@ done:
 	return c->err;
 }
 
-/* Value of a CPT whose variables are all observed. */
+/* The log of the value of a CPT whose variables are all observed. */
 static double
-observed_value(const gx_bn *bn, const gx_cpt *cpt)
+observed_log(const gx_bn *bn, const gx_cpt *cpt)
 {
 	size_t		idx = 0;
 
@@ -2015,7 +2057,7 @@ observed_value(const gx_bn *bn, const gx_cpt *cpt)
 		idx = idx * (size_t) bn->card[cpt->parents[j]] +
 			(size_t) bn->evidence[cpt->parents[j]];
 	idx = idx * (size_t) bn->card[cpt->child] + (size_t) bn->evidence[cpt->child];
-	return cpt->vals[idx];
+	return cpt_log(cpt, idx, bn->evidence[cpt->child], 1);
 }
 
 /* Serialize a component canonically: nloc, cards, then sorted factors. */
@@ -2260,6 +2302,7 @@ typedef struct compbuild
 	factor	   *fs;				/* reduced factors, in key order */
 	int			nf;
 	keybuf		key;
+	double		lconst;			/* the log offsets reduce_cpt left out */
 	uint64_t	h;				/* the bucket hash */
 	uint64_t	keyhash;		/* the key's real hash, see cache_fill */
 } compbuild;
@@ -2299,7 +2342,8 @@ component_build(ctx *c, const int *members, int nloc, const int *cptlist,
 		factor	   *f = &cb->fs[cb->nf];
 
 		interrupt(c);
-		if (reduce_cpt(c, &bn->cpts[cptlist[i]], loc, cb->lcard, f, gval) != GX_OK)
+		if (reduce_cpt(c, &bn->cpts[cptlist[i]], loc, cb->lcard, f, gval,
+					   &cb->lconst) != GX_OK)
 			return c->err;
 		f->src = i;
 		cb->nf++;
@@ -2442,7 +2486,7 @@ find_components(ctx *c, inferwork *w, gx_result *out)
 			else
 				w->uf[uf_find(w->uf, p)] = uf_find(w->uf, first);
 		}
-		if (first < 0 && observed_value(bn, cpt) == 0.0)
+		if (first < 0 && observed_log(bn, cpt) == -INFINITY)
 		{
 			out->bad_var = cpt->child;
 			c->err = GX_EZERO;
@@ -2787,7 +2831,7 @@ counts_component(ctx *c, const inferwork *w, int k, int nloc, const size_t *goff
 	 * posterior i, whichever component filled the entry: equal keys have
 	 * equal factors in equal order.  src names this component's CPT.
 	 */
-	ec->loglik += e->logz;
+	ec->loglik += e->logz + cb.lconst;
 	for (int i = 0; i < cb.nf; i++)
 	{
 		int			j = cptlist[cb.fs[i].src];
@@ -2873,7 +2917,7 @@ gx_expected_counts(const gx_env *env, const gx_bn *bn, gx_counts *ec)
 					interrupt(&c);
 				counts_add(bn, &bn->cpts[i], &one, 1,
 						   ec->counts + goff[ec->group[i]], w.gval);
-				ec->loglik += log(observed_value(bn, &bn->cpts[i]));
+				ec->loglik += observed_log(bn, &bn->cpts[i]);
 			}
 		for (int k = 0; k < r.ncomp; k++)
 		{

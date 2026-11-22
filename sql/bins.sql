@@ -79,6 +79,44 @@ SELECT round((0.3 * 0.1 / (0.7 * 0.7 + 0.3 * 0.1))::numeric, 6) AS lo,
 	   round((0.3 * 0.3 / (0.7 * 0.2 + 0.3 * 0.3))::numeric, 6) AS mid,
 	   round((0.3 * 0.6 / (0.7 * 0.1 + 0.3 * 0.6))::numeric, 6) AS hi;
 
+-- A logistic factor with a binned parent: its weights are per bin, and a
+-- row's score uses the weight of its value's bin.  bias -1, weights lo 0,
+-- mid 1, hi 3: P(y = on) = 1 / (1 + exp(-(-1 + w(bin)))); x NULL averages
+-- over the bins with x's prior (.5, .3, .2).
+CREATE TABLE lg (id int PRIMARY KEY, x numeric, y text);
+INSERT INTO lg VALUES (1, 0.5, NULL), (2, 1, NULL), (3, 2.5, NULL), (4, NULL, NULL),
+	(5, NULL, 'on');
+SELECT gaps.create_model('lg');
+SELECT gaps.declare_attribute('lg', 'lg', 'x', ARRAY['lo', 'mid', 'hi'], edges => ARRAY[1, 2.5]);
+SELECT gaps.declare_attribute('lg', 'lg', 'y', ARRAY['off', 'on']);
+SELECT gaps.add_stripe('lg', 'x', 'lg', 'x'), gaps.add_stripe('lg', 'y', 'lg', 'y');
+SELECT gaps.add_factor('lg', 'px', 'x', '{}', ARRAY[0.5, 0.3, 0.2]);
+SELECT gaps.add_factor('lg', 'py', 'y', ARRAY['x'], kind => 'logistic',
+					   params => ARRAY[-1, 0, 1, 3]);
+WITH w(bin, wt, pr) AS (VALUES (1, 0.0, 0.5), (2, 1.0, 0.3), (3, 3.0, 0.2)),
+hand AS (
+	SELECT l.id, CASE WHEN l.x IS NULL THEN NULL ELSE width_bucket(l.x, ARRAY[1, 2.5]) + 1 END
+		AS bin FROM lg l),
+want AS (
+	SELECT h.id,
+		   CASE WHEN h.bin IS NULL
+				THEN (SELECT sum(w.pr / (1 + exp(1 - w.wt))) FROM w)
+				ELSE (SELECT 1 / (1 + exp(1 - w.wt)) FROM w WHERE w.bin = h.bin) END AS p
+	FROM hand h WHERE h.id < 5)
+SELECT m.entity, round(m.probability::numeric, 12) AS p_on,
+	   abs(m.probability - want.p) < 1e-12 AS equals_hand
+FROM gaps.marginals('lg') m JOIN want ON want.id = (m.entity ->> 'id')::int
+WHERE m.attname = 'y' AND m.value = 'on' ORDER BY 1;
+-- Row 5's observed y = on is evidence about its missing x: P(bin | on) is
+-- the prior times P(on | bin), normalized.
+WITH w(bin, label, wt, pr) AS (VALUES (1, 'lo', 0.0, 0.5), (2, 'mid', 1.0, 0.3),
+								  (3, 'hi', 3.0, 0.2)),
+z AS (SELECT sum(pr / (1 + exp(1 - wt))) AS z FROM w)
+SELECT m.value, round(m.probability::numeric, 12) AS p,
+	   abs(m.probability - w.pr / (1 + exp(1 - w.wt)) / z.z) < 1e-12 AS equals_hand
+FROM gaps.marginals('lg', 'lg', '[{"id": 5}]') m JOIN w ON w.label = m.value, z
+WHERE m.attname = 'x' ORDER BY w.bin;
+
 -- Rejections.
 CREATE TABLE t (id int PRIMARY KEY, x float8, c text, r real);
 SELECT gaps.create_model('bad');
@@ -99,4 +137,4 @@ SELECT count(*) FROM gaps.attribute a JOIN gaps.model m USING (model_id) WHERE m
 ALTER TABLE lc ALTER COLUMN x TYPE text;
 SELECT count(*) FROM gaps.marginals('lc');                                                  -- fail
 
-SELECT gaps.drop_model(name) FROM gaps.model WHERE name IN ('b', 'lc', 'bad');
+SELECT gaps.drop_model(name) FROM gaps.model WHERE name IN ('b', 'lc', 'lg', 'bad');

@@ -129,7 +129,8 @@ bad_arg(const char *fmt, int a, int b)
 
 /*
  * gaps._infer(card int[], evidence int[], child int[], parent_off int[],
- *			   parents int[], cpt_off int[], cpts float8[])
+ *			   parents int[], cpt_off int[], cpts float8[],
+ *			   cpt_lscale int[] DEFAULT '{}')
  * RETURNS TABLE (var int, value int, probability float8, component int,
  *				  map_value int, map_probability float8, samples int)
  *
@@ -140,7 +141,10 @@ bad_arg(const char *fmt, int a, int b)
  * (parent_off has n+1 elements).  Its values start at cpts[cpt_off[j]]
  * and run for as many entries as its variables' cardinalities imply, so
  * every instance of a first-order factor points at the same values.  All
- * offsets are 1-based.
+ * offsets are 1-based.  cpt_lscale is empty, or has one entry per CPT: 0
+ * for a table of probabilities, or the offset in cpts of the card(child)
+ * log offsets of a log CPT, whose values are then logs (gx.h); the
+ * parameterised factors' tables are log CPTs (engine/gx_param.h).
  *
  * samples is NULL for a component solved exactly, and otherwise the number
  * of Gibbs samples per chain behind its probabilities; map_value is then each
@@ -161,7 +165,8 @@ build_network(FunctionCallInfo fcinfo, gx_bn *bn, const int **cpt_off)
 			   *child,
 			   *poff,
 			   *par,
-			   *coff;
+			   *coff,
+			   *lsc;
 	double	   *vals;
 	int			n,
 				nev,
@@ -169,7 +174,8 @@ build_network(FunctionCallInfo fcinfo, gx_bn *bn, const int **cpt_off)
 				npoff,
 				npar,
 				ncoff,
-				nvals;
+				nvals,
+				nlsc;
 	gx_cpt	   *cpts;
 
 	n = int_array(PG_GETARG_ARRAYTYPE_P(0), "card", &card);
@@ -179,12 +185,15 @@ build_network(FunctionCallInfo fcinfo, gx_bn *bn, const int **cpt_off)
 	npar = int_array(PG_GETARG_ARRAYTYPE_P(4), "parents", &par);
 	ncoff = int_array(PG_GETARG_ARRAYTYPE_P(5), "cpt_off", &coff);
 	nvals = float_array(PG_GETARG_ARRAYTYPE_P(6), "cpts", &vals);
+	nlsc = int_array(PG_GETARG_ARRAYTYPE_P(7), "cpt_lscale", &lsc);
 
 	if (nev != n || ncpt != n)
 		bad_arg("card, evidence and child must have the same length (%d, %d)", n,
 				nev != n ? nev : ncpt);
 	if (npoff != n + 1 || ncoff != n)
 		bad_arg("parent_off needs %d elements and cpt_off %d", n + 1, n);
+	if (nlsc != 0 && nlsc != n)
+		bad_arg("cpt_lscale needs 0 or %d elements, got %d", n, nlsc);
 	if (n > 0 && (poff[0] != 1 || poff[n] != npar + 1))
 		bad_arg("parent_off must run from 1 to %d, got last %d", npar + 1, poff[n]);
 
@@ -222,10 +231,14 @@ build_network(FunctionCallInfo fcinfo, gx_bn *bn, const int **cpt_off)
 		}
 		if (coff[j] < 1 || (int64) coff[j] - 1 + need > nvals)
 			bad_arg("CPT %d needs %d values from its offset", j + 1, (int) need);
+		if (nlsc && (lsc[j] < 0 ||
+					 (lsc[j] > 0 && (int64) lsc[j] - 1 + card[c - 1] > nvals)))
+			bad_arg("CPT %d needs %d log offsets from its cpt_lscale", j + 1, card[c - 1]);
 		cpts[j].child = c - 1;
 		cpts[j].nparents = np;
 		cpts[j].parents = &par[poff[j] - 1];
 		cpts[j].vals = &vals[coff[j] - 1];
+		cpts[j].lscale = nlsc && lsc[j] > 0 ? &vals[lsc[j] - 1] : NULL;
 	}
 
 	bn->nvars = n;
@@ -324,7 +337,7 @@ gaps_infer(PG_FUNCTION_ARGS)
 	MemoryContext work,
 				old;
 
-	for (int i = 0; i < 7; i++)
+	for (int i = 0; i < 8; i++)
 		if (PG_ARGISNULL(i))
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -437,7 +450,7 @@ derive_groups(const gx_bn *bn, const int *coff, int *group, int **goffs,
 /*
  * gaps._expected_counts(card int[], evidence int[], child int[],
  *						 parent_off int[], parents int[], cpt_off int[],
- *						 cpts float8[])
+ *						 cpts float8[], cpt_lscale int[] DEFAULT '{}')
  * RETURNS TABLE (cpt_off int, cell int, n float8, loglik float8)
  *
  * The E-step of EM over the ground network gaps._infer takes (same
@@ -447,8 +460,9 @@ derive_groups(const gx_bn *bn, const int *coff, int *group, int **goffs,
  * posterior probability that the instance's child and parents take that
  * cell's values, given the evidence; an instance with all of them
  * observed adds 1 to its cell.  loglik, the same on every row, is log
- * P(evidence) under the given CPTs.  Exact inference only: a component
- * too large for it is an ERROR whatever gaps.samples says.
+ * P(evidence) under the given CPTs, log offsets included.  Exact inference
+ * only: a component too large for it is an ERROR whatever gaps.samples
+ * says.
  */
 Datum
 gaps_expected_counts(PG_FUNCTION_ARGS)
@@ -467,7 +481,7 @@ gaps_expected_counts(PG_FUNCTION_ARGS)
 	MemoryContext work,
 				old;
 
-	for (int i = 0; i < 7; i++)
+	for (int i = 0; i < 8; i++)
 		if (PG_ARGISNULL(i))
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),

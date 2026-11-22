@@ -173,6 +173,21 @@ SELECT gaps.set_cpt('cm', 'f', ARRAY[0.5, 0.5]);
 SELECT plan_rows($$SELECT * FROM gaps.marginals('cm')$$) AS coarse_est,
 	   (SELECT count(*) FROM gaps.marginals('cm')) AS coarse_actual;
 
+-- A composite model: its members' attributes and its own.  Model cm
+-- (above, 200 estimated) as a member of a composite that declares
+-- ce2.b, missing in 300 rows (domain of 3): 200 + 900 = 1100.
+CREATE TABLE ce2 (id int PRIMARY KEY, k int, b text);
+INSERT INTO ce2 SELECT i, i % 10, CASE WHEN i <= 300 THEN NULL ELSE 'p' END
+FROM generate_series(1, 1000) i;
+ANALYZE ce2;
+SELECT gaps.create_model('cc');
+SELECT gaps.add_member('cc', 'cm');
+SELECT gaps.declare_attribute('cc', 'ce2', 'b', ARRAY['p', 'q', 'r']);
+SELECT plan_rows($$SELECT * FROM gaps.marginals('cc')$$) AS composite_est,
+	   plan_rows($$SELECT * FROM gaps.impute('cc')$$) AS composite_impute_est;
+SELECT gaps.drop_model('cc');
+DROP TABLE ce2;
+
 -- A table never analyzed has no statistics: the default.
 CREATE TABLE u (id int PRIMARY KEY, c text);
 SELECT gaps.create_model('um');

@@ -4,6 +4,7 @@
  */
 #include "oracle.h"
 
+#include <math.h>
 #include <string.h>
 
 double
@@ -19,7 +20,7 @@ oracle_joint(const gx_bn *bn, const int *assign)
 		for (int j = 0; j < c->nparents; j++)
 			idx = idx * bn->card[c->parents[j]] + assign[c->parents[j]];
 		idx = idx * bn->card[c->child] + assign[c->child];
-		p *= c->vals[idx];
+		p *= c->lscale ? exp(c->lscale[assign[c->child]] + c->vals[idx]) : c->vals[idx];
 	}
 	return p;
 }

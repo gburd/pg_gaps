@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+Composite models: `gaps.add_member(model, member)` makes a model hold
+others, and its factors may name a member's stripes as `member.stripe`.
+One call grounds and solves the union as one network, so a person-level
+combiner over three networks conditions everything on everything instead
+of multiplying the members' marginals in SQL.  A member in use cannot be
+dropped; membership cycles and members the caller cannot see are
+refused; composites survive pg_dump and restore.
+
+Parameterised factors: `gaps.add_factor(..., kind => 'logistic' |
+'noisy_or', params => ...)` declares a factor whose table is computed
+from weights at grounding instead of stored, over each instance's missing
+parents only, so a logistic over 15 observed five-valued inputs costs one
+row per instance rather than 5^15.  `learn_cpts` keeps them fixed (method
+'fixed (<kind>)'), EM learns the other factors around them, and
+`cpt_rows` shows their computed table.  A parent of such a factor may
+aggregate (`aggregate => ARRAY[true, ...]`): a child then maps to any
+number of parent entities there, which share the slot's parameters, and
+grounding expands them into an OR chain or count chains of internal
+auxiliary variables, so inference stays exact.  Their tables reach the engine
+as logs with a log offset per child value, so a person with thousands of
+labelled e-mails gets the exact posterior where folding into a plain
+double underflowed; an entry that cannot be represented is an error
+naming the factor.  An instance, and a factor's instances together, are
+sized against the limits before any table is built.
+
 Binned attributes: `gaps.declare_attribute(..., edges => float8[])`
 declares a numeric column (smallint, integer, bigint, numeric, real or
 double precision) that pg_gaps discretises on read.  n strictly

@@ -437,6 +437,11 @@ SELECT * FROM gaps._infer('{2}', '{3}', '{1}', '{1,1}', '{}', '{1}', '{0.5,0.5}'
 SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,1}', '{}', '{1}', '{0.5}');        -- fail
 SELECT * FROM gaps._infer('{2}', '{0}', '{2}', '{1,1}', '{}', '{1}', '{0.5,0.5}');  -- fail
 SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,2}', '{1}', '{1}', '{0.5,0.5,0.5,0.5}');   -- fail
+-- Log-scaled CPTs: an entry (offset plus value) is a log probability, so
+-- one above 0 is refused, not summed into log P(evidence).
+SELECT * FROM gaps._infer('{2}', '{1}', '{1}', '{1,1}', '{}', '{1}', '{0,-1,800,800}', '{3}');  -- fail
+SELECT * FROM gaps._expected_counts('{2}', '{1}', '{1}', '{1,1}', '{}', '{1}',
+	'{0,-1,800,800}', '{3}');                                                        -- fail
 
 DROP TABLE sensor, reading;
 SELECT gaps.drop_model('m');

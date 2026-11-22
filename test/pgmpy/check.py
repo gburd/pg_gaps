@@ -9,8 +9,9 @@ pg_gaps must be installable.  For each random model it:
   1. creates a table of random rows, with a random fraction of values
      missing, and declares a random first-order model over it in pg_gaps:
      a few attributes per row, each with a prior or with parents among
-     earlier attributes of the same row, and optionally a vertical factor
-     tying row r's attribute to row r-1's;
+     earlier attributes of the same row (as a CPT, or as a logistic or
+     noisy-OR factor), and optionally a vertical factor tying row r's
+     attribute to row r-1's;
   2. reads back the ground network pg_gaps built (gaps._ground) and builds
      the same Bayesian network in pgmpy, with the same CPTs and evidence;
   3. asks pgmpy's VariableElimination for every missing variable's
@@ -24,6 +25,7 @@ disagreement, printing the model's seed.
 
 import argparse
 import json
+import math
 import random
 import sys
 import warnings
@@ -50,9 +52,10 @@ def random_cpt(rng, nrows, k, zero_frac):
     return out
 
 
-def build_model(cur, rng, name):
+def build_model(cur, rng, name, parameterised=True):
     """Create a table and a random model over it.  Returns nothing; the
-    model is read back through gaps._ground."""
+    model is read back through gaps._ground.  With parameterised, some
+    factors with parents are logistic or noisy-OR instead of CPTs."""
     natt = rng.randint(1, 4)
     nrows = rng.randint(1, 6)
     cards = [rng.randint(2, 3) for _ in range(natt)]
@@ -115,15 +118,33 @@ def build_model(cur, rng, name):
         prows = 1
         for p in parents:
             prows *= cards[p]
+        kind = "cpt"
+        if parents and parameterised:
+            kind = rng.choice(["cpt", "cpt", "logistic", "noisy_or"])
+        if kind == "noisy_or" and cards[i] != 2:
+            kind = "logistic"
+        if kind == "cpt":
+            cur.execute(
+                "SELECT gaps.add_factor(%s, %s, %s, %s, %s)",
+                [
+                    name,
+                    f"f{i}",
+                    f"s{i}",
+                    [f"s{p}" for p in parents],
+                    random_cpt(rng, prows, cards[i], zero),
+                ],
+            )
+            continue
+        # A parameterised factor: grounding turns it into one table per
+        # instance over its missing parents, which check_model reads back.
+        if kind == "noisy_or":
+            params = [rng.random() for _ in range(1 + len(parents))]
+        else:
+            width = 1 + sum(cards[p] for p in parents)
+            params = [rng.uniform(-3, 3) for _ in range((cards[i] - 1) * width)]
         cur.execute(
-            "SELECT gaps.add_factor(%s, %s, %s, %s, %s)",
-            [
-                name,
-                f"f{i}",
-                f"s{i}",
-                [f"s{p}" for p in parents],
-                random_cpt(rng, prows, cards[i], zero),
-            ],
+            "SELECT gaps.add_factor(%s, %s, %s, %s, kind => %s, params => %s)",
+            [name, f"f{i}", f"s{i}", [f"s{p}" for p in parents], kind, params],
         )
 
 
@@ -137,6 +158,7 @@ def check_model(cur, name, seed):
         parents,
         cpt_off,
         cpts,
+        cpt_lscale,
         var_attr,
     ) = cur.fetchone()
     n = len(card)
@@ -158,6 +180,11 @@ def check_model(cur, name, seed):
         for p in ps:
             nrows *= card[p]
         flat = cpts[cpt_off[j] - 1 : cpt_off[j] - 1 + nrows * k]
+        if cpt_lscale[j]:
+            # A log CPT (a parameterised factor's): add each child value's
+            # offset and leave the logs.
+            scale = cpts[cpt_lscale[j] - 1 : cpt_lscale[j] - 1 + k]
+            flat = [math.exp(x + scale[i % k]) for i, x in enumerate(flat)]
         # pgmpy's table is child-by-parent-combination, parents in order with
         # the last varying fastest: transpose our row-major layout.
         table = [[flat[r * k + x] for r in range(nrows)] for x in range(k)]
@@ -191,7 +218,7 @@ def check_model(cur, name, seed):
     infer = VariableElimination(bn)
     checked = 0
     for v in range(n):
-        if evidence[v] > 0:
+        if evidence[v] > 0 or var_attr[v] is None:
             continue
         att, dom = attnames[var_attr[v]]
         q = infer.query([v], evidence=ev, show_progress=False)
