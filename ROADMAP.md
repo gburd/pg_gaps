@@ -59,7 +59,8 @@ canonical stripe constants (a catalog change), the rest of the grounding
 cost (Phase 6), and fitting parameterised factors.  Gated on PG 17.12,
 18.7 and 19.0 (nixpkgs with clang; PGDG on Debian trixie and Fedora 44
 with gcc and `-Werror`).  Public at codeberg.org/gregburd/pg_gaps (mirror
-github.com/gburd/pg_gaps).  Packaged for PGXN, not yet published.
+github.com/gburd/pg_gaps).  0.1.0 released 2026-11-22 on PGXN, GitHub and
+Codeberg (one zip, sha256 38bc3353...e5f4).
 
 | phase | item | status |
 |---|---|---|
@@ -84,7 +85,7 @@ github.com/gburd/pg_gaps).  Packaged for PGXN, not yet published.
 | 2 | `SupportRequestRows` for the SRFs | done: catalog plus `stanullfrac` estimate, under the `pg_stats` visibility rule; ROWS fallback; no lock waits, none on a standby or under SERIALIZABLE; replans on ANALYZE (`sql/rows.sql`) |
 | 2 | grounding cost | **open**: entity keys are typed composites and temp tables are reused per transaction: `marginals` 2.0-2.6x faster on the hotel workload (10.3 s for 2M variables on EC2), 1.7x on a 900-attribute model, 3 ms slower on a 2-attribute one (`bench/RESULTS_GROUNDING_2026-11-20.md`); keys of the same types share tables whatever their names, so 300 and 2,000 relations keyed by differently named int columns hold main's lock count plus 12 and take 0.70-0.83x its time per call (local), and more than 100 key shapes is an `ERROR`; what remains is sorting integer instance rows (Phase 6) |
 | 3 | Gibbs sampling for components too large for exact | done: `gaps.samples` (per chain), `gaps.seed`; 4 chains from dispersed starts, refused (`ERROR`) when two chains' estimates differ by more than 0.1.  On models of at most 12 variables (20,000 random strictly positive cases) and the 6 x 6 grid, Rao-Blackwellized marginals are within 0.1 of exact at 4,000 samples (largest error 0.025) with no refusals; the review's multimodal grid and hub models are refused.  The check cannot see chains all stuck in one mode, so a sampled answer can still be wrong without an error (DESIGN.md "Gibbs sampling, as built").  Refusal on zeros, cancellable (`test/engine`, `sql/infer.sql`) |
-| 8 | PGXN packaging | done: `META.json` (`pgxn_meta` clean), `make dist`, `make check-meta` in the flake and CI, `.github/workflows/release.yml`; the zip builds and passes on PGDG 17, 18, 19 with gcc `-Werror`.  **Not published**: the release workflow has not run |
+| 8 | PGXN packaging | done: `META.json` (`pgxn_meta` clean), `make dist`, `make check-meta` in the flake and CI, `.github/workflows/release.yml`; the zip builds and passes on PGDG 17, 18, 19 with gcc `-Werror`.  0.1.0 published 2026-11-22 by the release workflow (PGXN HTTP 303); the PGXN, GitHub and Codeberg zips are identical, and the PGXN download passes 13/13 |
 | 3 | full hotel workload with its vertical factors | done: runs exact, components of at most 4 variables (`bench/hotel.sql`, `bench/RESULTS_HOTEL_2026-11-20.md`) |
 
 ## Phase 1: model catalog and validation

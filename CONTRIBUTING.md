@@ -90,6 +90,12 @@ MAJOR` in a `debian:trixie` container to reproduce either locally.
    tests the zip itself, attaches it to a GitHub Release, and uploads it to
    PGXN with the `PGXN_USER` and `PGXN_PASSWORD` repository secrets
    (skipped with a warning when they are not set).
-4. To republish an existing tag, run the workflow by hand
+4. The Codeberg-to-GitHub mirror can lag a tag push by hours (its
+   interval is 8 h); force it with `tea api -l codeberg.org/gregburd -X POST
+   /repos/gregburd/pg_gaps/push_mirrors-sync`.  Afterwards attach the same
+   zip and its `.sha256sum` to a Codeberg release (`tea releases create`,
+   then `tea releases assets create`), and check that the GitHub, PGXN and
+   Codeberg zips have one sha256.
+5. To republish an existing tag, run the workflow by hand
    (`workflow_dispatch`) with the tag; do not re-tag.  PGXN answers 409 for
    a version it already has.
