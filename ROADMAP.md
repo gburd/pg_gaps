@@ -47,16 +47,19 @@ Each has a recommendation.  None blocks Phase 0, which is done.
   because the repository has no remote yet.
 - `AGENTS.md`, this file, `doc/DESIGN.md`, `CONTRIBUTING.md`, `README.md`.
 
-## Status, 2026-11-20
+## Status, 2026-11-21
 
-Phases 1, 2 and 3 are built.  Two items are open: canonical stripe
-constants (a catalog change) and the rest of the grounding cost (Phase
-6).  Gated on PG 17.12, 18.7 and 19.0 (nixpkgs with clang; PGDG on Fedora
-44 with gcc 16 and `-Werror`).  Exact inference handles vertical
-correlations (any component the size bounds allow); Gibbs sampling covers
-larger components when `gaps.samples` is set.  Public at
-codeberg.org/gregburd/pg_gaps (mirror github.com/gburd/pg_gaps); GitHub CI
-green on the first push.  Packaged for PGXN, not yet published.
+Phases 1, 2 and 3 are built, plus what pg.ddx.io's qualification asked
+for (their report of 2026-11-21): per-cell Dirichlet priors and EM in
+`learn_cpts`, `marginals`/`impute` restricted to some entities, models
+over views and foreign tables, binned numeric attributes, parameterised
+factors (logistic, noisy-OR) with aggregating parent slots, and
+composite models that ground several member networks as one.  Open:
+canonical stripe constants (a catalog change), the rest of the grounding
+cost (Phase 6), and fitting parameterised factors.  Gated on PG 17.12,
+18.7 and 19.0 (nixpkgs with clang; PGDG on Debian trixie and Fedora 44
+with gcc and `-Werror`).  Public at codeberg.org/gregburd/pg_gaps (mirror
+github.com/gburd/pg_gaps).  Packaged for PGXN, not yet published.
 
 | phase | item | status |
 |---|---|---|
