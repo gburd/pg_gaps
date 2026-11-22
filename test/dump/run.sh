@@ -12,9 +12,10 @@
 # rows with the same probabilities in both.  Then checks that renaming
 # and dropping a column the model uses, and dropping its table, make
 # inference fail with an error naming what changed.  The factors' CPTs,
-# priors, kinds, parameters and aggregating parents must also come back
-# unchanged, and so must a composite model over the first one, its
-# marginals included, and the restriction on dropping its member.
+# priors, kinds, parameters and aggregating parents, and the attributes'
+# bin edges, must also come back unchanged, and so must a composite model
+# over the first one, its marginals included, and the restriction on
+# dropping its member.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,12 +43,15 @@ factors_q="SELECT f.name, f.cpt, f.prior, f.kind, f.params,
 	 FROM gaps.model_member mm JOIN gaps.model c ON c.model_id = mm.model_id
 		JOIN gaps.model m ON m.model_id = mm.member_id)
 	FROM gaps.factor f ORDER BY f.name"
+edges_q="SELECT relname, attname, domain, edges FROM gaps.attribute ORDER BY 1, 2"
 psql_q -d "$src_db" -At -c "$factors_q" >"$work/factors_before"
+psql_q -d "$src_db" -At -c "$edges_q" >"$work/edges_before"
 
 pg_dump -d "$src_db" -Fc -f "$work/dump"
 pg_restore -d "$dst_db" "$work/dump"
 psql_q -d "$dst_db" -At -c "$marginals_q" >"$work/after"
 psql_q -d "$dst_db" -At -c "$factors_q" >"$work/factors_after"
+psql_q -d "$dst_db" -At -c "$edges_q" >"$work/edges_after"
 
 if [ ! -s "$work/before" ]; then
 	echo "FAIL: the model returned no marginals before the dump" >&2
@@ -83,6 +87,21 @@ if ! grep -q 'model_member_member_id_fkey' <<<"$out"; then
 	exit 1
 fi
 echo "dump: dropping a member in use is refused after restore"
+if ! grep -q '^public.reading|lux|{dim,lit,bright}|{10,100}$' "$work/edges_before"; then
+	echo "FAIL: attribute lux has no bin edges before the dump" >&2
+	exit 1
+fi
+if ! grep -q '^lux|{0.3333333333333333,0.3333333333333333,0.3333333333333333}||cpt|' \
+	"$work/factors_before"; then
+	echo "FAIL: factor lux did not learn one entity per bin" >&2
+	exit 1
+fi
+if ! cmp -s "$work/edges_before" "$work/edges_after"; then
+	echo "FAIL: attributes' domains or bin edges differ after pg_dump and restore" >&2
+	diff "$work/edges_before" "$work/edges_after" >&2
+	exit 1
+fi
+echo "dump: $(wc -l <"$work/edges_before") attributes' domains and bin edges identical after restore"
 
 # The restored model must still find its table by name, and refuse when the
 # table it was declared over has changed.

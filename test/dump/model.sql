@@ -1,6 +1,7 @@
 -- The model test/dump/run.sh dumps and restores.  It exercises every
 -- catalog table: stripe predicates, a vertical factor with a mapping, a
--- horizontal factor, a coarse entity set, a prior and learned CPTs.
+-- horizontal factor, a coarse entity set, a binned attribute, a prior and
+-- learned CPTs.
 SET client_min_messages = warning;
 CREATE EXTENSION pg_gaps;
 
@@ -12,12 +13,16 @@ INSERT INTO sensor VALUES
 	(2, 2, 1, 'cold', 'dark'), (2, 2, 2, 'cold', NULL);
 CREATE TABLE room (room int, t int, k int, occupied text, PRIMARY KEY (room, t, k));
 INSERT INTO room VALUES (1, 1, 1, 'yes'), (1, 1, 2, NULL), (2, 1, 1, NULL), (2, 2, 1, 'no');
+CREATE TABLE reading (id int PRIMARY KEY, lux numeric);
+INSERT INTO reading VALUES (1, 0.5), (2, 10), (3, NULL), (4, 250), (5, 'NaN');
 
 SELECT gaps.create_model('dump');
 SELECT gaps.declare_attribute('dump', 'sensor', 'temp', ARRAY['cold', 'hot']);
 SELECT gaps.declare_attribute('dump', 'sensor', 'light', ARRAY['dark', 'bright']);
 SELECT gaps.declare_attribute('dump', 'room', 'occupied', ARRAY['yes', 'no'],
 							  ARRAY['room', 't']::name[]);
+SELECT gaps.declare_attribute('dump', 'reading', 'lux', ARRAY['dim', 'lit', 'bright'],
+							  edges => ARRAY[10, 100]);
 SELECT gaps.add_stripe('dump', 'tp1', 'sensor', 'temp');
 SELECT gaps.add_stripe_qual('dump', 'tp1', 'sid', '=', '1');
 SELECT gaps.add_stripe('dump', 'tp2', 'sensor', 'temp');
@@ -31,6 +36,8 @@ SELECT gaps.map_factor('dump', 'copy', 1, 't', 't');
 SELECT gaps.map_factor('dump', 'copy', 1, 'room', 'room');
 SELECT gaps.add_factor('dump', 'light', 'l', ARRAY['tp']);
 SELECT gaps.add_factor('dump', 'occ', 'occ', '{}');
+SELECT gaps.add_stripe('dump', 'lux', 'reading', 'lux');
+SELECT gaps.add_factor('dump', 'lux', 'lux', '{}');
 SELECT gaps.set_prior('dump', 'light', ARRAY[2, 0.5, 0.25, 3]);
 SELECT * FROM gaps.learn_cpts('dump');
 

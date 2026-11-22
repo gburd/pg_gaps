@@ -42,6 +42,7 @@ steps:
       - python3 -m venv /tmp/venv
       - /tmp/venv/bin/pip install --quiet pgmpy 'psycopg[binary]'
       - pg_virtualenv -v ${PG} /tmp/venv/bin/python test/pgmpy/check.py --models 300
+      - pg_virtualenv -v ${PG} /tmp/venv/bin/python test/pgmpy/em.py --models 200
     when:
       - matrix:
           PG: 19
