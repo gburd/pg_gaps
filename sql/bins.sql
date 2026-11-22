@@ -55,9 +55,10 @@ FROM gaps.factor f ORDER BY 1;
 SELECT value, probability FROM gaps.cpt_rows('b', 'i');
 
 -- The missing values (NULL and NaN) get the learned distribution over the
--- labels.
+-- labels.  Sorted in "C" so the order of labels like '>=3' and '[2,3)' does
+-- not depend on the database's locale.
 SELECT attname, entity, value, round(probability::numeric, 6) AS p
-FROM gaps.marginals('b') ORDER BY 1, 2, 3;
+FROM gaps.marginals('b') ORDER BY 1, 2, value COLLATE "C";
 
 -- A latent class with a binned child: evidence is the bin, so the
 -- posterior of a given x is the hand value for x's bin.  P(a = 1) = .3;

@@ -144,9 +144,10 @@ SELECT value, probability FROM gaps.cpt_rows('b', 'i');
 (3 rows)
 
 -- The missing values (NULL and NaN) get the learned distribution over the
--- labels.
+-- labels.  Sorted in "C" so the order of labels like '>=3' and '[2,3)' does
+-- not depend on the database's locale.
 SELECT attname, entity, value, round(probability::numeric, 6) AS p
-FROM gaps.marginals('b') ORDER BY 1, 2, 3;
+FROM gaps.marginals('b') ORDER BY 1, 2, value COLLATE "C";
  attname |  entity   | value |    p     
 ---------+-----------+-------+----------
  b       | {"id": 7} | hi    | 0.750000
