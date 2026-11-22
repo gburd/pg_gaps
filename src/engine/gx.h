@@ -73,8 +73,9 @@ typedef struct gx_env
  * A CPT.  With lscale NULL, vals are probabilities.  Otherwise vals are
  * natural logs (-INFINITY for zero), offset per child value: the log of
  * entry (row, x) is lscale[x] + vals[row * card(child) + x], with
- * card(child) finite lscale entries.  The offsets let a table whose
- * entries are far below 1 (a parameterised factor with many observed
+ * card(child) finite lscale entries, and every entry's log at most 0
+ * (gx_check refuses one above, beyond rounding).  The offsets let a table
+ * whose entries are far below 1 (a parameterised factor with many observed
  * parents, gx_param.h) keep its precision: when the child is observed,
  * only the differences between rows of one column reach the posterior,
  * and lscale of the observed value goes to log P(evidence) alone.

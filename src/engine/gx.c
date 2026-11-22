@@ -127,6 +127,9 @@ cells_bounded(const int *card, const int *vars, int nv, size_t limit)
  * ----------------------------------------------------------------
  */
 
+/* How far above 0 a log-scaled CPT entry may round (check_cpt). */
+#define LSCALE_SLACK 1e-9
+
 /*
  * Check one CPT: child, parents and entries.  Sets *bad_var on failure.
  * mark[] is all-zero on entry and on return; it finds duplicate parents
@@ -184,9 +187,20 @@ check_cpt(const gx_bn *bn, const gx_cpt *c, unsigned char *mark, int *bad_var)
 		for (int x = 0; x < bn->card[c->child]; x++)
 			if (!isfinite(c->lscale[x]))
 				return rc;
+		/*
+		 * Each entry, offset plus value, is a log probability, so at most
+		 * 0 (with LSCALE_SLACK for rounding).  A larger one is not a
+		 * valid table; letting it through could overflow log P(evidence)
+		 * to +Infinity.
+		 */
 		for (size_t k = 0; k < n; k++)
-			if (isnan(c->vals[k]) || c->vals[k] == INFINITY)
+		{
+			int			x = (int) (k % (size_t) bn->card[c->child]);
+
+			if (isnan(c->vals[k]) || c->vals[k] == INFINITY ||
+				c->lscale[x] + c->vals[k] > LSCALE_SLACK)
 				return rc;
+		}
 	}
 	else
 		for (size_t k = 0; k < n; k++)
