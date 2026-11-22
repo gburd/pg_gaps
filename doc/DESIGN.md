@@ -466,14 +466,14 @@ transactional, dumpable (each table and sequence is registered with
 `pg_extension_config_dump`), and replicated with no WAL code of ours.
 
 ```
-gaps.model          (model_id, name, owner regrole)
+gaps.model          (model_id, name, owner regrole, parent text, note text)
 gaps.model_member   (model_id, member_id, ord)  -- composite model's members
 gaps.attribute      (attribute_id, model_id, rel regclass, relname, attname,
                      typname, entity_keys name[], domain text[], edges float8[])
 gaps.stripe         (stripe_id, model_id, name, attribute_id)
 gaps.stripe_qual    (stripe_id, ord, attname, op, value)   -- ANDed, on Ad
 gaps.factor         (factor_id, model_id, name, child_stripe, cpt float8[],
-                     prior float8[], kind text, params float8[])
+                     prior float8[], kind text, params float8[], frozen boolean)
 gaps.factor_parent  (factor_id, ord, parent_stripe, aggregate boolean)
 gaps.factor_map     (factor_id, ord, child_att, parent_att) -- equalities
 ```
@@ -725,7 +725,7 @@ logistic (inputs are binned attributes), and a combiner that is a parent
 of members' latents, which the members must declare themselves.
 
 **Learning with missing values.**  `learn_cpts(model, alpha, method =>
-'em', max_iterations => 50, tol => 1e-6)` runs expectation maximization,
+'em', max_iterations => 500, tol => 1e-6)` runs expectation maximization,
 so an entity with a missing child or parent still informs the factor
 (pg.ddx.io's case: a latent author per email, a few hundred labelled and
 hundreds of thousands not).  It starts from the `'counts'` estimate,
@@ -739,12 +739,38 @@ That update is not EM for the posterior mean.  It is EM for the
 posterior mode under Dirichlet(pseudocount + 1), whose log density is
 sum(pseudocount * ln(cell)) up to a constant, so the quantity it never
 decreases is loglik + sum(pseudocount * ln(cell)) (a cell with pseudocount 0 adds 0
-ln(cell) = 0, even at 0), and that is what the stopping rule watches.
-The tolerance is relative: the loop ends when an iteration changes the
-objective by at most `tol` * max(1, |objective|).  An absolute rule would
-fire on rounding noise at pg.ddx.io's scale, where loglik is about -1e6
-and the summed log Z carries about 1e-10 relative error (`sql/em.sql`
-checks the climb on t5's model at pseudocounts 0.5, 1, 3 and 50).  On
+ln(cell) = 0, even at 0); `sql/em.sql` checks the climb on t5's model at
+pseudocounts 0.5, 1, 3 and 50.
+
+**When EM stops.**  `tol` is an absolute tolerance on probabilities: EM
+stops when every CPT cell is estimated to be within `tol` of its fixed
+point.  Near a fixed point EM converges linearly, each M-step moving the
+cells by about r times the step before, for a rate r below 1 set by the
+share of missing information; the cells are then within step * r / (1 -
+r) of the fixed point, where step is the last M-step's largest change in
+any cell and r is estimated as step over the step before.  EM stops when
+that bound and step itself are both at most `tol` (with r below 1), or
+when step is 0.  The default, 1e-6, puts the cells within about 1e-6 of
+the fixed point: 78 iterations at 20,000 rows and 72 at 40,000 on
+pg.ddx.io's shape, against 11 and 7 under the earlier rule, which stopped
+3.6e-3 and 2.5e-3 away (`bench/RESULTS_EM_CONVERGENCE_2026-11-22.md`).
+`max_iterations` defaults to 500, since a model with little labelled
+data can need hundreds (`sql/em.sql` has one that needs 777).
+
+The rule watches the cells rather than the objective because the
+objective cannot resolve a fixed point at this scale.  Its change falls
+as the square of the distance, so cells within 1e-6 mean a change of
+about 1e-8 nats, and at |loglik| 6e4 that is the objective's rounding:
+measured changes below it are as often negative as positive.  An objective rule
+relative to |objective| (the earlier one, tol * max(1, |objective|))
+reads 0.05 nats at that scale as converged, and an absolute one tight
+enough to matter fires on rounding noise or never.  The estimate of r is
+unsteady in the first few iterations, so the bound can be low then (on
+`sql/em.sql`'s 4,000-row model at tol 1e-3, EM stopped 1.08e-3 away);
+requiring the last step to be within `tol` too keeps a run that still
+moves from stopping.  `last_change`, in the output, is the objective's
+change over the last M-step in nats, so a caller can see how flat the
+objective was where EM stopped.  On
 complete data the E-step returns the counts, so 'em' gives the 'counts'
 answer after one iteration.  Treating the prior as a posterior-mean
 prior over EM would need a variational or sampling E-step; a mode under
@@ -775,9 +801,58 @@ observed together with its parents starts uniform, which is a saddle
 when the latent variable's values are interchangeable; nothing here
 breaks that symmetry, so such a factor needs a prior or a few labelled
 rows.  The output says `method` 'em', `iterations` (M-steps, 0 for
-'counts'), `loglik` (log P(evidence) under the returned CPTs) and
-`converged` (false when `max_iterations` stopped it).  A component too
+'counts'), `loglik` (log P(evidence) under the returned CPTs),
+`converged` (false when `max_iterations` stopped it) and `last_change`.  A component too
 large for exact inference is an `ERROR`; there is no sampled E-step.
+
+**Frozen factors.**  `gaps.set_frozen(model, factor, true)` sets
+`gaps.factor.frozen`, and `learn_cpts` then keeps that factor's CPT bit
+for bit, by either method.  EM's E-step uses it like any CPT; the
+M-step leaves it, and the objective leaves out its log prior, which is
+constant while it is frozen, so the objective still never decreases
+(`sql/lifecycle.sql` checks the climb, and that the learned factor is a
+fixed point of its own M-step with the frozen one held).  Its row comes
+after the learned ones, with method 'fixed (frozen)' and no count, like
+a parameterised factor's.  A frozen CPT factor must have a CPT (the
+trigger refuses one without).  pg.ddx.io's uses: pin the prior row after
+EM, where the latent class soaks up the shift between labelled and
+unlabelled rows (their N4); trust a prior more than the data; and fit
+only a new child of a learned model (freeze the rest, add it, learn).  A
+separate setter, rather than an argument of `set_cpt`, because freezing
+is about learning and not the CPT: one may freeze a learned CPT without
+restating it, and thaw it without touching it.  A parameterised factor is
+never learned, so the flag means nothing there.
+
+**Changing a model.**  `add_factor`, `declare_attribute` and
+`add_stripe` work on a model that has been learned; nothing about
+learning closes it.  `gaps.drop_factor(model, factor)` removes a factor
+with its parents and mappings.  Every value of a declared attribute
+needs exactly one factor, so dropping the last factor whose child is
+over an attribute could leave the model ungroundable; instead
+`drop_factor` then removes the attribute and its stripes too, with a
+NOTICE, which is retiring a feature in one call.  That is refused while
+another factor (of the model, or of a composite holding it) has a parent
+over the attribute, since that factor would lose its parent: the error
+names the factor.  A composite's factor the caller cannot see is still
+found, by the foreign key from `gaps.factor_parent.parent_stripe`,
+which no longer cascades (it is deferred, so `drop_model`'s own cascade
+finishes first, and `drop_factor` checks it at once); then the error is
+the foreign key's, naming nothing the caller cannot see.  When another
+factor still has its child over the attribute (the attribute is split
+into stripes), only the factor goes, its stripe stays, and the next
+grounding reports any values left uncovered, naming the entity; adding a
+factor over the stripe covers them again.  Refusing that case outright
+would forbid the replace-in-two-steps order (drop, then add), and the
+grounding check is exact where a check at drop time would have to guess
+which rows a stripe holds.
+
+**Lineage.**  `gaps.model.parent` and `gaps.model.note`, set by
+`create_model(name, parent => ..., note => ...)` or
+`gaps.set_lineage(model, parent, note)`, record where a model came from
+(pg.ddx.io: "round 5, refit from round 4 with 400 new labels").  The
+parent is a name, not a reference: a parent model may be dropped or
+renamed later, and its child must not block that or change with it.
+Nothing reads either column; both are dumped with the model.
 
 **Composite models.**  pg.ddx.io runs three networks (e-mail, commit
 message, patch), each a latent author state per row with observed

@@ -107,10 +107,13 @@ SELECT a, count(*) AS steps, bool_and(its = t) AS all_ran,
 	   bool_and(d >= -1e-12) AS monotone, sum(d) > 1e-4 AS moved
 FROM (SELECT a, t, its, obj - lag(obj) OVER (PARTITION BY a ORDER BY t) AS d FROM path) x
 WHERE d IS NOT NULL GROUP BY a ORDER BY a;
--- And it converges: by 500 iterations an iteration changes the objective
--- by at most 1e-6 of its size.
-SELECT DISTINCT method, converged, iterations < 500 AS early
-FROM gaps.learn_cpts('h', 1, 'em', 500);
+-- And it converges, slowly: P(a) moves by about 0.3 over hundreds of
+-- iterations whose objective changes are each below 1e-3 nats, so a rule
+-- on the objective stops early.  The rule on the cells runs until every
+-- cell is within 1e-6 of the fixed point.
+SELECT DISTINCT method, converged, iterations > 500 AS slow, iterations < 2000 AS early,
+	   abs(last_change) < 1e-9 AS small_change
+FROM gaps.learn_cpts('h', 1, 'em', 2000);
 
 -- A tiny positive pseudocount keeps its cells positive, and EM's
 -- objective stays finite: P(b = v | a = x) is 1e-20 / (10 + 2e-20), below
@@ -210,6 +213,52 @@ WHERE pa.model_id = gaps._model_id('lc') AND pa.name = 'pa'
   AND pc.model_id = pa.model_id AND pc.name = 'pc';
 DROP TABLE lc;
 SELECT gaps.drop_model('lc');
+
+-- pg.ddx.io's scale problem in small: a latent class with three children,
+-- 4,000 rows of which 100 are labelled, drawn from planted CPTs.  The
+-- default tol stops when every cell is within 1e-6 of EM's fixed point,
+-- which a run to tol 1e-13 gives.
+SELECT setseed(0.42);
+CREATE TABLE lk (id int PRIMARY KEY, a text, b text, c text, d text);
+INSERT INTO lk
+SELECT g, CASE WHEN g <= 100 THEN (ARRAY['s', 't'])[a] END,
+	   (ARRAY['1', '2', '3'])[CASE WHEN u1 < p1 THEN 1 WHEN u1 < 0.9 THEN 2 ELSE 3 END],
+	   (ARRAY['1', '2', '3'])[CASE WHEN u2 < p2 THEN 1 WHEN u2 < 0.8 THEN 2 ELSE 3 END],
+	   (ARRAY['1', '2'])[CASE WHEN u3 < p3 THEN 1 ELSE 2 END]
+FROM (SELECT g, a, random() AS u1, random() AS u2, random() AS u3,
+			 CASE a WHEN 1 THEN 0.7 ELSE 0.1 END AS p1, CASE a WHEN 1 THEN 0.2 ELSE 0.5 END AS p2,
+			 CASE a WHEN 1 THEN 0.3 ELSE 0.8 END AS p3
+	  FROM (SELECT g, CASE WHEN random() < 0.3 THEN 1 ELSE 2 END AS a
+			FROM generate_series(1, 4000) g) x) y;
+SELECT gaps.create_model('lk');
+SELECT gaps.declare_attribute('lk', 'lk', 'a', ARRAY['s', 't']);
+SELECT gaps.declare_attribute('lk', 'lk', x, ARRAY['1', '2', '3']) FROM unnest(ARRAY['b', 'c']) x;
+SELECT gaps.declare_attribute('lk', 'lk', 'd', ARRAY['1', '2']);
+SELECT gaps.add_stripe('lk', x, 'lk', x) FROM unnest(ARRAY['a', 'b', 'c', 'd']) x;
+SELECT gaps.add_factor('lk', 'pa', 'a');
+SELECT gaps.add_factor('lk', 'p' || x, x, ARRAY['a']) FROM unnest(ARRAY['b', 'c', 'd']) x;
+SELECT DISTINCT method, converged, iterations > 2 AS iterated, loglik < -5000 AS scale
+FROM gaps.learn_cpts('lk', 1, 'em', 5000, 1e-13);
+CREATE TEMP TABLE fixed_point AS SELECT name, cpt FROM gaps.factor
+WHERE model_id = gaps._model_id('lk');
+SELECT DISTINCT method, converged, last_change > 0 AND last_change < 1e-4 AS last_change_ok
+FROM gaps.learn_cpts('lk', 1, 'em');
+SELECT count(*) AS cells, max(abs(x - y)) < 1e-6 AS at_fixed_point,
+	   max(abs(x - y)) > 0 AS not_identical
+FROM gaps.factor f JOIN fixed_point p USING (name), unnest(f.cpt, p.cpt) u(x, y)
+WHERE f.model_id = gaps._model_id('lk');
+-- tol is on probabilities: 1e-3 stops sooner, further from it.  The
+-- distance is estimated from the rate of the last two steps, which early
+-- in a run is not yet steady, so here it is 1.08e-3, not under 1e-3.
+SELECT DISTINCT converged FROM gaps.learn_cpts('lk', 1, 'em', tol => 1e-3);
+SELECT max(abs(x - y)) BETWEEN 1e-4 AND 2e-3 AS near_1e3
+FROM gaps.factor f JOIN fixed_point p USING (name), unnest(f.cpt, p.cpt) u(x, y)
+WHERE f.model_id = gaps._model_id('lk');
+-- One M-step has no step before it to estimate the rate from.
+SELECT DISTINCT iterations, converged, last_change > 0 AS climbed
+FROM gaps.learn_cpts('lk', 1, 'em', 1);
+DROP TABLE lk;
+SELECT gaps.drop_model('lk');
 
 -- On complete data the E-step returns the counts, so EM stops after one
 -- iteration with the counting answer.

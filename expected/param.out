@@ -431,11 +431,11 @@ SELECT gaps.add_factor('lx', 'pz', 'z', ARRAY['y'], kind => 'noisy_or',
 (1 row)
 
 SELECT * FROM gaps.learn_cpts('lx');
- factor | complete_entities |      method      | iterations | loglik | converged 
---------+-------------------+------------------+------------+--------+-----------
- px     |                60 | counts           |          0 |        | 
- py     |                20 | counts           |          0 |        | 
- pz     |                   | fixed (noisy_or) |          0 |        | 
+ factor | complete_entities |      method      | iterations | loglik | converged | last_change 
+--------+-------------------+------------------+------------+--------+-----------+-------------
+ px     |                60 | counts           |          0 |        |           |            
+ py     |                20 | counts           |          0 |        |           |            
+ pz     |                   | fixed (noisy_or) |          0 |        |           |            
 (3 rows)
 
 SELECT factor, complete_entities, method, iterations > 1 AS iterated, converged

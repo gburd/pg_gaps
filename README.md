@@ -75,7 +75,8 @@ What else is there:
 - **Learning.**  `learn_cpts(model, alpha)` takes the posterior mean
   under a symmetric Dirichlet(alpha), or per-cell pseudocounts set with
   `gaps.set_prior`; `method => 'em'` also learns from rows with missing
-  values.
+  values.  `gaps.set_frozen` holds a factor's CPT fixed while the rest
+  learn, and `gaps.drop_factor` retires a factor from a learned model.
 - **Some entities only.**  `gaps.marginals(model, rel, entities)` grounds
   only the components that hold the given entities, with the same
   answers as the whole-model call.

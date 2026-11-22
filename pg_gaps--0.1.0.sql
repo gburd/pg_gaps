@@ -13,7 +13,9 @@
 CREATE TABLE gaps.model (
 	model_id	serial PRIMARY KEY,
 	name		text NOT NULL UNIQUE,
-	owner		regrole NOT NULL DEFAULT current_user::regrole
+	owner		regrole NOT NULL DEFAULT current_user::regrole,
+	parent		text,				-- lineage: the model this one came from, by name
+	note		text				-- lineage: free text
 );
 
 CREATE TABLE gaps.attribute (
@@ -56,13 +58,18 @@ CREATE TABLE gaps.factor (
 	kind		text NOT NULL DEFAULT 'cpt'
 				CHECK (kind IN ('cpt', 'logistic', 'noisy_or')),
 	params		float8[],			-- weights of a parameterised factor
+	frozen		boolean NOT NULL DEFAULT false,	-- learn_cpts keeps the CPT as it is
 	UNIQUE (model_id, name)
 );
 
 CREATE TABLE gaps.factor_parent (
 	factor_id	int NOT NULL REFERENCES gaps.factor ON DELETE CASCADE,
 	ord			int NOT NULL,
-	parent_stripe int NOT NULL REFERENCES gaps.stripe ON DELETE CASCADE,
+	-- Not ON DELETE CASCADE: removing a stripe that is still some factor's
+	-- parent would silently drop that parent, even from a composite the
+	-- deleting role cannot see.  Deferred, so drop_model's cascades finish
+	-- before the check.
+	parent_stripe int NOT NULL REFERENCES gaps.stripe DEFERRABLE INITIALLY DEFERRED,
 	aggregate	boolean NOT NULL DEFAULT false,	-- any number of exchangeable parents
 	PRIMARY KEY (factor_id, ord)
 );
@@ -530,6 +537,10 @@ AS $$
 BEGIN
 	IF TG_TABLE_NAME = 'factor' THEN
 		PERFORM gaps._cpt_check(NEW.factor_id, false);
+		IF NEW.frozen AND NEW.kind = 'cpt' AND NEW.cpt IS NULL THEN
+			RAISE EXCEPTION 'factor "%" is frozen and has no CPT', NEW.name
+				USING HINT = 'Set its CPT with gaps.set_cpt before freezing it.';
+		END IF;
 		IF NEW.kind = 'cpt' AND EXISTS (SELECT 1 FROM gaps.factor_parent fp
 										WHERE fp.factor_id = NEW.factor_id AND fp.aggregate) THEN
 			RAISE EXCEPTION 'factor "%" is a CPT and cannot have an aggregating parent', NEW.name;
@@ -723,11 +734,27 @@ $$;
 -- Note that SQL-function parameters are qualified with the function name
 -- wherever a column of the same name is in scope: an unqualified "name"
 -- inside a query on gaps.model is the column, not the parameter.
-CREATE FUNCTION gaps.create_model(name text) RETURNS void
+--
+-- parent and note record where a model came from (its lineage): parent is
+-- another model's name, kept as text so that dropping or renaming that
+-- model leaves this one alone, and note is free text.  Neither changes
+-- what the model computes.
+CREATE FUNCTION gaps.create_model(name text, parent text DEFAULT NULL, note text DEFAULT NULL)
+RETURNS void
 LANGUAGE sql
 SET search_path = pg_catalog, pg_temp
 AS $$
-	INSERT INTO gaps.model (name) VALUES (create_model.name)
+	INSERT INTO gaps.model (name, parent, note)
+	VALUES (create_model.name, create_model.parent, create_model.note)
+$$;
+
+-- Set a model's lineage (gaps.create_model): both values, NULL clearing.
+CREATE FUNCTION gaps.set_lineage(model text, parent text, note text) RETURNS void
+LANGUAGE sql
+SET search_path = pg_catalog, pg_temp
+AS $$
+	UPDATE gaps.model m SET parent = set_lineage.parent, note = set_lineage.note
+	WHERE m.model_id = gaps._model_id(set_lineage.model)
 $$;
 
 CREATE FUNCTION gaps.drop_model(name text) RETURNS void
@@ -885,6 +912,93 @@ BEGIN
 	END IF;
 	PERFORM gaps._cpt_check(x.factor_id, true) FROM gaps.factor x
 	WHERE x.model_id = gaps._model_id(model) AND x.name = set_prior.factor;
+END
+$$;
+
+-- Freeze a factor, or thaw it: gaps.learn_cpts keeps a frozen factor's
+-- CPT as it is and conditions on it (doc/DESIGN.md, "Frozen factors").  A
+-- frozen CPT factor must have a CPT.  A parameterised factor is never
+-- learned, frozen or not.
+CREATE FUNCTION gaps.set_frozen(model text, factor text, frozen boolean) RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+	IF frozen IS NULL THEN
+		RAISE EXCEPTION 'frozen must be true or false, not NULL';
+	END IF;
+	UPDATE gaps.factor x SET frozen = set_frozen.frozen
+	WHERE x.model_id = gaps._model_id(model) AND x.name = set_frozen.factor;
+	IF NOT FOUND THEN
+		RAISE EXCEPTION 'factor "%" does not exist in model "%"', factor, model;
+	END IF;
+	-- The trigger checks this at commit; checking now names the problem
+	-- before a learn_cpts in the same transaction can meet it.
+	IF EXISTS (SELECT 1 FROM gaps.factor x
+			   WHERE x.model_id = gaps._model_id(model) AND x.name = set_frozen.factor
+				 AND x.frozen AND x.kind = 'cpt' AND x.cpt IS NULL) THEN
+		RAISE EXCEPTION 'factor "%" is frozen and has no CPT', factor
+			USING HINT = 'Set its CPT with gaps.set_cpt before freezing it.';
+	END IF;
+END
+$$;
+
+-- Remove a factor of model, with its parents and mappings (doc/DESIGN.md,
+-- "Changing a model").  Every value of a declared attribute needs a
+-- factor, so when no factor of the model is left whose child is over the
+-- dropped factor's child attribute, the attribute goes too, with its
+-- stripes; that is retiring a feature in one call.  It is refused while
+-- another factor, of this model or of a composite holding it, has a parent
+-- over that attribute, since those parents would have no CPT.  When the
+-- attribute stays (another factor's child is over it), the dropped
+-- factor's child stripe stays, and grounding checks that its values are
+-- still covered.  To replace a factor, add the new one before dropping
+-- the old, so the attribute is never uncovered.
+CREATE FUNCTION gaps.drop_factor(model text, factor text) RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	m int := gaps._model_id(model);
+	f gaps.factor;
+	att int;
+	user_ record;
+BEGIN
+	SELECT * INTO f FROM gaps.factor x WHERE x.model_id = m AND x.name = drop_factor.factor;
+	IF f.factor_id IS NULL THEN
+		RAISE EXCEPTION 'factor "%" does not exist in model "%"', factor, model;
+	END IF;
+	SELECT s.attribute_id INTO att FROM gaps.stripe s WHERE s.stripe_id = f.child_stripe;
+	DELETE FROM gaps.factor x WHERE x.factor_id = f.factor_id;
+	IF EXISTS (SELECT 1 FROM gaps.factor x JOIN gaps.stripe s ON s.stripe_id = x.child_stripe
+			   WHERE x.model_id = m AND s.attribute_id = att) THEN
+		RETURN;
+	END IF;
+
+	-- Nothing covers the attribute now.  The foreign key on
+	-- gaps.factor_parent.parent_stripe refuses the attribute's removal
+	-- while any factor uses it as a parent, visible to the caller or not;
+	-- this names the factor when the caller can see it.
+	SELECT x.name AS fname, xm.name AS mname INTO user_
+	FROM gaps.factor_parent fp JOIN gaps.stripe s ON s.stripe_id = fp.parent_stripe
+		JOIN gaps.factor x ON x.factor_id = fp.factor_id
+		JOIN gaps.model xm ON xm.model_id = x.model_id
+	WHERE s.attribute_id = att ORDER BY x.factor_id LIMIT 1;
+	IF user_.fname IS NOT NULL THEN
+		RAISE EXCEPTION 'cannot drop factor "%": factor "%" of model "%" has a parent over its '
+			'child, which would have no factor left', factor, user_.fname, user_.mname
+			USING HINT = 'Add another factor over the same attribute first, or drop that '
+				'factor too.';
+	END IF;
+	RAISE NOTICE 'attribute %.% has no factor left in model "%" and is removed',
+		(SELECT a.relname FROM gaps.attribute a WHERE a.attribute_id = att),
+		(SELECT a.attname FROM gaps.attribute a WHERE a.attribute_id = att), model;
+	DELETE FROM gaps.attribute a WHERE a.attribute_id = att;
+	-- A factor the caller cannot see (another role's composite) may still
+	-- have a parent over the attribute; the foreign key sees it.  Check now
+	-- rather than at commit, then restore the deferral drop_model needs.
+	SET CONSTRAINTS gaps.factor_parent_parent_stripe_fkey IMMEDIATE;
+	SET CONSTRAINTS gaps.factor_parent_parent_stripe_fkey DEFERRED;
 END
 $$;
 
@@ -2804,11 +2918,26 @@ $$;
 -- The EM loop of gaps.learn_cpts(method => 'em'), over the ground network
 -- in the arrays (gaps._ground) and the factors in pg_gaps_learn, which
 -- holds each factor's pseudocounts, complete-data counts and starting CPT
--- and receives the learned one.  Each iteration evaluates the objective
--- (log P(evidence) plus the log prior) at the current CPTs, stops if it
--- changed by at most tol * max(1, |objective|), and otherwise does one
--- M-step; so the returned loglik belongs to the returned CPTs, and
--- iterations counts M-steps.
+-- and receives the learned one.  A frozen factor's row keeps its CPT: the
+-- E-step uses it, the M-step and the objective leave it out.  Each
+-- iteration evaluates the objective (log P(evidence) plus the log prior
+-- of the unfrozen factors) at the current CPTs, stops if the last two
+-- M-steps put every CPT cell within tol of the fixed point (see below),
+-- and otherwise does one M-step; so the returned loglik belongs to the
+-- returned CPTs, iterations counts M-steps, and last_change is the
+-- objective's change over the last M-step, in nats.
+--
+-- The stopping rule.  Near a fixed point EM converges linearly: each
+-- M-step moves the CPTs by about r times the previous move, for a rate r
+-- below 1 set by the share of missing information.  The cells are then
+-- within step * r / (1 - r) of the fixed point, where step is the last
+-- move's largest change in any cell and r is estimated as step over the
+-- move before.  EM stops when both step and that bound are at most tol
+-- (with r below 1), or when step is 0; requiring step <= tol too keeps an
+-- early, accidentally small ratio from stopping a run still moving.  A
+-- rule on the objective cannot reach the same precision: at |loglik|
+-- 6e4 the objective's rounding is about 1e-8 nats, about the change at
+-- which the cells are within 1e-6 (bench/RESULTS_EM_CONVERGENCE_2026-11-22.md).
 --
 -- The start is the complete-data estimate.  With a pseudocount of 0 that
 -- can give probability 0 to a value present only in incomplete rows, and
@@ -2819,13 +2948,16 @@ $$;
 CREATE FUNCTION gaps._em(card int[], evidence int[], child int[], parent_off int[],
 	parents int[], cpt_off int[], fixed float8[], cpt_lscale int[], max_iterations int,
 	tol float8,
-	OUT iterations int, OUT loglik float8, OUT converged boolean, OUT add_one boolean)
+	OUT iterations int, OUT loglik float8, OUT converged boolean, OUT add_one boolean,
+	OUT last_change float8)
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
 	obj float8;
 	prev float8;
+	step float8;
+	prev_step float8;
 	state text;
 BEGIN
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_ec (
@@ -2852,23 +2984,32 @@ BEGIN
 		UPDATE pg_gaps_learn l
 		SET cpt = gaps._normalize((SELECT array_agg(greatest(u.a, 1) + u.n ORDER BY u.i)
 								   FROM unnest(l.pseudo, l.n) WITH ORDINALITY u(a, n, i)),
-								  l.k);
+								  l.k)
+		WHERE NOT l.frozen;
 		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed,
 							  cpt_lscale);
 	END;
+	-- With every factor frozen there is nothing to learn.
+	IF NOT EXISTS (SELECT 1 FROM pg_gaps_learn l WHERE NOT l.frozen) THEN
+		converged := true;
+		RETURN;
+	END IF;
 	LOOP
 		-- The objective the update climbs: the log posterior under
 		-- Dirichlet(pseudocount + 1), up to its normalizing constant.  A
 		-- cell with pseudocount 0 adds 0 ln(cell) = 0, even at 0; one with a
 		-- positive pseudocount is positive (gaps._normalize).
 		SELECT loglik + coalesce(sum(a * ln(x)), 0) INTO obj
-		FROM pg_gaps_learn l, unnest(l.pseudo, l.cpt) u(a, x) WHERE a > 0;
-		IF prev IS NOT NULL AND abs(obj - prev) <= tol * greatest(1, abs(obj)) THEN
+		FROM pg_gaps_learn l, unnest(l.pseudo, l.cpt) u(a, x) WHERE a > 0 AND NOT l.frozen;
+		last_change := obj - prev;
+		IF step <= tol AND (step = 0 OR (step < prev_step
+										 AND step * step / (prev_step - step) <= tol)) THEN
 			converged := true;
 			EXIT;
 		END IF;
 		EXIT WHEN iterations = max_iterations;
 		prev := obj;
+		prev_step := step;
 
 		-- M-step: expected counts plus pseudocounts, normalized per row.
 		-- gaps._expected_counts gives every cell of every factor with
@@ -2885,10 +3026,13 @@ BEGIN
 		x AS (
 			SELECT o.factor_id, e.n FROM o LEFT JOIN e ON e.cpt_off = o.off)
 		UPDATE pg_gaps_learn l
-		SET cpt = gaps._normalize((SELECT array_agg(u.a + coalesce(u.n, 0) ORDER BY u.i)
+		SET prev = l.cpt,
+			cpt = gaps._normalize((SELECT array_agg(u.a + coalesce(u.n, 0) ORDER BY u.i)
 								   FROM unnest(l.pseudo, x.n) WITH ORDINALITY u(a, n, i)),
 								  l.k)
-		FROM x WHERE x.factor_id = l.factor_id;
+		FROM x WHERE x.factor_id = l.factor_id AND NOT l.frozen;
+		SELECT coalesce(max(abs(u.x - u.y)), 0) INTO step
+		FROM pg_gaps_learn l, unnest(l.cpt, l.prev) u(x, y) WHERE NOT l.frozen;
 		iterations := iterations + 1;
 		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed,
 							  cpt_lscale);
@@ -2964,9 +3108,10 @@ $$;
 -- (gaps._expected_counts, exact inference), then the same update with
 -- expected counts in place of counts.  That is the MAP update under a
 -- Dirichlet(pseudocount + 1) prior, so it never decreases the log
--- posterior, loglik + sum(pseudocount * ln(cell)); it stops when an
--- iteration changes that by at most tol * max(1, |objective|), a relative
--- tolerance, or after max_iterations.  When the 'counts' estimate gives
+-- posterior, loglik + sum(pseudocount * ln(cell)).  It stops when every
+-- CPT cell is estimated to be within tol of EM's fixed point, an absolute
+-- tolerance on probabilities (gaps._em says how it is estimated), or
+-- after max_iterations.  When the 'counts' estimate gives
 -- probability 0 to a value present in an incomplete row (possible with a
 -- pseudocount of 0), EM starts from the counts plus max(pseudocount, 1)
 -- instead (gaps._em), warns, and reports method 'em (add-one start)'.
@@ -2975,11 +3120,17 @@ $$;
 --
 -- One row per factor: complete_entities, the entities complete for the
 -- factor, and iterations, the M-steps run (0 for 'counts').  For 'em',
--- also loglik (log P(evidence) under the returned CPTs) and converged
--- (false when max_iterations stopped it); both NULL for 'counts'.
--- iterations, loglik and converged describe the whole model, and repeat
--- on every factor's row.  A composite model is refused: learning through
--- it would write its members' CPTs.  A parameterised factor ('logistic', 'noisy_or')
+-- also loglik (log P(evidence) under the returned CPTs), converged (false
+-- when max_iterations stopped it) and last_change, the change in the
+-- objective over the last M-step in nats (NULL when EM ran none); all
+-- three NULL for 'counts'.  iterations, loglik, converged and last_change
+-- describe the whole model, and repeat on every factor's row.
+--
+-- A frozen factor (gaps.set_frozen) keeps its CPT: EM's E-step uses it,
+-- the M-step and the objective leave it out, and its row, after the
+-- learned ones, has method 'fixed (frozen)' and complete_entities NULL.
+-- A composite model is refused: learning through it would write its
+-- members' CPTs.  A parameterised factor ('logistic', 'noisy_or')
 -- keeps its params: its row, after the learned ones, has method 'fixed
 -- (<kind>)' and complete_entities NULL, and EM conditions on its tables
 -- as they are.
@@ -2988,9 +3139,9 @@ $$;
 -- can read the model can read them (doc/DESIGN.md, "Security").
 CREATE FUNCTION gaps.learn_cpts(model text, alpha float8 DEFAULT 1.0,
 	OUT factor text, OUT complete_entities bigint,
-	INOUT method text DEFAULT 'counts', max_iterations int DEFAULT 50,
+	INOUT method text DEFAULT 'counts', max_iterations int DEFAULT 500,
 	tol float8 DEFAULT 1e-6,
-	OUT iterations int, OUT loglik float8, OUT converged boolean)
+	OUT iterations int, OUT loglik float8, OUT converged boolean, OUT last_change float8)
 RETURNS SETOF record
 LANGUAGE plpgsql
 ROWS 10 SUPPORT gaps._rows_support
@@ -3032,24 +3183,32 @@ BEGIN
 							   * coalesce((SELECT exp(sum(ln(gaps._card(fp.parent_stripe))))::int
 										  FROM gaps.factor_parent fp
 										  WHERE fp.factor_id = fa.factor_id), 1)])
-	WHERE fa.model_id = m AND fa.cpt IS NULL AND fa.kind = 'cpt';
+	WHERE fa.model_id = m AND fa.cpt IS NULL AND fa.kind = 'cpt' AND NOT fa.frozen;
 	g := gaps._ground(m);
 
 	-- Each factor's pseudocounts and the complete-data estimate; EM starts
 	-- from it.
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_learn (
 		factor_id int, name text, k int, pseudo float8[], n float8[], used bigint,
-		cpt float8[]) ON COMMIT DROP;
+		cpt float8[], frozen boolean, prev float8[]) ON COMMIT DROP;
 	TRUNCATE pg_gaps_learn;
-	FOR f IN SELECT fa.factor_id, fa.name, fa.child_stripe, fa.prior FROM gaps.factor fa
+	FOR f IN SELECT fa.factor_id, fa.name, fa.child_stripe, fa.prior, fa.cpt, fa.frozen
+			 FROM gaps.factor fa
 			 WHERE fa.model_id = m AND fa.kind = 'cpt' ORDER BY fa.factor_id LOOP
+		-- A frozen factor's CPT is kept, and only EM's E-step reads it.
+		IF f.frozen THEN
+			INSERT INTO pg_gaps_learn (factor_id, name, cpt, frozen)
+			VALUES (f.factor_id, f.name, f.cpt, true);
+			CONTINUE;
+		END IF;
 		k := gaps._card(f.child_stripe);
 		SELECT k * coalesce(exp(sum(ln(gaps._card(fp.parent_stripe))))::bigint, 1) INTO nrows
 		FROM gaps.factor_parent fp WHERE fp.factor_id = f.factor_id;
 
 		SELECT * INTO c FROM gaps._count_cells(f.factor_id, f.prior, alpha, k, nrows,
 											  g.card, g.evidence);
-		INSERT INTO pg_gaps_learn VALUES (f.factor_id, f.name, k, c.pseudo, c.n, c.used, c.cpt);
+		INSERT INTO pg_gaps_learn
+		VALUES (f.factor_id, f.name, k, c.pseudo, c.n, c.used, c.cpt, false);
 	END LOOP;
 
 	iterations := 0;
@@ -3064,26 +3223,29 @@ BEGIN
 		iterations := r.iterations;
 		loglik := r.loglik;
 		converged := r.converged;
+		last_change := r.last_change;
 		IF r.add_one THEN
 			method := 'em (add-one start)';
 		END IF;
 	END IF;
 
-	FOR f IN SELECT * FROM pg_gaps_learn ORDER BY factor_id LOOP
+	FOR f IN SELECT * FROM pg_gaps_learn WHERE NOT frozen ORDER BY factor_id LOOP
 		UPDATE gaps.factor x SET cpt = f.cpt WHERE x.factor_id = f.factor_id;
 		factor := f.name;
 		complete_entities := f.used;
 		RETURN NEXT;
 	END LOOP;
 
-	-- A parameterised factor is not learned: its row says so in method
-	-- and has no count.
+	-- A frozen or parameterised factor is not learned: its row says so in
+	-- method and has no count.
 	learned := method;
-	FOR f IN SELECT fa.name, fa.kind FROM gaps.factor fa
-			 WHERE fa.model_id = m AND fa.kind <> 'cpt' ORDER BY fa.factor_id LOOP
+	FOR f IN SELECT fa.name, CASE WHEN fa.kind = 'cpt' THEN 'frozen' ELSE fa.kind END AS why
+			 FROM gaps.factor fa
+			 WHERE fa.model_id = m AND (fa.kind <> 'cpt' OR fa.frozen)
+			 ORDER BY fa.kind = 'cpt' DESC, fa.factor_id LOOP
 		factor := f.name;
 		complete_entities := NULL;
-		method := format('fixed (%s)', f.kind);
+		method := format('fixed (%s)', f.why);
 		RETURN NEXT;
 	END LOOP;
 	method := learned;

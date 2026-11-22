@@ -1,0 +1,619 @@
+-- Changing a learned model: frozen factors, adding and dropping factors,
+-- and lineage.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_gaps;
+\set VERBOSITY terse
+-- A latent class a with children b and c, 600 rows of which 60 are
+-- labelled.
+CREATE TABLE lt (id int PRIMARY KEY, a text, b text, c text, d text);
+INSERT INTO lt
+SELECT g, CASE WHEN g <= 60 THEN CASE WHEN g % 3 = 0 THEN 's' ELSE 't' END END,
+	   CASE WHEN g % 3 = 0 THEN CASE WHEN g % 5 = 0 THEN '2' ELSE '1' END
+			ELSE CASE WHEN g % 7 = 0 THEN '1' ELSE '2' END END,
+	   CASE WHEN g % 3 = 0 THEN CASE WHEN g % 4 = 0 THEN '2' ELSE '1' END
+			ELSE CASE WHEN g % 11 = 0 THEN '1' ELSE '2' END END,
+	   CASE WHEN g % 3 = 0 THEN 'y' ELSE CASE WHEN g % 2 = 0 THEN 'y' ELSE 'n' END END
+FROM generate_series(1, 600) g;
+SELECT gaps.create_model('lt');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('lt', 'lt', 'a', ARRAY['s', 't']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('lt', 'lt', x, ARRAY['1', '2']) FROM unnest(ARRAY['b', 'c']) x;
+ declare_attribute 
+-------------------
+ 
+ 
+(2 rows)
+
+SELECT gaps.add_stripe('lt', x, 'lt', x) FROM unnest(ARRAY['a', 'b', 'c']) x;
+ add_stripe 
+------------
+ 
+ 
+ 
+(3 rows)
+
+SELECT gaps.add_factor('lt', 'pa', 'a');
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('lt', 'p' || x, x, ARRAY['a']) FROM unnest(ARRAY['b', 'c']) x;
+ add_factor 
+------------
+ 
+ 
+(2 rows)
+
+SELECT factor, method, converged FROM gaps.learn_cpts('lt', 1, 'em') ORDER BY factor;
+ factor | method | converged 
+--------+--------+-----------
+ pa     | em     | t
+ pb     | em     | t
+ pc     | em     | t
+(3 rows)
+
+-- Frozen, by counts: pa keeps its CPT bit for bit and reports so, and the
+-- others learn what they learn without the freeze (counting is per
+-- factor).
+SELECT gaps.set_cpt('lt', 'pa', ARRAY[0.04, 0.96]);
+ set_cpt 
+---------
+ 
+(1 row)
+
+SELECT gaps.set_frozen('lt', 'pa', true);
+ set_frozen 
+------------
+ 
+(1 row)
+
+SELECT * FROM gaps.learn_cpts('lt', 1) ORDER BY method, factor;
+ factor | complete_entities |     method     | iterations | loglik | converged | last_change 
+--------+-------------------+----------------+------------+--------+-----------+-------------
+ pb     |                60 | counts         |          0 |        |           |            
+ pc     |                60 | counts         |          0 |        |           |            
+ pa     |                   | fixed (frozen) |          0 |        |           |            
+(3 rows)
+
+SELECT cpt = ARRAY[0.04, 0.96]::float8[] AS kept FROM gaps.factor WHERE name = 'pa';
+ kept 
+------
+ t
+(1 row)
+
+CREATE TEMP TABLE frozen_counts AS SELECT name, cpt FROM gaps.factor
+WHERE model_id = gaps._model_id('lt') AND name <> 'pa';
+SELECT gaps.set_frozen('lt', 'pa', false);
+ set_frozen 
+------------
+ 
+(1 row)
+
+SELECT count(*) FROM gaps.learn_cpts('lt', 1);
+ count 
+-------
+     3
+(1 row)
+
+SELECT bool_and(f.cpt = x.cpt) AS others_as_unfrozen, count(*)
+FROM gaps.factor f JOIN frozen_counts x USING (name) WHERE f.model_id = gaps._model_id('lt');
+ others_as_unfrozen | count 
+--------------------+-------
+ t                  |     2
+(1 row)
+
+-- Frozen, by EM: pg.ddx.io's use, the prior row pinned while the children
+-- refit.  pa is unchanged, EM still converges, and its objective, over the
+-- unfrozen factors, never decreases: the t-th iterate at tol 0.
+SELECT gaps.set_cpt('lt', 'pa', ARRAY[0.04, 0.96]);
+ set_cpt 
+---------
+ 
+(1 row)
+
+SELECT gaps.set_frozen('lt', 'pa', true);
+ set_frozen 
+------------
+ 
+(1 row)
+
+SELECT factor, complete_entities, method, converged FROM gaps.learn_cpts('lt', 1, 'em')
+ORDER BY method, factor;
+ factor | complete_entities |     method     | converged 
+--------+-------------------+----------------+-----------
+ pb     |                60 | em             | t
+ pc     |                60 | em             | t
+ pa     |                   | fixed (frozen) | t
+(3 rows)
+
+SELECT cpt = ARRAY[0.04, 0.96]::float8[] AS kept FROM gaps.factor WHERE name = 'pa';
+ kept 
+------
+ t
+(1 row)
+
+CREATE TEMP TABLE path (t int, obj float8);
+DO $$
+DECLARE
+	ll float8;
+BEGIN
+	FOR t IN 1 .. 8 LOOP
+		SELECT max(l.loglik) INTO ll FROM gaps.learn_cpts('lt', 1, 'em', t, 0) l;
+		INSERT INTO path SELECT t, ll + sum(ln(x))
+		FROM gaps.factor f, unnest(f.cpt) x
+		WHERE f.model_id = gaps._model_id('lt') AND NOT f.frozen;
+	END LOOP;
+END
+$$;
+SELECT count(*) AS steps, bool_and(d >= -1e-9) AS monotone, sum(d) > 1e-6 AS moved
+FROM (SELECT obj - lag(obj) OVER (ORDER BY t) AS d FROM path) x WHERE d IS NOT NULL;
+ steps | monotone | moved 
+-------+----------+-------
+     7 | t        | t
+(1 row)
+
+-- The oracle: at the fixed point with pa held, pb is the M-step of its
+-- own E-step, (expected count + 1) / (rows + 2) per value of a, with the
+-- expected counts from the posteriors under the learned CPTs.
+SELECT count(*) FROM gaps.learn_cpts('lt', 1, 'em', 5000, 1e-12);
+ count 
+-------
+     3
+(1 row)
+
+WITH post AS (
+	SELECT (m.entity ->> 'id')::int AS id, m.probability AS p_s
+	FROM gaps.marginals('lt') m WHERE m.attname = 'a' AND m.value = 's'),
+w AS (
+	SELECT l.b, CASE WHEN l.a = 's' THEN 1 WHEN l.a = 't' THEN 0 ELSE p.p_s END AS ws
+	FROM lt l LEFT JOIN post p USING (id)),
+cnt AS (
+	SELECT sum(ws) FILTER (WHERE b = '1') AS s1, sum(ws) AS s,
+		   sum(1 - ws) FILTER (WHERE b = '1') AS t1, sum(1 - ws) AS t
+	FROM w)
+SELECT abs(f.cpt[1] - (c.s1 + 1) / (c.s + 2)) < 1e-9 AS given_s,
+	   abs(f.cpt[3] - (c.t1 + 1) / (c.t + 2)) < 1e-9 AS given_t
+FROM cnt c, gaps.factor f WHERE f.name = 'pb';
+ given_s | given_t 
+---------+---------
+ t       | t
+(1 row)
+
+-- Every factor frozen: nothing to learn, EM stops at once.
+SELECT gaps.set_frozen('lt', x, true) FROM unnest(ARRAY['pb', 'pc']) x;
+ set_frozen 
+------------
+ 
+ 
+(2 rows)
+
+SELECT factor, method, iterations, converged FROM gaps.learn_cpts('lt', 1, 'em')
+ORDER BY factor;
+ factor |     method     | iterations | converged 
+--------+----------------+------------+-----------
+ pa     | fixed (frozen) |          0 | t
+ pb     | fixed (frozen) |          0 | t
+ pc     | fixed (frozen) |          0 | t
+(3 rows)
+
+SELECT gaps.set_frozen('lt', x, false) FROM unnest(ARRAY['pa', 'pb', 'pc']) x;
+ set_frozen 
+------------
+ 
+ 
+ 
+(3 rows)
+
+-- Rejections.
+SELECT gaps.set_frozen('lt', 'nosuch', true);                   -- fail
+ERROR:  factor "nosuch" does not exist in model "lt"
+SELECT gaps.set_frozen('lt', 'pa', NULL);                       -- fail
+ERROR:  frozen must be true or false, not NULL
+SELECT gaps.add_factor('lt', 'pd0', 'b');
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.set_frozen('lt', 'pd0', true);                      -- fail: no CPT
+ERROR:  factor "pd0" is frozen and has no CPT
+DELETE FROM gaps.factor WHERE name = 'pd0';
+-- Adding a child to a learned model and fitting only it: freeze the rest,
+-- add d, learn.  The frozen factors are unchanged bit for bit.
+SELECT gaps.learn_cpts('lt', 1, 'em') IS NOT NULL AS relearned;
+ relearned 
+-----------
+ t
+ t
+ t
+(3 rows)
+
+CREATE TEMP TABLE learned AS SELECT name, cpt FROM gaps.factor
+WHERE model_id = gaps._model_id('lt');
+SELECT gaps.set_frozen('lt', x, true) FROM unnest(ARRAY['pa', 'pb', 'pc']) x;
+ set_frozen 
+------------
+ 
+ 
+ 
+(3 rows)
+
+SELECT gaps.declare_attribute('lt', 'lt', 'd', ARRAY['n', 'y']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('lt', 'd', 'lt', 'd');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('lt', 'pd', 'd', ARRAY['a']);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT factor, complete_entities, method, converged FROM gaps.learn_cpts('lt', 1, 'em')
+ORDER BY method, factor;
+ factor | complete_entities |     method     | converged 
+--------+-------------------+----------------+-----------
+ pd     |                60 | em             | t
+ pa     |                   | fixed (frozen) | t
+ pb     |                   | fixed (frozen) | t
+ pc     |                   | fixed (frozen) | t
+(4 rows)
+
+SELECT bool_and(f.cpt = l.cpt) AS unchanged, count(*)
+FROM gaps.factor f JOIN learned l USING (name) WHERE f.model_id = gaps._model_id('lt');
+ unchanged | count 
+-----------+-------
+ t         |     3
+(1 row)
+
+-- d is y whenever a is s, so P(d = y | a = s) is near 1.
+SELECT cpt[2] > 0.9 AS learned_d FROM gaps.factor WHERE name = 'pd';
+ learned_d 
+-----------
+ t
+(1 row)
+
+-- Retiring a feature: dropping pd removes it, and d with it (nothing else
+-- covers d), and the model still answers.
+SET client_min_messages = notice;
+SELECT gaps.drop_factor('lt', 'pd');
+NOTICE:  attribute public.lt.d has no factor left in model "lt" and is removed
+ drop_factor 
+-------------
+ 
+(1 row)
+
+SELECT count(*) AS d_attribute FROM gaps.attribute WHERE attname = 'd';
+ d_attribute 
+-------------
+           0
+(1 row)
+
+SELECT count(DISTINCT attname) FROM gaps.marginals('lt');
+ count 
+-------
+     1
+(1 row)
+
+-- A factor whose child is another factor's parent cannot go.
+SELECT gaps.drop_factor('lt', 'pa');                            -- fail
+ERROR:  cannot drop factor "pa": factor "pb" of model "lt" has a parent over its child, which would have no factor left
+SELECT gaps.drop_factor('lt', 'nosuch');                        -- fail
+ERROR:  factor "nosuch" does not exist in model "lt"
+-- Replacing a factor over part of an attribute: c splits into two stripes.
+-- Dropping one stripe's factor leaves its values uncovered, which
+-- grounding reports; a new factor over the stripe covers them again.
+SELECT gaps.drop_factor('lt', 'pc');
+NOTICE:  attribute public.lt.c has no factor left in model "lt" and is removed
+ drop_factor 
+-------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('lt', 'lt', 'c', ARRAY['1', '2']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('lt', 'c_lo', 'lt', 'c');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe_qual('lt', 'c_lo', 'id', '<=', '300');
+ add_stripe_qual 
+-----------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('lt', 'c_hi', 'lt', 'c');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe_qual('lt', 'c_hi', 'id', '>', '300');
+ add_stripe_qual 
+-----------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('lt', 'pc_lo', 'c_lo', ARRAY['a'], ARRAY[0.5, 0.5, 0.5, 0.5]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('lt', 'pc_hi', 'c_hi', ARRAY['a'], ARRAY[0.5, 0.5, 0.5, 0.5]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.drop_factor('lt', 'pc_hi');
+ drop_factor 
+-------------
+ 
+(1 row)
+
+SELECT count(*) FROM gaps.marginals('lt');                      -- fail: uncovered
+ERROR:  public.lt.c of entity {"id": 301} is the child of 0 factors, not exactly one
+SELECT gaps.add_factor('lt', 'pc_hi2', 'c_hi', ARRAY['a'], ARRAY[0.3, 0.7, 0.6, 0.4]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT count(DISTINCT attname) FROM gaps.marginals('lt');
+ count 
+-------
+     1
+(1 row)
+
+-- A member's factor that a composite's factor uses as a parent cannot go.
+CREATE TABLE grp (g int PRIMARY KEY, z text);
+INSERT INTO grp VALUES (1, NULL);
+ALTER TABLE lt ADD COLUMN g int DEFAULT 1;
+SELECT gaps.create_model('top');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.add_member('top', 'lt');
+ add_member 
+------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('top', 'grp', 'z', ARRAY['off', 'on']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('top', 'z', 'grp', 'z');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('top', 'pz', 'z', ARRAY['lt.b'], kind => 'noisy_or',
+					   params => ARRAY[0.1, 0.5], aggregate => ARRAY[true]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('top', 'pz', 1, 'g', 'g');
+ map_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.drop_factor('lt', 'pb');                            -- fail: composite
+ERROR:  cannot drop factor "pb": factor "pz" of model "top" has a parent over its child, which would have no factor left
+SELECT gaps.drop_factor('top', 'pz');
+NOTICE:  attribute public.grp.z has no factor left in model "top" and is removed
+ drop_factor 
+-------------
+ 
+(1 row)
+
+SELECT gaps.drop_factor('lt', 'pb');
+NOTICE:  attribute public.lt.b has no factor left in model "lt" and is removed
+ drop_factor 
+-------------
+ 
+(1 row)
+
+SELECT count(*) AS b_attribute FROM gaps.attribute WHERE attname = 'b';
+ b_attribute 
+-------------
+           0
+(1 row)
+
+SELECT gaps.drop_model('top');
+ drop_model 
+------------
+ 
+(1 row)
+
+-- The same through a composite the dropping role cannot see: the foreign
+-- key on the parent stripe refuses it, without naming the hidden factor.
+SET client_min_messages = warning;
+CREATE ROLE gaps_a;
+CREATE ROLE gaps_b;
+GRANT gaps_a TO gaps_b;
+GRANT SELECT ON lt, grp TO gaps_a, gaps_b;
+SET ROLE gaps_a;
+SELECT gaps.create_model('mine');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('mine', 'lt', 'b', ARRAY['1', '2']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('mine', 'b', 'lt', 'b');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('mine', 'pb', 'b', '{}', ARRAY[0.5, 0.5]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SET ROLE gaps_b;
+SELECT gaps.create_model('theirs');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.add_member('theirs', 'mine');
+ add_member 
+------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('theirs', 'grp', 'z', ARRAY['off', 'on']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('theirs', 'z', 'grp', 'z');
+ add_stripe 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('theirs', 'pz', 'z', ARRAY['mine.b'], kind => 'noisy_or',
+					   params => ARRAY[0.1, 0.5], aggregate => ARRAY[true]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.map_factor('theirs', 'pz', 1, 'g', 'g');
+ map_factor 
+------------
+ 
+(1 row)
+
+SET ROLE gaps_a;
+SELECT count(*) AS visible_models FROM gaps.model;
+ visible_models 
+----------------
+              1
+(1 row)
+
+\set VERBOSITY sqlstate
+SELECT gaps.drop_factor('mine', 'pb');                          -- fail: 23503
+ERROR:  23503
+\set VERBOSITY terse
+SELECT count(*) AS still_there FROM gaps.factor WHERE name = 'pb';
+ still_there 
+-------------
+           1
+(1 row)
+
+SET ROLE gaps_b;
+SELECT gaps.drop_model('theirs');
+ drop_model 
+------------
+ 
+(1 row)
+
+SET ROLE gaps_a;
+SELECT gaps.drop_model('mine');
+ drop_model 
+------------
+ 
+(1 row)
+
+RESET ROLE;
+REVOKE SELECT ON lt, grp FROM gaps_a, gaps_b;
+DROP ROLE gaps_b;
+DROP ROLE gaps_a;
+-- Lineage: a parent's name and a note, which change nothing else.  The
+-- parent is a name, so dropping it leaves the child alone.
+SELECT gaps.create_model('lt2', parent => 'lt', note => 'round 2, refit from lt');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT name, parent, note FROM gaps.model ORDER BY name;
+ name | parent |          note          
+------+--------+------------------------
+ lt   |        | 
+ lt2  | lt     | round 2, refit from lt
+(2 rows)
+
+SELECT gaps.set_lineage('lt', 'lt0', 'round 1');
+ set_lineage 
+-------------
+ 
+(1 row)
+
+SELECT gaps.set_lineage('lt2', NULL, NULL);
+ set_lineage 
+-------------
+ 
+(1 row)
+
+SELECT gaps.set_lineage('nosuch', NULL, NULL);                  -- fail
+ERROR:  model "nosuch" does not exist
+SELECT gaps.set_lineage('lt2', 'lt', 'round 2');
+ set_lineage 
+-------------
+ 
+(1 row)
+
+SELECT gaps.drop_model('lt');
+ drop_model 
+------------
+ 
+(1 row)
+
+SELECT name, parent, note FROM gaps.model ORDER BY name;
+ name | parent |  note   
+------+--------+---------
+ lt2  | lt     | round 2
+(1 row)
+
+SELECT gaps.drop_model('lt2');
+ drop_model 
+------------
+ 
+(1 row)
+
+DROP TABLE lt, grp;
