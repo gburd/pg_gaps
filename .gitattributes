@@ -12,3 +12,5 @@ dev export-ignore
 flake.nix export-ignore
 flake.lock export-ignore
 test export-ignore
+.woodpecker export-ignore
+ci export-ignore
