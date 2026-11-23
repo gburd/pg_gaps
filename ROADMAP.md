@@ -90,6 +90,13 @@ Codeberg (one zip, sha256 38bc3353...e5f4).
 | 8 | PGXN packaging | done: `META.json` (`pgxn_meta` clean), `make dist`, `make check-meta` in the flake and CI, `.github/workflows/release.yml`; the zip builds and passes on PGDG 17, 18, 19 with gcc `-Werror`.  0.1.0 published 2026-11-22 by the release workflow (PGXN HTTP 303); the PGXN, GitHub and Codeberg zips are identical, and the PGXN download passes 13/13 |
 | 3 | full hotel workload with its vertical factors | done: runs exact, components of at most 4 variables (`bench/hotel.sql`, `bench/RESULTS_HOTEL_2026-11-20.md`) |
 
+Follow-ups from pg.ddx.io round two (2026-11-22), not in 0.2.0:
+EM rebuilds CPT factors' tables with `array_agg`, which stops at 2^26
+elements, so a model whose CPT factors hold between 2^26 and 134M cells
+passes the up-front bound and fails in EM's first step with an unnamed
+error (capacity re-review N1); past 2^26 variables per call means
+handing the engine the grounding temp tables directly (Phase 6).
+
 ## Phase 1: model catalog and validation
 
 **Goal:** a user can declare a first-order Bayesian network over an
