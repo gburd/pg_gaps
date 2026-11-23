@@ -1,6 +1,36 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (unreleased)
+
+**Updating from 0.1.0.**  Install the 0.2.0 package, then run, in every
+database that has the extension:
+
+    ALTER EXTENSION pg_gaps UPDATE;
+
+Models, CPTs, priors, parameters and composite members are kept, and
+every model returns the same marginals, bit for bit, as before the update
+(`test/upgrade`).  Existing factors become `kind` 'cpt', not frozen, with
+no prior; attributes have no bin edges; models have no lineage.  Until a
+database is updated, the 0.2.0 library refuses to run under its 0.1.0
+SQL: `marginals`, `impute` and `learn_cpts` fail with "pg_gaps library
+0.2.0 is loaded but the extension's SQL is 0.1.0" and a hint to run
+`ALTER EXTENSION pg_gaps UPDATE`.  (Before, the new library called by the
+old SQL failed with "gaps._infer arguments must not be NULL", or worse.)
+
+The same update handles both catalogs that were installed as 0.1.0: the
+release (tag v0.1.0) and the earlier pre-release d35680c, which pg.ddx.io
+runs.  d35680c has no `gaps.model_member`; the update creates it.
+
+Privileges: the update grants nothing on a table that already exists, so
+a `REVOKE` on a catalog table survives it.  It grants PUBLIC the same
+rights on `gaps.model_member` as on the other catalog tables only when it
+creates that table (from d35680c); revoke them again if you revoked the
+others.  Functions whose arguments or results changed are dropped and
+created again, and so are executable by PUBLIC afterwards: from the
+release, `gaps.create_model` and `gaps.learn_cpts`; from d35680c also
+`gaps.declare_attribute`, `gaps.add_factor`, `gaps.marginals` and
+`gaps.impute`.  Repeat any `REVOKE EXECUTE` you made on those.  Every
+other function keeps its privileges.
 
 Grounding capacity (pg.ddx.io N1).  A model whose ground network passed
 1 GB in total failed after minutes with "tuple is too big", because

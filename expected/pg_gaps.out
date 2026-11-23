@@ -5,7 +5,7 @@ SELECT extversion, extnamespace::regnamespace AS schema, extrelocatable
   FROM pg_extension WHERE extname = 'pg_gaps';
  extversion | schema | extrelocatable 
 ------------+--------+----------------
- 0.1.0      | gaps   | f
+ 0.2.0      | gaps   | f
 (1 row)
 
 LOAD 'pg_gaps';

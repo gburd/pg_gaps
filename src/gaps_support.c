@@ -60,6 +60,8 @@
 #include "utils/rls.h"
 #include "utils/syscache.h"
 
+#include "pg_gaps.h"
+
 PG_FUNCTION_INFO_V1(gaps_rows_support);
 
 /* Which set-returning function a request is for. */
@@ -422,6 +424,8 @@ gaps_rows_support(PG_FUNCTION_ARGS)
 	 */
 	if (!IsA(rawreq, SupportRequestRows) || IsInParallelMode() ||
 		RecoveryInProgress() || IsolationIsSerializable())
+		PG_RETURN_POINTER(NULL);
+	if (!gaps_check_version(false))
 		PG_RETURN_POINTER(NULL);
 	req = (SupportRequestRows *) rawreq;
 	if (!is_funcclause(req->node) || ((FuncExpr *) req->node)->args == NIL)

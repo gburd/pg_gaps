@@ -338,6 +338,7 @@ gaps_infer(PG_FUNCTION_ARGS)
 	MemoryContext work,
 				old;
 
+	gaps_check_version(true);
 	for (int i = 0; i < 8; i++)
 		if (PG_ARGISNULL(i))
 			ereport(ERROR,
@@ -482,6 +483,7 @@ gaps_expected_counts(PG_FUNCTION_ARGS)
 	MemoryContext work,
 				old;
 
+	gaps_check_version(true);
 	for (int i = 0; i < 8; i++)
 		if (PG_ARGISNULL(i))
 			ereport(ERROR,

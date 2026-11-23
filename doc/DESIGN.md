@@ -1293,6 +1293,37 @@ The estimate also uses `reltuples` as `ANALYZE` or `VACUUM` stored it,
 without the planner's scaling by the table's current size, so after a bulk
 load without `ANALYZE` it lags the planner's own row count for the table.
 
+### Upgrades and the version check
+
+An installed pg_gaps is two things that a package update can separate:
+the library, replaced at once for every database, and the SQL objects
+in each database, which change only at `ALTER EXTENSION pg_gaps UPDATE`.
+Each release ships an update script from the previous one, and
+`test/upgrade` holds it to two properties: the updated database's
+extension objects equal a fresh install's (functions by definition,
+columns, constraints, triggers, policies, extension membership), and
+every model's marginals are bit for bit what the old version returned.
+"0.1.0" names two catalogs, the release (v0.1.0) and the pre-release
+d35680c that pg.ddx.io runs in production; the one update script handles
+both, by adding what is missing (`IF NOT EXISTS`) and dropping by exact
+signature the functions either one had in a different shape.
+
+The update grants nothing on existing tables, so a DBA's `REVOKE`
+survives it.  A function it has to drop and create again regains
+PUBLIC's default `EXECUTE`; the update script and `CHANGELOG.md` list
+those, and nothing else changes privileges.
+
+Between the package update and `ALTER EXTENSION`, the new library would
+be called by the old SQL with arguments it does not expect.  So each C
+entry point (`_infer`, `_expected_counts`, `_param_cpts`, `_param_size`)
+first compares `PG_GAPS_VERSION` with the installed extension's
+`extversion`, read from `pg_extension` and cached for the backend until
+an invalidation of `pg_extension` arrives, and refuses a mismatch with an
+`ERROR` naming both versions and the hint to update.  `ALTER EXTENSION`
+writes the new `extversion` before it runs the script, so the update's
+own calls pass.  The planner support function never fails: on a mismatch
+it gives no estimate and the declared `ROWS` applies.
+
 ### Security
 
 The extension is **not trusted** (`trusted = false`, the default) until a

@@ -465,6 +465,7 @@ gaps_param_cpts(PG_FUNCTION_ARGS)
 	ExpandedRecordHeader *erh;
 	Datum		values[7];
 
+	gaps_check_version(true);
 	for (int i = 0; i < 11; i++)
 		if (PG_ARGISNULL(i))
 			ereport(ERROR,
@@ -552,6 +553,7 @@ gaps_param_size(PG_FUNCTION_ARGS)
 	Datum		values[3];
 	bool		nulls[3] = {0};
 
+	gaps_check_version(true);
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "gaps._param_size must return a record");
 	fname = text_to_cstring(PG_GETARG_TEXT_PP(0));

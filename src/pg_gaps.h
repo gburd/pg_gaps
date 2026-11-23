@@ -17,4 +17,7 @@ extern bool gaps_share_components;
 extern int	gaps_samples;
 extern int	gaps_seed;
 
+/* The installed extension matches this library (pg_gaps.c). */
+extern bool gaps_check_version(bool raise);
+
 #endif							/* PG_GAPS_H */
