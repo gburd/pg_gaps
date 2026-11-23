@@ -2375,79 +2375,110 @@ BEGIN
 END
 $$;
 
+-- The tables of a parameterised factor's instances, as gaps._infer's
+-- arrays (src/gaps_param.c).  A named type, not OUT parameters, for the
+-- reason gaps._network is one.
+CREATE TYPE gaps._param_net AS (
+	aux_card int[], child int[], parent_off int[], parents int[], cpt_off int[],
+	cpts float8[], cpt_lscale int[]);
+
 -- The tables of a parameterised factor's instances, log CPTs
--- (src/gaps_param.c); factor names the factor in errors.
+-- (src/gaps_param.c); factor names the factor in errors.  The result is
+-- an expanded record: assign it (r := gaps._param_cpts(...)), since
+-- selecting it into a row forms one tuple of all seven arrays.
 CREATE FUNCTION gaps._param_cpts(factor text, kind text, child_card int, slot_card int[],
 	slot_agg boolean[], params float8[], first_aux int, inst_child int[], inst_off int[],
-	member_var int[], member_ev int[],
-	OUT aux_card int[], OUT child int[], OUT parent_off int[], OUT parents int[],
-	OUT cpt_off int[], OUT cpts float8[], OUT cpt_lscale int[])
+	member_var int[], member_ev int[])
+RETURNS gaps._param_net
 AS 'MODULE_PATHNAME', 'gaps_param_cpts'
 LANGUAGE C STRICT VOLATILE;
 
+-- What gaps._param_cpts would build for the same arguments, without
+-- building it (src/gaps_param.c): its auxiliary variables, its tables'
+-- parent links and their cells.  Applies the same bounds, naming the
+-- factor.
+CREATE FUNCTION gaps._param_size(factor text, kind text, child_card int, slot_card int[],
+	slot_agg boolean[], params float8[], inst_child int[], inst_off int[],
+	member_var int[], member_ev int[], OUT aux bigint, OUT links bigint, OUT cells bigint)
+AS 'MODULE_PATHNAME', 'gaps_param_size'
+LANGUAGE C STRICT VOLATILE;
+
 -- A step of gaps._ground, after its instances are in pg_gaps_inst and its
--- variables in pg_gaps_rv: the tables of every instance of parameterised
--- factor fid, as gaps._param_cpts returns them, with cpt_off and
--- cpt_lscale shifted so that the factor's tables start at element
--- cpt_base of the network's cpts and auxiliary variables numbered from
--- first_aux.  Each instance's
--- table is over its missing parents only, the observed ones folded in, so
--- its size does not grow with the observed parents (doc/DESIGN.md,
--- "Parameterised factors").  The instances' slots are gathered with one
--- join and one sort over pg_gaps_inst, never a scan per instance.
-CREATE FUNCTION gaps._param_ground(fid int, first_aux int, cpt_base int,
-	OUT aux_card int[], OUT child int[], OUT parent_off int[], OUT parents int[],
-	OUT cpt_off int[], OUT cpts float8[], OUT cpt_lscale int[])
+-- variables in pg_gaps_rv: gaps._param_cpts's arguments for every
+-- parameterised factor of the models in ms, one row each in pg_gaps_param
+-- in factor order, with what they will build (gaps._param_size) and the
+-- totals over all of them, all before any table is built.  Each
+-- instance's table is over its missing parents only, the observed ones
+-- folded in, so its size does not grow with the observed parents
+-- (doc/DESIGN.md, "Parameterised factors").  The instances' slots are
+-- gathered with one join and one sort over pg_gaps_inst, never a scan
+-- per instance; gaps._ground_check has bounded what they gather.  A
+-- model without parameterised factors creates no table.
+CREATE FUNCTION gaps._param_args(ms int[], OUT aux bigint, OUT links bigint,
+	OUT cells bigint)
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-	fr gaps.factor;
-	ns int;
-	scard int[];
-	sagg boolean[];
+	fr record;
 	ichild int[];
 	ioff int[];
 	mvar int[];
 	mev int[];
 	r record;
 BEGIN
-	SELECT * INTO fr FROM gaps.factor WHERE factor_id = fid;
-	SELECT count(*), coalesce(array_agg(gaps._card(fp.parent_stripe) ORDER BY fp.ord), '{}'),
-		   coalesce(array_agg(fp.aggregate ORDER BY fp.ord), '{}')
-	INTO ns, scard, sagg
-	FROM gaps.factor_parent fp WHERE fp.factor_id = fid;
+	aux := 0;
+	links := 0;
+	cells := 0;
+	IF NOT EXISTS (SELECT 1 FROM gaps.factor fa WHERE fa.model_id = ANY (ms)
+				   AND fa.kind <> 'cpt') THEN
+		RETURN;
+	END IF;
+	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_param (
+		factor_id int, name text, kind text, k int, scard int[], sagg boolean[],
+		params float8[], ichild int[], ioff int[], mvar int[], mev int[]) ON COMMIT DROP;
+	TRUNCATE pg_gaps_param;
+	FOR fr IN
+		SELECT fa.factor_id, fa.name, fa.kind, fa.params, gaps._card(fa.child_stripe) AS k,
+			   count(fp.ord)::int AS ns,
+			   coalesce(array_agg(gaps._card(fp.parent_stripe) ORDER BY fp.ord)
+						FILTER (WHERE fp.ord IS NOT NULL), '{}') AS scard,
+			   coalesce(array_agg(fp.aggregate ORDER BY fp.ord)
+						FILTER (WHERE fp.ord IS NOT NULL), '{}') AS sagg
+		FROM gaps.factor fa LEFT JOIN gaps.factor_parent fp USING (factor_id)
+		WHERE fa.model_id = ANY (ms) AND fa.kind <> 'cpt'
+		GROUP BY fa.factor_id ORDER BY fa.factor_id LOOP
+		-- Per instance (child variable) and slot, the number of members;
+		-- then the members themselves in the same order with their
+		-- evidence.
+		WITH ch AS (
+			SELECT i.v FROM pg_gaps_inst i WHERE i.factor_id = fr.factor_id AND i.ord = 0),
+		cnt AS (
+			SELECT ch.v, s.o, count(j.pv) AS n
+			FROM ch CROSS JOIN generate_series(1, fr.ns) s(o)
+				LEFT JOIN pg_gaps_inst j
+					ON j.factor_id = fr.factor_id AND j.v = ch.v AND j.ord = s.o
+			GROUP BY ch.v, s.o),
+		run AS (
+			SELECT cnt.v, cnt.o, 1 + sum(cnt.n) OVER (ORDER BY cnt.v, cnt.o) AS e FROM cnt)
+		SELECT (SELECT coalesce(array_agg(ch.v ORDER BY ch.v), '{}') FROM ch),
+			   ARRAY[1] || coalesce((SELECT array_agg(run.e::int ORDER BY run.v, run.o)
+									 FROM run), '{}')
+		INTO ichild, ioff;
+		SELECT coalesce(array_agg(j.pv ORDER BY j.v, j.ord, j.pv), '{}'),
+			   coalesce(array_agg(rv.ev ORDER BY j.v, j.ord, j.pv), '{}')
+		INTO mvar, mev
+		FROM pg_gaps_inst j JOIN pg_gaps_rv rv ON rv.v = j.pv
+		WHERE j.factor_id = fr.factor_id AND j.ord > 0;
 
-	-- Per instance (child variable) and slot, the number of members; then
-	-- the members themselves in the same order with their evidence.
-	WITH ch AS (
-		SELECT i.v FROM pg_gaps_inst i WHERE i.factor_id = fid AND i.ord = 0),
-	cnt AS (
-		SELECT ch.v, s.o, count(j.pv) AS n
-		FROM ch CROSS JOIN generate_series(1, ns) s(o)
-			LEFT JOIN pg_gaps_inst j ON j.factor_id = fid AND j.v = ch.v AND j.ord = s.o
-		GROUP BY ch.v, s.o),
-	run AS (
-		SELECT cnt.v, cnt.o, 1 + sum(cnt.n) OVER (ORDER BY cnt.v, cnt.o) AS e FROM cnt)
-	SELECT (SELECT coalesce(array_agg(ch.v ORDER BY ch.v), '{}') FROM ch),
-		   ARRAY[1] || coalesce((SELECT array_agg(run.e::int ORDER BY run.v, run.o) FROM run),
-								'{}')
-	INTO ichild, ioff;
-	SELECT coalesce(array_agg(j.pv ORDER BY j.v, j.ord, j.pv), '{}'),
-		   coalesce(array_agg(rv.ev ORDER BY j.v, j.ord, j.pv), '{}')
-	INTO mvar, mev
-	FROM pg_gaps_inst j JOIN pg_gaps_rv rv ON rv.v = j.pv
-	WHERE j.factor_id = fid AND j.ord > 0;
-
-	SELECT * INTO r FROM gaps._param_cpts(fr.name, fr.kind, gaps._card(fr.child_stripe), scard,
-										   sagg, fr.params, first_aux, ichild, ioff, mvar, mev);
-	aux_card := r.aux_card;
-	child := r.child;
-	parent_off := r.parent_off;
-	parents := r.parents;
-	cpt_off := ARRAY(SELECT x + cpt_base - 1 FROM unnest(r.cpt_off) x);
-	cpt_lscale := ARRAY(SELECT x + cpt_base - 1 FROM unnest(r.cpt_lscale) x);
-	cpts := r.cpts;
+		r := gaps._param_size(fr.name, fr.kind, fr.k, fr.scard, fr.sagg, fr.params, ichild,
+							  ioff, mvar, mev);
+		aux := aux + r.aux;
+		links := links + r.links;
+		cells := cells + r.cells;
+		INSERT INTO pg_gaps_param VALUES (fr.factor_id, fr.name, fr.kind, fr.k, fr.scard,
+										  fr.sagg, fr.params, ichild, ioff, mvar, mev);
+	END LOOP;
 END
 $$;
 
@@ -2531,41 +2562,45 @@ BEGIN
 END
 $$;
 
--- A step of gaps._ground: each parameterised factor of the models in ms,
--- its tables for each of its instances (gaps._param_ground), concatenated
+-- A step of gaps._ground, after gaps._param_args(ms): the tables of each
+-- parameterised factor of the models in ms, from the arguments in
+-- pg_gaps_param (gaps._param_cpts), concatenated
 -- in factor order, with their auxiliary variables numbered from first_aux
--- and their values from element cpt_base of the network's cpts.
--- parent_off is relative to the start of parents and has no leading 1.
-CREATE FUNCTION gaps._param_tables(ms int[], first_aux int, cpt_base int,
-	OUT aux_card int[], OUT child int[], OUT parent_off int[], OUT parents int[],
-	OUT cpt_off int[], OUT cpts float8[], OUT cpt_lscale int[])
+-- and their values from element cpt_base of the network's cpts (cpt_off
+-- and cpt_lscale shifted to match).  parent_off is relative to the start
+-- of parents and has no leading 1.  Built field by field and returned as
+-- an expanded record, never one tuple (gaps._network).
+CREATE FUNCTION gaps._param_tables(ms int[], first_aux int, cpt_base int)
+RETURNS gaps._param_net
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
 	f record;
 	pg record;
+	pt gaps._param_net;
+	base int;
 BEGIN
-	aux_card := '{}';
-	child := '{}';
-	parent_off := '{}';
-	parents := '{}';
-	cpt_off := '{}';
-	cpts := '{}';
-	cpt_lscale := '{}';
-	FOR f IN SELECT fa.factor_id FROM gaps.factor fa
-			 WHERE fa.model_id = ANY (ms) AND fa.kind <> 'cpt' ORDER BY fa.factor_id LOOP
-		pg := gaps._param_ground(f.factor_id, first_aux + cardinality(aux_card),
-								 cpt_base + cardinality(cpts));
-		parent_off := parent_off
-			|| ARRAY(SELECT x + cardinality(parents) FROM unnest(pg.parent_off[2:]) x);
-		aux_card := aux_card || pg.aux_card;
-		child := child || pg.child;
-		parents := parents || pg.parents;
-		cpt_off := cpt_off || pg.cpt_off;
-		cpt_lscale := cpt_lscale || pg.cpt_lscale;
-		cpts := cpts || pg.cpts;
+	pt := ROW('{}', '{}', '{}', '{}', '{}', '{}', '{}');
+	IF NOT EXISTS (SELECT 1 FROM gaps.factor fa WHERE fa.model_id = ANY (ms)
+				   AND fa.kind <> 'cpt') THEN
+		RETURN pt;
+	END IF;
+	FOR f IN SELECT * FROM pg_gaps_param ORDER BY factor_id LOOP
+		base := cpt_base + cardinality(pt.cpts) - 1;
+		pg := gaps._param_cpts(f.name, f.kind, f.k, f.scard, f.sagg, f.params,
+							   first_aux + cardinality(pt.aux_card), f.ichild, f.ioff, f.mvar,
+							   f.mev);
+		pt.parent_off := pt.parent_off
+			|| ARRAY(SELECT x + cardinality(pt.parents) FROM unnest(pg.parent_off[2:]) x);
+		pt.aux_card := pt.aux_card || pg.aux_card;
+		pt.child := pt.child || pg.child;
+		pt.parents := pt.parents || pg.parents;
+		pt.cpt_off := pt.cpt_off || ARRAY(SELECT x + base FROM unnest(pg.cpt_off) x);
+		pt.cpt_lscale := pt.cpt_lscale || ARRAY(SELECT x + base FROM unnest(pg.cpt_lscale) x);
+		pt.cpts := pt.cpts || pg.cpts;
 	END LOOP;
+	RETURN pt;
 END
 $$;
 
@@ -2576,16 +2611,25 @@ CREATE TYPE gaps._network AS (
 	card int[], evidence int[], child int[], parent_off int[], parents int[],
 	cpt_off int[], cpts float8[], cpt_lscale int[], var_attr int[]);
 
--- Why a ground network of nvars variables and nparents parent links
--- (pg_gaps_inst rows with ord > 0) cannot be built in one call, or NULL
--- when it can.  array_agg builds each array in a buffer of 8 bytes per
--- element that doubles and must stay under 1 GB (MaxAllocSize), so no
--- array may pass 2^26 elements; and the statement that builds child,
--- parent_off, cpt_off and parents returns them as one row, which must
--- stay under 1 GB too.  The 1,024 bytes cover the row's and the arrays'
--- headers.  Counting every variable as a CPT's child, and every parent
--- link, overestimates a model with parameterised factors slightly.
-CREATE FUNCTION gaps._ground_fits(nvars bigint, nparents bigint) RETURNS text
+-- Why a ground network cannot be built in one call, or NULL when it can.
+-- nvars counts its random variables, entities and auxiliary variables
+-- alike, which is also its number of tables; nparents counts its parent
+-- links, and the members of parameterised factors' instances
+-- (pg_gaps_inst rows with ord > 0) besides; ncells counts the values of
+-- every table; and nslots is the longest list of instance offsets
+-- gaps._param_args gathers for one parameterised factor, its instances
+-- times its slots plus one.  array_agg builds each array in a buffer of 8
+-- bytes per element that doubles and must stay under 1 GB (MaxAllocSize),
+-- so no array it builds may pass 2^26 elements; cpts, built with ||, must
+-- stay under 1 GB, 134217724 float8s after its header; and the statement
+-- that builds child, parent_off, cpt_off and parents returns them as one
+-- row, and gaps._param_args stores a factor's four gathered arrays as one,
+-- each of which must stay under 1 GB too.  The 1,024 bytes cover a row's
+-- and its arrays' headers.  Counting every variable as a CPT's child, and
+-- every variable, slot and member for one factor's row, overestimates
+-- slightly.
+CREATE FUNCTION gaps._ground_fits(nvars bigint, nparents bigint, ncells bigint,
+	nslots bigint) RETURNS text
 LANGUAGE sql IMMUTABLE STRICT
 SET search_path = pg_catalog
 AS $$
@@ -2594,21 +2638,30 @@ AS $$
 			format('%s random variables, more than the 67108864 one array can hold', nvars)
 		WHEN nparents > 67108864 THEN
 			format('%s parent links, more than the 67108864 one array can hold', nparents)
+		WHEN ncells > 134217724 THEN
+			format('%s table cells, more than the 134217724 one array can hold', ncells)
+		WHEN nslots > 67108865 THEN
+			format('%s instance offsets in one factor, more than the 67108865 one array can '
+				   'hold', nslots)
 		WHEN 4 * (3 * nvars + 1 + nparents) + 1024 > 1073741823 THEN
 			format('%s bytes for the network''s structure, more than the 1073741823 '
 				   'one row can hold', 4 * (3 * nvars + 1 + nparents) + 1024)
+		WHEN 4 * (nvars + nslots + 2 * nparents) + 1024 > 1073741823 THEN
+			format('%s bytes for one factor''s instances, more than the 1073741823 one row '
+				   'can hold', 4 * (nvars + nslots + 2 * nparents) + 1024)
 	END
 $$;
 
 -- Refuse to ground model m when gaps._ground_fits says its network does
 -- not fit one call (AGENTS.md rule 16), naming the model, its
 -- attributes and variables.
-CREATE FUNCTION gaps._ground_bound(m int, nvars bigint, nparents bigint) RETURNS void
+CREATE FUNCTION gaps._ground_bound(m int, nvars bigint, nparents bigint, ncells bigint,
+	nslots bigint) RETURNS void
 LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-	why text := gaps._ground_fits(nvars, nparents);
+	why text := gaps._ground_fits(nvars, nparents, ncells, nslots);
 	natt bigint;
 BEGIN
 	IF why IS NULL THEN
@@ -2618,11 +2671,42 @@ BEGIN
 	RAISE EXCEPTION 'model "%" is too large to ground in one call: %',
 		(SELECT x.name FROM gaps.model x WHERE x.model_id = m), why
 		USING DETAIL = format('It has %s random variables over %s attributes (about %s '
-			'entities each).  One call holds at most 67108864 variables and as many parent '
-			'links, in arrays of at most 1 GB.', nvars, natt, nvars / greatest(natt, 1)),
+			'entities each), auxiliary variables included.  One call holds at most 67108864 '
+			'variables and as many parent links, and 134217724 table cells, in arrays of at '
+			'most 1 GB.', nvars, natt, nvars / greatest(natt, 1)),
 			HINT = 'Split the model into smaller models (for example one per value of a '
 				'parent), restrict the call with rel and entities, or learn each part with '
 				'its own model.';
+END
+$$;
+
+-- A step of gaps._ground, after gaps._ground_factors: refuse model m
+-- (gaps._ground_bound) when its network, of nv entity variables, cannot
+-- be built in one call; first on what gaps._param_args will gather, then
+-- on the whole network, the parameterised factors' tables sized but not
+-- built (gaps._param_args).  The model's tables are all built only after
+-- this returns.
+CREATE FUNCTION gaps._ground_check(m int, ms int[], nv bigint) RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	np bigint;
+	nslots bigint;
+	ps record;
+BEGIN
+	SELECT coalesce(sum(n.links), 0), coalesce(max(n.slots), 0) INTO np, nslots
+	FROM (SELECT count(*) FILTER (WHERE i.ord > 0) AS links,
+				 CASE WHEN fa.kind <> 'cpt' THEN 1 + count(*) FILTER (WHERE i.ord = 0)
+					 * (SELECT count(*) FROM gaps.factor_parent fp
+						WHERE fp.factor_id = fa.factor_id) END AS slots
+		  FROM pg_gaps_inst i JOIN gaps.factor fa USING (factor_id)
+		  GROUP BY fa.factor_id) n;
+	PERFORM gaps._ground_bound(m, nv, np, 0, nslots);
+	ps := gaps._param_args(ms);
+	PERFORM gaps._ground_bound(m, nv + ps.aux, np + ps.links,
+		ps.cells + (SELECT coalesce(sum(cardinality(fa.cpt)), 0) FROM gaps.factor fa
+					WHERE fa.model_id = ANY (ms) AND fa.kind = 'cpt'), nslots);
 END
 $$;
 
@@ -2644,24 +2728,20 @@ $$;
 --   - the rows of one entity agree on its observed value, which is in the
 --     attribute's domain.
 -- Directed cycles are found by the engine (gx_check).
+--
+-- NB: callers assign the result (g := gaps._ground(...)).  It is built
+-- field by field and returned as an expanded record, which assignment
+-- takes over whole, so the nine arrays together may pass 1 GB; SELECT ...
+-- FROM gaps._ground(...), with or without INTO, forms one tuple of them,
+-- held to 1 GB in all (doc/DESIGN.md, "Grounding capacity").
 CREATE FUNCTION gaps._ground(m int, rel regclass DEFAULT NULL, entities jsonb DEFAULT NULL)
 RETURNS gaps._network
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-	card int[];
-	evidence int[];
-	child int[];
-	parent_off int[];
-	parents int[];
-	cpt_off int[];
-	cpts float8[];
-	cpt_lscale int[];
-	var_attr int[];
 	net gaps._network;
 	nv bigint;
-	np bigint;
 	restricted boolean;
 	f record;
 	fids int[] := '{}';
@@ -2677,19 +2757,19 @@ BEGIN
 	ms := gaps._models(m);
 	PERFORM gaps._members_check(ms);
 	-- The size bound is checked once the variables are known and again
-	-- once the parent links are, each time before anything larger is built.
+	-- once the instances are, each time before anything larger is built.
 	restricted := gaps._ground_entities(m, rel, entities);
 	SELECT count(*) INTO nv FROM pg_gaps_rv;
-	PERFORM gaps._ground_bound(m, nv, 0);
+	PERFORM gaps._ground_bound(m, nv, 0, 0, 0);
 	PERFORM gaps._ground_factors(ms, restricted);
-	SELECT count(*) INTO np FROM pg_gaps_inst i WHERE i.ord > 0;
-	PERFORM gaps._ground_bound(m, nv, np);
+	PERFORM gaps._ground_check(m, ms, nv);
 
-	-- Assemble the arrays, in variable order; each CPT appears once in cpts
-	-- and every instance of its factor points at it.
+	-- Assemble the arrays, in variable order, straight into the result;
+	-- each CPT appears once in cpts and every instance of its factor
+	-- points at it.
 	SELECT array_agg(r.card ORDER BY r.v), array_agg(r.ev ORDER BY r.v),
 		   array_agg(r.attribute_id ORDER BY r.v)
-	INTO card, evidence, var_attr
+	INTO net.card, net.evidence, net.var_attr
 	FROM pg_gaps_rv r;
 
 	-- The tables: first every CPT factor's CPT once, in factor order,
@@ -2697,14 +2777,14 @@ BEGIN
 	-- log tables for each of its instances, with their auxiliary variables
 	-- numbered after the entities.  NB: gaps._estep relies on this order,
 	-- rebuilding the CPT factors' prefix and keeping the rest.
-	cpts := '{}';
+	net.cpts := '{}';
 	FOR f IN SELECT fa.factor_id, fa.cpt FROM gaps.factor fa
 			 WHERE fa.model_id = ANY (ms) AND fa.kind = 'cpt' ORDER BY fa.factor_id LOOP
 		fids := fids || f.factor_id;
-		offs := offs || (cardinality(cpts) + 1);
-		cpts := cpts || f.cpt;
+		offs := offs || (cardinality(net.cpts) + 1);
+		net.cpts := net.cpts || f.cpt;
 	END LOOP;
-	pt := gaps._param_tables(ms, cardinality(card) + 1, cardinality(cpts) + 1);
+	pt := gaps._param_tables(ms, cardinality(net.card) + 1, cardinality(net.cpts) + 1);
 
 	-- One ordered pass over the CPT factors' instances: every child
 	-- variable (ord 0, the coverage check guarantees exactly one per
@@ -2724,34 +2804,22 @@ BEGIN
 			   || (1 + count(*) FILTER (WHERE s.ord > 0))::int,
 		   coalesce(array_agg(s.off::int ORDER BY s.v) FILTER (WHERE s.ord = 0), '{}'),
 		   coalesce(array_agg(s.pv ORDER BY s.v, s.ord) FILTER (WHERE s.ord > 0), '{}')
-	INTO child, parent_off, cpt_off, parents
+	INTO net.child, net.parent_off, net.cpt_off, net.parents
 	FROM seq s;
 
 	-- The parameterised tables follow, and their auxiliary variables,
 	-- which are missing and belong to no attribute.  The CPT factors'
 	-- tables are probabilities (cpt_lscale 0), the others log CPTs.
-	cpt_lscale := array_fill(0, ARRAY[cardinality(child)]) || pt.cpt_lscale;
-	parent_off := parent_off || ARRAY(SELECT x + cardinality(parents) FROM unnest(pt.parent_off) x);
-	parents := parents || pt.parents;
-	child := child || pt.child;
-	cpt_off := cpt_off || pt.cpt_off;
-	cpts := cpts || pt.cpts;
-	card := card || pt.aux_card;
-	evidence := evidence || array_fill(0, ARRAY[cardinality(pt.aux_card)]);
-	var_attr := var_attr || array_fill(NULL::int, ARRAY[cardinality(pt.aux_card)]);
-
-	-- Assigned one field at a time, the result stays an expanded record
-	-- and is never formed into one tuple, which would be limited to 1 GB
-	-- for all nine arrays together (doc/DESIGN.md, "Grounding capacity").
-	net.card := card;
-	net.evidence := evidence;
-	net.child := child;
-	net.parent_off := parent_off;
-	net.parents := parents;
-	net.cpt_off := cpt_off;
-	net.cpts := cpts;
-	net.cpt_lscale := cpt_lscale;
-	net.var_attr := var_attr;
+	net.cpt_lscale := array_fill(0, ARRAY[cardinality(net.child)]) || pt.cpt_lscale;
+	net.parent_off := net.parent_off
+		|| ARRAY(SELECT x + cardinality(net.parents) FROM unnest(pt.parent_off) x);
+	net.parents := net.parents || pt.parents;
+	net.child := net.child || pt.child;
+	net.cpt_off := net.cpt_off || pt.cpt_off;
+	net.cpts := net.cpts || pt.cpts;
+	net.card := net.card || pt.aux_card;
+	net.evidence := net.evidence || array_fill(0, ARRAY[cardinality(pt.aux_card)]);
+	net.var_attr := net.var_attr || array_fill(NULL::int, ARRAY[cardinality(pt.aux_card)]);
 	RETURN net;
 END
 $$;

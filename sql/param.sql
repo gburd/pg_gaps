@@ -131,6 +131,24 @@ BEGIN
 END
 $$;
 
+-- The up-front size of a model's parameterised tables (gaps._param_args,
+-- before any is built) against the tables grounding then builds: one row
+-- per model into sizes, which must agree.
+CREATE TABLE sizes (model text, est bigint[], built bigint[]);
+CREATE FUNCTION check_sizes(model text) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	m int := gaps._model_id(model);
+	ps record;
+	pt record;
+BEGIN
+	PERFORM gaps._ground(m);
+	ps := gaps._param_args(gaps._models(m));
+	pt := gaps._param_tables(gaps._models(m), 1, 1);
+	INSERT INTO sizes VALUES (model, ARRAY[ps.aux, ps.links, ps.cells],
+		ARRAY[cardinality(pt.aux_card), cardinality(pt.parents), cardinality(pt.cpts)]);
+END
+$$;
+
 -- 200 random models, each solved both ways.  Every marginal must agree to
 -- 1e-12, every distribution must sum to 1 with no negative entry, and
 -- there must be marginals to compare.
@@ -144,6 +162,7 @@ BEGIN
 		kind := build(s / 1000.0, 'd');
 		CREATE TEMP TABLE md AS SELECT * FROM gaps.marginals('rd');
 		PERFORM build(s / 1000.0, 'p');
+		PERFORM check_sizes('rp');
 		INSERT INTO cmp
 		SELECT s, kind, d.attname, d.entity, d.value, d.probability, p.probability
 		FROM md d FULL JOIN gaps.marginals('rp') p USING (attname, entity, value);
@@ -414,6 +433,7 @@ BEGIN
 		b := build_agg(s / 100.0, 'd');
 		CREATE TEMP TABLE md AS SELECT * FROM gaps.marginals('gd');
 		PERFORM build_agg(s / 100.0, 'a');
+		PERFORM check_sizes('ga');
 		INSERT INTO cmpa
 		SELECT s, b.n, b.kind, d.attname, d.entity, d.value, d.probability, a.probability
 		FROM md d FULL JOIN gaps.marginals('ga') a USING (attname, entity, value);
@@ -431,6 +451,29 @@ FROM cmpa GROUP BY kind ORDER BY kind;
 SELECT count(*) AS bad_distributions FROM (
 	SELECT seed, attname, entity FROM cmpa GROUP BY seed, attname, entity
 	HAVING abs(sum(pa) - 1) > 1e-12 OR min(pa) < 0) x;
+-- One variable in two slots is one parent of the child's table: four
+-- parent links over the three rows' missing variables, not six.
+TRUNCATE rt;
+INSERT INTO rt VALUES (1, NULL, 'v0', NULL, NULL, NULL), (2, 'v1', NULL, NULL, NULL, 'v1'),
+	(3, NULL, NULL, NULL, NULL, NULL);
+SELECT gaps.create_model('dup');
+SELECT count(*) FROM (
+	SELECT gaps.declare_attribute('dup', 'rt', a, ARRAY['v0', 'v1'])
+	FROM unnest('{a1,a2,c}'::name[]) a
+	UNION ALL SELECT gaps.add_stripe('dup', s, 'rt', a)
+	FROM (VALUES ('s1', 'a1'), ('s1b', 'a1'), ('s2', 'a2'), ('sc', 'c')) v(s, a)
+	UNION ALL SELECT gaps.add_factor('dup', 'f' || s, s, '{}', ARRAY[0.4, 0.6])
+	FROM unnest('{s1,s2}'::text[]) s) x;
+SELECT gaps.add_factor('dup', 'fc', 'sc', ARRAY['s1', 's2', 's1b'], kind => 'noisy_or',
+	params => ARRAY[0.1, 0.5, 0.4, 0.3]);
+SELECT check_sizes('dup');
+SELECT est, built FROM sizes WHERE model = 'dup';
+SELECT gaps.drop_model('dup');
+-- The up-front sizes are the built ones, with and without auxiliary
+-- chains, in every model of both loops and in dup.
+SELECT model, count(*) AS models, count(*) FILTER (WHERE est <> built) AS differ,
+	   count(*) FILTER (WHERE built[1] > 0) AS with_aux, sum(built[3]) > 0 AS cells
+FROM sizes GROUP BY model ORDER BY model;
 -- No auxiliary variable is returned: every row is a declared attribute.
 SELECT count(*) FILTER (WHERE attname NOT IN ('st')) AS foreign_rows,
 	   count(DISTINCT seed) FILTER (WHERE n >= 2 AND attname = 'st'
@@ -511,6 +554,7 @@ SELECT gaps.drop_model('gl');
 DROP TABLE cmpa, person, mail;
 DROP FUNCTION build_agg(float8, text);
 
-DROP TABLE rt, cmp;
+DROP TABLE rt, cmp, sizes;
+DROP FUNCTION check_sizes(text);
 DROP FUNCTION build(float8, text), dense(text, float8[], int, int[]),
 	formula(text, float8[], int, int[], int[], int);
