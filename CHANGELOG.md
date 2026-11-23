@@ -42,8 +42,15 @@ d35680c's, `marginals` and `impute`.  `learn_cpts` with method 'counts'
 and keep working under the old SQL.  On PostgreSQL 17.0 to 17.7, which
 lack a system cache on `pg_extension`, the library reads `extversion`
 on each such call instead of once per backend; that costs one index
-scan, too little to measure next to inference.  (Before, the new library called by the
-old SQL failed with "gaps._infer arguments must not be NULL", or worse.)
+scan, too little to measure next to inference.  (Before, the new library
+called by the old SQL failed with "gaps._infer arguments must not be
+NULL", or worse.)
+
+PostgreSQL 17.0 to 17.7 work again.  0.1.0 built there but its C
+functions failed at the first call with "type 23 not supported by
+deconstruct_array_builtin()", because that function learned `int4` only
+in 17.8.  The library now unpacks its arrays with `deconstruct_array`;
+the regression suite and the dump test pass on a 17.7 server.
 
 The same update handles both catalogs that were installed as 0.1.0: the
 release (tag v0.1.0) and the earlier pre-release d35680c, which pg.ddx.io
