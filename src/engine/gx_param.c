@@ -315,6 +315,55 @@ gx_param_naux(const gx_pfactor *f, const gx_pinst *in)
 }
 
 /*
+ * A chain over m missing members has m links, the first with one parent
+ * (the member) and each later one two (the previous link and the
+ * member).  The child's parents are its distinct missing direct parents
+ * (as distinct_missing counts them) and the end of each chain: one OR
+ * chain over every aggregating slot for noisy-OR, one count chain per
+ * aggregating slot with a missing member for logistic.
+ */
+int
+gx_param_nlinks(const gx_pfactor *f, const gx_pinst *in)
+{
+	int			links = 0;
+	int			ends = 0;
+	int			or_members = 0;
+
+	for (int s = 0; s < f->nslots; s++)
+	{
+		int			i = in->off[s];
+		int			seen = 0;
+		int			m;
+
+		if (f->slot_agg[s])
+		{
+			m = missing_in_slot(in, s);
+			if (f->kind == GX_NOISY_OR)
+				or_members += m;
+			else if (m > 0)
+			{
+				links += 2 * m - 1;
+				ends++;
+			}
+			continue;
+		}
+		if (in->value[i] >= 0)
+			continue;
+		for (int s2 = 0; s2 < s && !seen; s2++)
+			seen = !f->slot_agg[s2] && in->value[in->off[s2]] < 0 &&
+				in->var[in->off[s2]] == in->var[i];
+		if (!seen)
+			links++;
+	}
+	if (or_members > 0)
+	{
+		links += 2 * or_members - 1;
+		ends++;
+	}
+	return links + ends;
+}
+
+/*
  * Check instance in against f: slot ranges in order, one member in every
  * slot that does not aggregate, values in range, and the variables of an
  * aggregating slot strictly increasing.  A variable twice in one slot

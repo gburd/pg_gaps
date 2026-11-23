@@ -1858,6 +1858,15 @@ check_param_case(uint64_t cseed)
 	rc = gx_param_ground(&env, &pc.f, &in, pcpts);
 	if (rc != GX_OK)
 		FAIL("param: gx_param_ground returned %d", rc);
+	{
+		int			links = 0;
+
+		for (int i = 0; i <= naux; i++)
+			links += pcpts[i].nparents;
+		if (links != gx_param_nlinks(&pc.f, &in))
+			FAIL("param: %d parent links, gx_param_nlinks says %d", links,
+				 gx_param_nlinks(&pc.f, &in));
+	}
 	b = a;
 	{
 		gx_cpt		bc[PMAXM + 1 + 64];
