@@ -545,6 +545,28 @@ to other sessions.  A real model rarely has more than a handful of key
 types; the limit is a guard against an unbounded failure, not a tuning
 knob, so it is not a GUC.
 
+**Grounding capacity.**  One call grounds the whole network into nine
+arrays (`gaps._ground`, the arrays `gaps._infer` takes), and each array
+is one varlena, at most 1 GB.  `array_agg` builds an array in a buffer of
+8 bytes per element that doubles, so no array may pass 2^26 (67,108,864)
+elements, and the statement that builds the structure arrays (child,
+parent_off, cpt_off and parents) returns them as one row, which is held
+to 1 GB as well.  So one call holds at most 2^26 random variables, 2^26
+parent links, and 4 x (3 x variables + parent links) bytes of structure
+under 1 GB.  `gaps._ground` returns the arrays as a named composite
+(`gaps._network`) assigned field by field, which PL/pgSQL keeps as an
+expanded record and never forms into one tuple, so the nine arrays
+together may pass 1 GB; returned through OUT parameters they could not
+(the "tuple is too big" pg.ddx.io hit at 5.25M rows x 7 attributes, 1.1
+GB in total).  The bound is checked (`gaps._ground_fits`) when the
+variables are counted and again when the parent links are, before the
+arrays are built, and past it the call is an `ERROR` naming the model,
+its variables and attributes, with a hint to split the model, restrict
+the call to some entities, or learn per part.  A model of 7 attributes
+over one table reaches 2^26 variables at about 9.6M rows.  Lifting the
+bound means handing the engine the grounding temp tables instead of
+arrays (Phase 6).
+
 **CPTs** are dense `float8[]`, indexed from 1, in row-major order over
 (parents..., child), the child varying fastest.  Each variable's values are in
 `gaps.attribute.domain` order, which is the order passed to

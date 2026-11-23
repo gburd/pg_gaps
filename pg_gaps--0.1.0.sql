@@ -2569,6 +2569,63 @@ BEGIN
 END
 $$;
 
+-- The ground network gaps._ground returns, in gaps._infer's arrays plus
+-- each variable's attribute.  A named type, not OUT parameters: see the
+-- end of gaps._ground.
+CREATE TYPE gaps._network AS (
+	card int[], evidence int[], child int[], parent_off int[], parents int[],
+	cpt_off int[], cpts float8[], cpt_lscale int[], var_attr int[]);
+
+-- Why a ground network of nvars variables and nparents parent links
+-- (pg_gaps_inst rows with ord > 0) cannot be built in one call, or NULL
+-- when it can.  array_agg builds each array in a buffer of 8 bytes per
+-- element that doubles and must stay under 1 GB (MaxAllocSize), so no
+-- array may pass 2^26 elements; and the statement that builds child,
+-- parent_off, cpt_off and parents returns them as one row, which must
+-- stay under 1 GB too.  The 1,024 bytes cover the row's and the arrays'
+-- headers.  Counting every variable as a CPT's child, and every parent
+-- link, overestimates a model with parameterised factors slightly.
+CREATE FUNCTION gaps._ground_fits(nvars bigint, nparents bigint) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT
+SET search_path = pg_catalog
+AS $$
+	SELECT CASE
+		WHEN nvars > 67108864 THEN
+			format('%s random variables, more than the 67108864 one array can hold', nvars)
+		WHEN nparents > 67108864 THEN
+			format('%s parent links, more than the 67108864 one array can hold', nparents)
+		WHEN 4 * (3 * nvars + 1 + nparents) + 1024 > 1073741823 THEN
+			format('%s bytes for the network''s structure, more than the 1073741823 '
+				   'one row can hold', 4 * (3 * nvars + 1 + nparents) + 1024)
+	END
+$$;
+
+-- Refuse to ground model m when gaps._ground_fits says its network does
+-- not fit one call (AGENTS.md rule 16), naming the model, its
+-- attributes and variables.
+CREATE FUNCTION gaps._ground_bound(m int, nvars bigint, nparents bigint) RETURNS void
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+	why text := gaps._ground_fits(nvars, nparents);
+	natt bigint;
+BEGIN
+	IF why IS NULL THEN
+		RETURN;
+	END IF;
+	SELECT count(*) INTO natt FROM gaps.attribute a WHERE a.model_id = ANY (gaps._models(m));
+	RAISE EXCEPTION 'model "%" is too large to ground in one call: %',
+		(SELECT x.name FROM gaps.model x WHERE x.model_id = m), why
+		USING DETAIL = format('It has %s random variables over %s attributes (about %s '
+			'entities each).  One call holds at most 67108864 variables and as many parent '
+			'links, in arrays of at most 1 GB.', nvars, natt, nvars / greatest(natt, 1)),
+			HINT = 'Split the model into smaller models (for example one per value of a '
+				'parent), restrict the call with rel and entities, or learn each part with '
+				'its own model.';
+END
+$$;
+
 -- Ground a model.  Returns one row per random variable, numbered 1..n,
 -- with what gaps._infer needs and each variable's attribute.  All reads of
 -- user tables happen here, through dynamic SQL run as the caller.
@@ -2587,14 +2644,25 @@ $$;
 --   - the rows of one entity agree on its observed value, which is in the
 --     attribute's domain.
 -- Directed cycles are found by the engine (gx_check).
-CREATE FUNCTION gaps._ground(m int, rel regclass DEFAULT NULL, entities jsonb DEFAULT NULL,
-	OUT card int[], OUT evidence int[], OUT child int[], OUT parent_off int[],
-	OUT parents int[], OUT cpt_off int[], OUT cpts float8[], OUT cpt_lscale int[],
-	OUT var_attr int[])
+CREATE FUNCTION gaps._ground(m int, rel regclass DEFAULT NULL, entities jsonb DEFAULT NULL)
+RETURNS gaps._network
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+	card int[];
+	evidence int[];
+	child int[];
+	parent_off int[];
+	parents int[];
+	cpt_off int[];
+	cpts float8[];
+	cpt_lscale int[];
+	var_attr int[];
+	net gaps._network;
+	nv bigint;
+	np bigint;
+	restricted boolean;
 	f record;
 	fids int[] := '{}';
 	offs int[] := '{}';
@@ -2608,7 +2676,14 @@ BEGIN
 	-- A composite grounds the union of its members and its own factors.
 	ms := gaps._models(m);
 	PERFORM gaps._members_check(ms);
-	PERFORM gaps._ground_factors(ms, gaps._ground_entities(m, rel, entities));
+	-- The size bound is checked once the variables are known and again
+	-- once the parent links are, each time before anything larger is built.
+	restricted := gaps._ground_entities(m, rel, entities);
+	SELECT count(*) INTO nv FROM pg_gaps_rv;
+	PERFORM gaps._ground_bound(m, nv, 0);
+	PERFORM gaps._ground_factors(ms, restricted);
+	SELECT count(*) INTO np FROM pg_gaps_inst i WHERE i.ord > 0;
+	PERFORM gaps._ground_bound(m, nv, np);
 
 	-- Assemble the arrays, in variable order; each CPT appears once in cpts
 	-- and every instance of its factor points at it.
@@ -2664,6 +2739,20 @@ BEGIN
 	card := card || pt.aux_card;
 	evidence := evidence || array_fill(0, ARRAY[cardinality(pt.aux_card)]);
 	var_attr := var_attr || array_fill(NULL::int, ARRAY[cardinality(pt.aux_card)]);
+
+	-- Assigned one field at a time, the result stays an expanded record
+	-- and is never formed into one tuple, which would be limited to 1 GB
+	-- for all nine arrays together (doc/DESIGN.md, "Grounding capacity").
+	net.card := card;
+	net.evidence := evidence;
+	net.child := child;
+	net.parent_off := parent_off;
+	net.parents := parents;
+	net.cpt_off := cpt_off;
+	net.cpts := cpts;
+	net.cpt_lscale := cpt_lscale;
+	net.var_attr := var_attr;
+	RETURN net;
 END
 $$;
 

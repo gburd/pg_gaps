@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+Grounding capacity (pg.ddx.io N1).  A model whose ground network passed
+1 GB in total failed after minutes with "tuple is too big", because
+`gaps._ground` returned its nine arrays as one record; it now returns a
+named composite that is never formed into one tuple, so `learn_cpts`,
+`marginals`, `impute` and EM ground pg.ddx.io's 5.25M-row,
+7-attribute model (1.1 GB of arrays).  The limit that remains, 2^26
+variables or parent links per call and 1 GB per array, is checked as
+soon as the variables and the parent links are counted, an `ERROR`
+naming the model with a hint to split or restrict it
+(doc/DESIGN.md, "Grounding capacity").
+
 ## 0.1.0 (2026-11-22)
 
 The first release.  pg_gaps declares first-order Bayesian networks over

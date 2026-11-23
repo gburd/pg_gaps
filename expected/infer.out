@@ -1240,6 +1240,27 @@ SELECT gaps.drop_model('snap');
 DROP TABLE par, ch;
 DROP FUNCTION public.later();
 DROP SEQUENCE public.reads;
+-- The up-front bound on one grounding (doc/DESIGN.md, "Grounding
+-- capacity"): NULL when the network fits, and otherwise the limit it
+-- passes.  pg.ddx.io's model of 5.25M rows and 7 attributes fits; at 10M
+-- rows it has more variables than one array holds (2^26).  At 2^26
+-- variables and as many parent links each array fits but the row of four
+-- does not.  The error names the model.
+SELECT n, p, gaps._ground_fits(n, p)
+FROM (VALUES (36750000, 31500000), (70000000, 60000000), (67108864, 0), (67108865, 0),
+			 (0, 67108865), (67108864, 67108864)) v(n, p);
+    n     |    p     |                                      _ground_fits                                       
+----------+----------+-----------------------------------------------------------------------------------------
+ 36750000 | 31500000 | 
+ 70000000 | 60000000 | 70000000 random variables, more than the 67108864 one array can hold
+ 67108864 |        0 | 
+ 67108865 |        0 | 67108865 random variables, more than the 67108864 one array can hold
+        0 | 67108865 | 67108865 parent links, more than the 67108864 one array can hold
+ 67108864 | 67108864 | 1073742852 bytes for the network's structure, more than the 1073741823 one row can hold
+(6 rows)
+
+SELECT gaps._ground_bound(gaps._model_id('m'), 70000000, 60000000);   -- fail
+ERROR:  model "m" is too large to ground in one call: 70000000 random variables, more than the 67108864 one array can hold
 -- The internal entry point validates its arrays.
 SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,1}', '{}', '{1}', '{0.5,0.5}');
  var | value | probability | component | map_value | map_probability | samples 

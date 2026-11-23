@@ -205,7 +205,8 @@ build_network(FunctionCallInfo fcinfo, gx_bn *bn, const int **cpt_off)
 			bad_arg("variable %d has evidence %d", v + 1, evid[v]);
 		evid[v] -= 1;
 	}
-	cpts = palloc(sizeof(gx_cpt) * (n ? n : 1));
+	/* Huge: at 32 bytes a CPT, past 33.5M variables this passes 1 GB. */
+	cpts = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(gx_cpt) * (n ? n : 1));
 	for (int j = 0; j < n; j++)
 	{
 		int			c = child[j];
