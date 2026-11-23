@@ -1314,6 +1314,13 @@ review says otherwise.  The rules:
   row-level security, as everywhere in PostgreSQL.  A consequence: pg_dump
   by a role that is neither superuser nor the catalog owner fails on these
   tables, because pg_dump runs with `row_security = off`.
+- **Models stay in the catalog.**  pg_gaps never logs, prints or exports
+  a model's contents: errors name factors, models and sizes, never CPT
+  entries or weights, and nothing writes a model outside the `gaps`
+  tables.  A model can be sensitive in itself (pg.ddx.io: feature
+  definitions and fitted CPTs are a guide to evading a detector), so
+  any export added later is opt-in.  pg_dump includes the catalog, as
+  for any extension configuration table.
 - **Learning publishes aggregates.**  `learn_cpts` writes statistics of
   the rows the caller could see into the model, which every role that can
   read the model can read.  A model is no more private than its owner

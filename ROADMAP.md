@@ -313,6 +313,73 @@ marginals sum to 1 and equal brute force; top-k comes out in
 non-increasing probability with no duplicates; the query-driven variants
 return the same answers as the naive plan.
 
+## Phase 9: learning that follows drift (pg.ddx.io note 3)
+
+**Goal:** refit a model often from small batches of new labels against a
+drifting population, while yesterday's model keeps serving, without
+leaving the database.  The asks are pg.ddx.io's
+(`pg_gaps-note-3-from-pg.ddx.io-2026-11-22.md`), in their order of use.
+Already in 0.2.0: frozen factors (A4's "fit only the new factor", N4),
+`drop_factor` and `add_factor` on an existing model (A4), lineage
+columns `gaps.model.parent` and `note` (A10).
+
+Delivers, in this order, each with its oracle:
+- **Sufficient statistics (A1).**  `gaps.factor.counts float8[]` in the
+  CPT's layout, written by `learn_cpts`, and a batch form that adds the
+  counts of some entities (the restricted grounding of `marginals`) to
+  the stored ones, so a nightly batch costs in proportion to the batch.
+  For the 'counts' method this is exact: counts are additive.  For EM the
+  stored expected counts are those of the CPTs that produced them, so an
+  added batch is one step of incremental EM, not the batch fixed point;
+  the output must say which.  Oracle: batch-by-batch counts equal one
+  full count over the union, bit for bit.
+- **Weights and forgetting (A2).**  A row weight (a column named in
+  `declare_attribute` or per model) that multiplies a row's contribution
+  to the counts, and a decay applied to stored counts before a batch is
+  added (`half_life` per factor or model, in the unit of a declared time
+  column).  Oracle: weighted counts against SQL `sum(weight)` grouped by
+  cell; decay against the closed form.
+- **Last round's posterior as this round's prior (A3).**
+  `gaps.prior_from(model_new, model_old, scale)` sets each factor's
+  prior to `scale` x the old model's stored counts plus its prior, for
+  factors that match by name and shape; refuses a shape mismatch, naming
+  the factor.  Together with frozen factors this is the Bayesian update
+  between rounds.
+- **Per-entity answers for review and labelling (A6, A7).**
+  `gaps.explain(model, rel, entities, attname)`: for each requested
+  entity, the change in the target's posterior log-odds when each
+  factor's observed child is removed from the evidence (exact for any
+  network, one restricted inference per factor per entity, so bounded by
+  the number of factors); for naive-Bayes-shaped models it equals the
+  familiar per-feature log-likelihood ratio.  Entropy and margin per
+  entity as columns of a `gaps.uncertainty(...)` call, or a documented
+  query over `marginals`; expected information gain about a factor is
+  later.
+- **Diagnostics per factor and slice (A5).**
+  `gaps.factor_report(model, rel, entities, group_by)`: per factor and
+  per group of rows, the mutual information between the child and its
+  parents under the current CPTs given the evidence, the average log
+  likelihood of the observed child, and the divergence of the observed
+  child's distribution from what the CPTs predict for those rows (KL, and
+  a chi-square p-value).  An evaded feature shows as information falling
+  toward zero, or labelled and unlabelled slices parting.
+- **Soft evidence (A8).**  Virtual evidence: an observed attribute may
+  carry a likelihood vector per row (a column of `P(value)`), entered in
+  inference as a likelihood factor on the variable and in learning as
+  fractional counts.  Needs an engine change (evidence as a factor, not a
+  clamp).  Oracle: brute force over worlds with the likelihood weights,
+  and pgmpy's virtual evidence.
+- **Fitting logistic and noisy-OR weights (A9).**  Maximum a posteriori
+  weights with a Gaussian prior (L2, or centred on last round's weights),
+  inside EM's M-step for models with latent variables; aggregate-slot
+  noisy-OR with person-level labels first, since that is the case named.
+  Oracle: scikit-learn's logistic regression on complete data; a
+  brute-force likelihood maximiser on small noisy-OR models.
+
+Nothing here logs, dumps or exports model contents outside the catalog:
+feature definitions and fitted CPTs are an evasion guide, and any export
+added later is opt-in (pg.ddx.io's request).
+
 ## Phase 8: release engineering
 
 Before 1.0: `make dist` from `git archive` with `.gitattributes`
