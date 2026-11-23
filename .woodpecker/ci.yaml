@@ -12,6 +12,17 @@ when:
     branch: main
   - event: pull_request
 
+# The upgrade test builds the 0.1.0 starting points from their commits,
+# so the clone needs the whole history; ci/pgdg.sh also unshallows a
+# shallow clone.
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      partial: false
+      depth: 0
+      tags: true
+
 matrix:
   PG:
     - 17

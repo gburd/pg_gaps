@@ -72,11 +72,38 @@
           })
           { };
 
+        # The two 0.1.0 starting points test/upgrade/run.sh updates from,
+        # each built from its own commit (test/upgrade/stage.sh).  Fetched
+        # from the GitHub mirror, since the flake's own source holds no git
+        # history.
+        oldSrc = rev: hash: pkgs.fetchFromGitHub {
+          owner = "gburd";
+          repo = "pg_gaps";
+          inherit rev hash;
+        };
+        v010Src = oldSrc "db040647e79b2354d4dfbef06fd09e92a112101c"
+          "sha256-GgkOe0mrEo+klplkjVTuzHYgSxdRqk1RulkOsA3r4iI=";
+        d35680cSrc = oldSrc "d35680cc3303e9791465256bfa9f5d8feb5615c2"
+          "sha256-600Rqs+fBvoqiXEtUQq5VRX8GUXM46wonldrsMexVcA=";
+        upgradeFixturesFor = pg: pkgs.stdenv.mkDerivation {
+          name = "pg_gaps-upgrade-fixtures-${pg.version}";
+          inherit src;
+          nativeBuildInputs = [ pg.pg_config pkgs.clang ];
+          dontConfigure = true;
+          dontInstall = true;
+          buildPhase = ''
+            runHook preBuild
+            bash test/upgrade/stage.sh ${pg.pg_config}/bin/pg_config "$TMPDIR/upgrade" \
+              "$out/lib" "$out/share/postgresql/extension" ${v010Src} ${d35680cSrc}
+            runHook postBuild
+          '';
+        };
+
         # Run REGRESS against a throwaway server that has pg_gaps installed.
         # pg_regress comes from the plain server's PGXS; the server it talks
         # to is the withPackages wrapper, which can load the extension.
         installcheckFor = pg:
-          let pgWith = pg.withPackages (_: [ (buildFor pg) ]);
+          let pgWith = pg.withPackages (_: [ (buildFor pg) (upgradeFixturesFor pg) ]);
           in pkgs.stdenv.mkDerivation {
             name = "pg_gaps-installcheck-${pg.version}";
             inherit src;
@@ -92,6 +119,9 @@
               make installcheck PG_CONFIG=${pg.pg_config}/bin/pg_config \
                 || { cat regression.diffs 2>/dev/null; cat "$TMPDIR/server.log"; exit 1; }
               PGDATABASE=postgres bash test/dump/run.sh \
+                || { cat "$TMPDIR/server.log"; exit 1; }
+              PGDATABASE=postgres PG_GAPS_EXTDIR=${pgWith}/share/postgresql/extension \
+                bash test/upgrade/run.sh \
                 || { cat "$TMPDIR/server.log"; exit 1; }
               pg_ctl -D "$PGDATA" -w stop
               touch $out

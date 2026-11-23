@@ -123,7 +123,11 @@ are specific to probabilistic inference.
     `pg_gaps--<old>--<new>.sql` upgrade edge. The version lives in
     `pg_gaps.control`; the Makefile and flake read it from there.
     `META.json` (PGXN) repeats it and `make check-meta`, run by the flake
-    and CI, fails until the two agree.
+    and CI, fails until the two agree.  The old version becomes a
+    starting point of `test/upgrade` (stage.sh builds its library from
+    its commit), which fails unless the update leaves exactly the new
+    install script's objects and the same marginals.  An update script
+    never GRANTs on a table that already exists.
 26. **Do not commit the papers.** They are the publishers' copyright;
     cite them by URL.
 

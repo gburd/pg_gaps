@@ -1293,6 +1293,67 @@ The estimate also uses `reltuples` as `ANALYZE` or `VACUUM` stored it,
 without the planner's scaling by the table's current size, so after a bulk
 load without `ANALYZE` it lags the planner's own row count for the table.
 
+### Upgrades and the version check
+
+An installed pg_gaps is two things that a package update can separate:
+the library, replaced at once for every database, and the SQL objects
+in each database, which change only at `ALTER EXTENSION pg_gaps UPDATE`.
+Each release ships an update script from the previous one, and
+`test/upgrade` holds it to two properties: the updated database's
+extension objects equal a fresh install's (functions by definition,
+columns, constraints, triggers, policies, extension membership), and
+every model's marginals are bit for bit what the old version returned.
+"0.1.0" names two catalogs, the release (v0.1.0) and the pre-release
+d35680c that pg.ddx.io runs in production; the one update script handles
+both, by adding what is missing (`IF NOT EXISTS`) and dropping by exact
+signature the functions either one had in a different shape.
+
+The update grants nothing on existing tables, so a DBA's `REVOKE`
+survives it.  A function it has to drop and create again regains
+PUBLIC's default `EXECUTE`; the update script and `CHANGELOG.md` list
+those, and nothing else changes privileges.
+
+Between the package update and `ALTER EXTENSION`, the new library would
+be called by the old SQL with arguments it does not expect.  So each C
+entry point (`_infer`, `_expected_counts`, `_param_cpts`, `_param_size`)
+first compares `PG_GAPS_VERSION` with the installed extension's
+`extversion`, read from `pg_extension` and cached for the backend until
+an invalidation of `pg_extension` arrives, and refuses a mismatch with an
+`ERROR` naming both versions and the hint to update.  `ALTER EXTENSION`
+writes the new `extversion` before it runs the script, so the update's
+own calls pass.  The planner support function never fails: on a mismatch
+it gives no estimate and the declared `ROWS` applies.  The cache's
+invalidation is the syscache on `pg_extension.oid`, which PostgreSQL 17
+has only from 17.8 (back-patched from 18).  Built against an earlier 17,
+the library caches nothing and reads `extversion` on every call (one
+index scan on `pg_extension_name_index`; on a 16-marginal model, 12.0 to
+13.5 ms per `marginals` call with the cache and 11.8 to 12.8 ms without,
+six pgbench runs of 3000 calls per build, so the difference is under
+the noise).  Only calls that reach the C library are checked: SQL-only
+paths of the old SQL, such as `learn_cpts` with method 'counts', run
+unchecked, and give the answers the old version would.
+
+The check sees only the library a backend has loaded.  A backend that
+loaded the old library before the package update keeps it mapped until
+it exits, and after the update runs the new SQL on the old library:
+calls to C functions the old library lacks fail, and an `ALTER
+EXTENSION` from such a backend fails while it validates the new C
+functions, so it rolls back.  The 0.1.0 libraries have no check at all.
+So the update procedure is: install the files, close every existing
+connection (poolers included) or restart the server, then `ALTER
+EXTENSION pg_gaps UPDATE` from a new connection.  From 0.2.0 on, the
+check also covers the reverse: a backend still holding the 0.2.0
+library refuses the next release's SQL.
+
+The update drops, without `CASCADE`, every function whose arguments or
+result columns changed.  A user view or SQL function over one of them
+makes `ALTER EXTENSION` fail with "cannot drop function ... because
+other objects depend on it", and the transaction rolls back whole.  The
+script does not try to save and recreate such objects: their meaning
+may depend on the result columns that changed.  Users drop them first
+and recreate them after; `test/upgrade/run.sh` checks the clean
+failure.
+
 ### Security
 
 The extension is **not trusted** (`trusted = false`, the default) until a

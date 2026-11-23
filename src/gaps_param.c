@@ -69,7 +69,8 @@ get_ints(FunctionCallInfo fcinfo, int arg, const char *what, int **out)
 		ereport(ERROR,
 				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 				 errmsg("%s must be a one-dimensional array", what)));
-	deconstruct_array_builtin(a, INT4OID, &d, &nulls, &n);
+	/* Not deconstruct_array_builtin: before 17.8 it does not know INT4OID. */
+	deconstruct_array(a, INT4OID, sizeof(int32), true, TYPALIGN_INT, &d, &nulls, &n);
 	*out = palloc(sizeof(int) * (n ? n : 1));
 	for (int i = 0; i < n; i++)
 	{
@@ -94,7 +95,8 @@ get_floats(FunctionCallInfo fcinfo, int arg, const char *what, double **out)
 		ereport(ERROR,
 				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 				 errmsg("%s must be a one-dimensional array", what)));
-	deconstruct_array_builtin(a, FLOAT8OID, &d, &nulls, &n);
+	deconstruct_array(a, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE,
+					  &d, &nulls, &n);
 	*out = palloc(sizeof(double) * (n ? n : 1));
 	for (int i = 0; i < n; i++)
 	{
@@ -465,6 +467,7 @@ gaps_param_cpts(PG_FUNCTION_ARGS)
 	ExpandedRecordHeader *erh;
 	Datum		values[7];
 
+	gaps_check_version(true);
 	for (int i = 0; i < 11; i++)
 		if (PG_ARGISNULL(i))
 			ereport(ERROR,
@@ -552,6 +555,7 @@ gaps_param_size(PG_FUNCTION_ARGS)
 	Datum		values[3];
 	bool		nulls[3] = {0};
 
+	gaps_check_version(true);
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "gaps._param_size must return a record");
 	fname = text_to_cstring(PG_GETARG_TEXT_PP(0));

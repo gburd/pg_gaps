@@ -1,6 +1,71 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (unreleased)
+
+**Updating from 0.1.0.**  Install the 0.2.0 package.  Then close every
+existing connection (restart the server, or at least restart connection
+poolers and long-lived clients), because a backend that has loaded the
+0.1.0 library keeps it until it exits: such a backend running 0.2.0's
+SQL can fail with "could not find function gaps_param_size", and an
+`ALTER EXTENSION` run from it fails with "could not find function
+gaps_expected_counts" and changes nothing.  Then run, in every database
+that has the extension, from a new connection:
+
+    ALTER EXTENSION pg_gaps UPDATE;
+
+A view or SQL function of yours over `gaps.marginals`, `gaps.impute`,
+`gaps.learn_cpts`, `gaps.create_model`, `gaps.declare_attribute` or
+`gaps.add_factor` stops the update, since 0.2.0 drops and recreates
+those (their arguments or result columns changed).  The update fails
+with, for example:
+
+    ERROR:  cannot drop function marginals(text) because other objects depend on it
+    DETAIL:  view public.scores depends on function marginals(text)
+
+and changes nothing: the extension stays at 0.1.0.  Drop such views
+before the update and create them again after it.  From d35680c,
+`marginals` and `impute` return 8 columns where they returned 6 or 7,
+so a `SELECT *` view gets new columns when you recreate it.
+
+Models, CPTs, priors, parameters and composite members are kept, and
+every model returns the same marginals, bit for bit, as before the update
+(`test/upgrade`).  Existing factors become `kind` 'cpt', not frozen, with
+no prior; attributes have no bin edges; models have no lineage.  Until a
+database is updated, the 0.2.0 library refuses to run under its 0.1.0
+SQL: every call that reaches the C library fails with "pg_gaps library
+0.2.0 is loaded but the extension's SQL is 0.1.0" and a hint to run
+`ALTER EXTENSION pg_gaps UPDATE`.  Under the released 0.1.0's SQL those
+are `marginals`, `impute`, `learn_cpts` with method 'em', and
+`cpt_rows` or grounding of a logistic or noisy-OR factor; under
+d35680c's, `marginals` and `impute`.  `learn_cpts` with method 'counts'
+(the default) and the functions that edit the model run in SQL alone
+and keep working under the old SQL.  On PostgreSQL 17.0 to 17.7, which
+lack a system cache on `pg_extension`, the library reads `extversion`
+on each such call instead of once per backend; that costs one index
+scan, too little to measure next to inference.  (Before, the new library
+called by the old SQL failed with "gaps._infer arguments must not be
+NULL", or worse.)
+
+PostgreSQL 17.0 to 17.7 work again.  0.1.0 built there but its C
+functions failed at the first call with "type 23 not supported by
+deconstruct_array_builtin()", because that function learned `int4` only
+in 17.8.  The library now unpacks its arrays with `deconstruct_array`;
+the regression suite and the dump test pass on a 17.7 server.
+
+The same update handles both catalogs that were installed as 0.1.0: the
+release (tag v0.1.0) and the earlier pre-release d35680c, which pg.ddx.io
+runs.  d35680c has no `gaps.model_member`; the update creates it.
+
+Privileges: the update grants nothing on a table that already exists, so
+a `REVOKE` on a catalog table survives it.  It grants PUBLIC the same
+rights on `gaps.model_member` as on the other catalog tables only when it
+creates that table (from d35680c); revoke them again if you revoked the
+others.  Functions whose arguments or results changed are dropped and
+created again, and so are executable by PUBLIC afterwards: from the
+release, `gaps.create_model` and `gaps.learn_cpts`; from d35680c also
+`gaps.declare_attribute`, `gaps.add_factor`, `gaps.marginals` and
+`gaps.impute`.  Repeat any `REVOKE EXECUTE` you made on those.  Every
+other function keeps its privileges.
 
 Grounding capacity (pg.ddx.io N1).  A model whose ground network passed
 1 GB in total failed after minutes with "tuple is too big", because

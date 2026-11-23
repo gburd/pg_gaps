@@ -20,7 +20,7 @@ EXTVERSION = $(shell sed -n "s/^default_version *= *'\(.*\)'/\1/p" $(srcdir)/$(E
 MODULE_big = pg_gaps
 OBJS = src/pg_gaps.o src/gaps_infer.o src/gaps_param.o src/gaps_support.o \
 	src/engine/gx.o src/engine/gx_param.o
-DATA = $(EXTENSION)--$(EXTVERSION).sql
+DATA = $(EXTENSION)--$(EXTVERSION).sql $(EXTENSION)--0.1.0--0.2.0.sql
 PGFILEDESC = "pg_gaps - probabilistic graphical models over incomplete relations"
 
 PG_CPPFLAGS = -DPG_GAPS_VERSION=\"$(EXTVERSION)\" -I$(srcdir)/src
