@@ -2958,7 +2958,11 @@ $$;
 -- EM stops").  The factor has settled when its newest step is 0, or when
 -- that step and the bound are both at most tol with r below 1; requiring
 -- the step itself to be within tol keeps a rate that is low by accident
--- from stopping a factor still moving by more than tol.
+-- from stopping a factor still moving by more than tol.  A factor whose
+-- four newest steps are all below 1e-12 has also settled: once converged
+-- its cells move only by rounding (1e-16 to 1e-13), whose ratios hover
+-- near 1, and waiting for them to look like a contraction kept mixed
+-- models running to max_iterations.
 CREATE FUNCTION gaps._em_settled(steps float8[], tol float8) RETURNS boolean
 LANGUAGE sql IMMUTABLE
 SET search_path = pg_catalog
@@ -2966,6 +2970,8 @@ AS $$
 	SELECT CASE
 		WHEN coalesce(cardinality(steps), 0) < 1 THEN false
 		WHEN steps[1] = 0 THEN true
+		WHEN cardinality(steps) >= 4 AND steps[1] <= tol
+			 AND greatest(steps[1], steps[2], steps[3], steps[4]) < 1e-12 THEN true
 		WHEN cardinality(steps) < 4 OR steps[1] > tol
 			 OR steps[2] = 0 OR steps[3] = 0 THEN false
 		ELSE (SELECT r < 1 AND steps[1] * r / (1 - r) <= tol
@@ -3048,9 +3054,11 @@ BEGIN
 			IF state IS NULL THEN
 				RAISE;
 			END IF;
-			RAISE EXCEPTION 'the observed values have probability zero under the model, whose '
-				'frozen factors % have zero entries', state
+			RAISE EXCEPTION 'the observed values have probability zero under the model''s '
+				'fixed factors'
 				USING ERRCODE = '22000',
+					  DETAIL = format('Frozen factors with zero entries: %s.  A parameterised '
+									  'factor can also give probability zero.', state),
 					  HINT = 'Thaw them with gaps.set_frozen, or set CPTs without zeros.';
 		END;
 		-- A WARNING, not a NOTICE, and the result says so too: the start

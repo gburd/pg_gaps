@@ -880,7 +880,10 @@ and is deferred, so `drop_model`'s own cascade finishes first.
 `drop_factor` checks it at once by setting it IMMEDIATE inside a
 subtransaction that it then rolls back, which restores whatever mode the
 caller had; the error is then the foreign key's, naming nothing the
-caller cannot see.
+caller cannot see.  Note that setting the constraint IMMEDIATE checks
+every pending row of it in the transaction, so a caller with its own
+unfinished `gaps.factor_parent` changes may see their violation reported
+by `drop_factor(..., cascade => true)`.
 
 **Lineage.**  `gaps.model.parent` and `gaps.model.note`, set by
 `create_model(name, parent => ..., note => ...)` or

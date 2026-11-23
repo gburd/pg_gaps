@@ -244,7 +244,7 @@ SELECT gaps.set_frozen('lt', 'pb', true);
 (1 row)
 
 SELECT * FROM gaps.learn_cpts('lt', 0, 'em');                   -- fail
-ERROR:  the observed values have probability zero under the model, whose frozen factors "pb" have zero entries
+ERROR:  the observed values have probability zero under the model's fixed factors
 SELECT gaps.set_frozen('lt', 'pb', false);
  set_frozen 
 ------------
