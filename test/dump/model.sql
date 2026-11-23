@@ -1,7 +1,7 @@
 -- The model test/dump/run.sh dumps and restores.  It exercises every
 -- catalog table: stripe predicates, a vertical factor with a mapping, a
--- horizontal factor, a coarse entity set, a binned attribute, a prior and
--- learned CPTs.
+-- horizontal factor, a coarse entity set, a binned attribute, a prior,
+-- learned CPTs, a frozen factor and a model's lineage.
 SET client_min_messages = warning;
 CREATE EXTENSION pg_gaps;
 
@@ -40,6 +40,8 @@ SELECT gaps.add_stripe('dump', 'lux', 'reading', 'lux');
 SELECT gaps.add_factor('dump', 'lux', 'lux', '{}');
 SELECT gaps.set_prior('dump', 'light', ARRAY[2, 0.5, 0.25, 3]);
 SELECT * FROM gaps.learn_cpts('dump');
+SELECT gaps.set_frozen('dump', 'occ', true);
+SELECT gaps.set_lineage('dump', 'dump0', 'round 2, refit from dump0');
 
 -- A composite over model dump: a building's alarm as a noisy-OR of every
 -- room's occupancy in it (an aggregating parent of a member's stripe),

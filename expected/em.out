@@ -194,13 +194,37 @@ WHERE d IS NOT NULL GROUP BY a ORDER BY a;
   50 |     9 | t       | t        | t
 (4 rows)
 
--- And it converges: by 500 iterations an iteration changes the objective
--- by at most 1e-6 of its size.
-SELECT DISTINCT method, converged, iterations < 500 AS early
-FROM gaps.learn_cpts('h', 1, 'em', 500);
- method | converged | early 
---------+-----------+-------
- em     | t         | t
+-- And it converges, slowly: P(a) moves by about 0.3 over hundreds of
+-- iterations whose objective changes are each below 1e-3 nats, so a rule
+-- on the objective stops early.  The rule on the cells runs until every
+-- cell is within 1e-6 of the fixed point.
+SELECT DISTINCT method, converged, iterations > 500 AS slow, iterations < 2000 AS early,
+	   abs(last_change) < 1e-9 AS small_change
+FROM gaps.learn_cpts('h', 1, 'em', 2000);
+ method | converged | slow | early | small_change 
+--------+-----------+------+-------+--------------
+ em     | t         | t    | t     | t
+(1 row)
+
+-- Its first M-step jumps by 0.8 and the next by 9e-4, so a rate taken
+-- from that pair is near 0: such a rule stopped here after 2 iterations,
+-- 0.16 from the fixed point, at every tol from 1e-2 to 1e-3.  tol 1e-3
+-- has to stop within about 1e-3 of the run above.
+CREATE TEMP TABLE h_fixed AS SELECT name, cpt FROM gaps.factor
+WHERE model_id = gaps._model_id('h');
+SELECT DISTINCT converged, iterations > 100 AS iterated
+FROM gaps.learn_cpts('h', 1, 'em', tol => 1e-3);
+ converged | iterated 
+-----------+----------
+ t         | t
+(1 row)
+
+SELECT max(abs(x - y)) BETWEEN 1e-4 AND 1.1e-3 AS near_1e3
+FROM gaps.factor f JOIN h_fixed p USING (name), unnest(f.cpt, p.cpt) u(x, y)
+WHERE f.model_id = gaps._model_id('h');
+ near_1e3 
+----------
+ t
 (1 row)
 
 -- A tiny positive pseudocount keeps its cells positive, and EM's
@@ -470,6 +494,146 @@ SELECT gaps.drop_model('lc');
  
 (1 row)
 
+-- pg.ddx.io's scale problem in small: a latent class with three children,
+-- 4,000 rows of which 100 are labelled, drawn from planted CPTs.  The
+-- default tol stops when every cell is within 1e-6 of EM's fixed point,
+-- which a run to tol 1e-13 gives.
+SELECT setseed(0.42);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE lk (id int PRIMARY KEY, a text, b text, c text, d text);
+INSERT INTO lk
+SELECT g, CASE WHEN g <= 100 THEN (ARRAY['s', 't'])[a] END,
+	   (ARRAY['1', '2', '3'])[CASE WHEN u1 < p1 THEN 1 WHEN u1 < 0.9 THEN 2 ELSE 3 END],
+	   (ARRAY['1', '2', '3'])[CASE WHEN u2 < p2 THEN 1 WHEN u2 < 0.8 THEN 2 ELSE 3 END],
+	   (ARRAY['1', '2'])[CASE WHEN u3 < p3 THEN 1 ELSE 2 END]
+FROM (SELECT g, a, random() AS u1, random() AS u2, random() AS u3,
+			 CASE a WHEN 1 THEN 0.7 ELSE 0.1 END AS p1, CASE a WHEN 1 THEN 0.2 ELSE 0.5 END AS p2,
+			 CASE a WHEN 1 THEN 0.3 ELSE 0.8 END AS p3
+	  FROM (SELECT g, CASE WHEN random() < 0.3 THEN 1 ELSE 2 END AS a
+			FROM generate_series(1, 4000) g) x) y;
+SELECT gaps.create_model('lk');
+ create_model 
+--------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('lk', 'lk', 'a', ARRAY['s', 't']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.declare_attribute('lk', 'lk', x, ARRAY['1', '2', '3']) FROM unnest(ARRAY['b', 'c']) x;
+ declare_attribute 
+-------------------
+ 
+ 
+(2 rows)
+
+SELECT gaps.declare_attribute('lk', 'lk', 'd', ARRAY['1', '2']);
+ declare_attribute 
+-------------------
+ 
+(1 row)
+
+SELECT gaps.add_stripe('lk', x, 'lk', x) FROM unnest(ARRAY['a', 'b', 'c', 'd']) x;
+ add_stripe 
+------------
+ 
+ 
+ 
+ 
+(4 rows)
+
+SELECT gaps.add_factor('lk', 'pa', 'a');
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT gaps.add_factor('lk', 'p' || x, x, ARRAY['a']) FROM unnest(ARRAY['b', 'c', 'd']) x;
+ add_factor 
+------------
+ 
+ 
+ 
+(3 rows)
+
+SELECT DISTINCT method, converged, iterations > 2 AS iterated, loglik < -5000 AS scale
+FROM gaps.learn_cpts('lk', 1, 'em', 5000, 1e-13);
+ method | converged | iterated | scale 
+--------+-----------+----------+-------
+ em     | t         | t        | t
+(1 row)
+
+CREATE TEMP TABLE fixed_point AS SELECT name, cpt FROM gaps.factor
+WHERE model_id = gaps._model_id('lk');
+SELECT DISTINCT method, converged, last_change > 0 AND last_change < 1e-4 AS last_change_ok
+FROM gaps.learn_cpts('lk', 1, 'em');
+ method | converged | last_change_ok 
+--------+-----------+----------------
+ em     | t         | t
+(1 row)
+
+SELECT count(*) AS cells, max(abs(x - y)) < 1e-6 AS at_fixed_point,
+	   max(abs(x - y)) > 0 AS not_identical
+FROM gaps.factor f JOIN fixed_point p USING (name), unnest(f.cpt, p.cpt) u(x, y)
+WHERE f.model_id = gaps._model_id('lk');
+ cells | at_fixed_point | not_identical 
+-------+----------------+---------------
+    18 | t              | t
+(1 row)
+
+-- tol is on probabilities: 1e-3 and 1e-2 stop sooner, further from it,
+-- but within tol.  The rate is still rising here, which the estimate
+-- allows for (gaps._em_settled).
+SELECT DISTINCT converged FROM gaps.learn_cpts('lk', 1, 'em', tol => 1e-2);
+ converged 
+-----------
+ t
+(1 row)
+
+SELECT max(abs(x - y)) BETWEEN 1e-3 AND 1e-2 AS near_1e2
+FROM gaps.factor f JOIN fixed_point p USING (name), unnest(f.cpt, p.cpt) u(x, y)
+WHERE f.model_id = gaps._model_id('lk');
+ near_1e2 
+----------
+ t
+(1 row)
+
+SELECT DISTINCT converged FROM gaps.learn_cpts('lk', 1, 'em', tol => 1e-3);
+ converged 
+-----------
+ t
+(1 row)
+
+SELECT max(abs(x - y)) BETWEEN 1e-4 AND 1e-3 AS near_1e3
+FROM gaps.factor f JOIN fixed_point p USING (name), unnest(f.cpt, p.cpt) u(x, y)
+WHERE f.model_id = gaps._model_id('lk');
+ near_1e3 
+----------
+ t
+(1 row)
+
+-- One M-step has no step before it to estimate the rate from.
+SELECT DISTINCT iterations, converged, last_change > 0 AS climbed
+FROM gaps.learn_cpts('lk', 1, 'em', 1);
+ iterations | converged | climbed 
+------------+-----------+---------
+          1 | f         | t
+(1 row)
+
+DROP TABLE lk;
+SELECT gaps.drop_model('lk');
+ drop_model 
+------------
+ 
+(1 row)
+
 -- On complete data the E-step returns the counts, so EM stops after one
 -- iteration with the counting answer.
 CREATE TABLE c (id int PRIMARY KEY, a text, b text);
@@ -517,10 +681,10 @@ SELECT gaps.add_factor('c', 'pb', 'b', ARRAY['a']);
 (1 row)
 
 SELECT * FROM gaps.learn_cpts('c', 1) ORDER BY factor;
- factor | complete_entities | method | iterations | loglik | converged 
---------+-------------------+--------+------------+--------+-----------
- pa     |                 3 | counts |          0 |        | 
- pb     |                 3 | counts |          0 |        | 
+ factor | complete_entities | method | iterations | loglik | converged | last_change 
+--------+-------------------+--------+------------+--------+-----------+-------------
+ pa     |                 3 | counts |          0 |        |           |            
+ pb     |                 3 | counts |          0 |        |           |            
 (2 rows)
 
 CREATE TEMP TABLE counted AS SELECT name, cpt FROM gaps.factor

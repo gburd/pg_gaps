@@ -12,11 +12,38 @@ travel the same way.  The limit that remains, 2^26 variables (auxiliary
 variables included) or parent links per call, 134M table cells, and
 1 GB per array, is checked before any table is built, the parameterised
 factors' tables sized but not built, an `ERROR` naming the model with a
-hint to split or restrict it.  4 noisy-OR factors over 1M rows failed
+hint to split the model.  4 noisy-OR factors over 1M rows failed
 after 182 s with an unnamed "array size exceeds the maximum allowed" and
 now get that `ERROR` after 167 s, before any table is built; over 980k
 rows (1.07 GB of cells) they ground (doc/DESIGN.md, "Grounding
 capacity").
+
+EM's stopping rule changed meaning.  `learn_cpts(..., 'em', tol)` used to
+stop when an iteration changed the objective by at most tol times
+|objective|, which at pg.ddx.io's scale (|loglik| about 5e4) stopped
+after a few iterations with CPT cells 2e-3 to 4e-3 from EM's fixed point
+and `converged` true.  tol is now an absolute tolerance on probabilities:
+EM stops when every CPT cell is estimated to be within tol of the fixed
+point (per factor, from the rate of its last steps; doc/DESIGN.md "When
+EM stops").  The default tol stays 1e-6 and now means that; `max_iterations`
+defaults to 500 (was 50), since the stricter rule runs 70 to 80
+iterations on that shape and a model with little labelled data can need
+hundreds.  A new output column, `last_change`, is the objective's change
+over the last M-step in nats.
+
+`gaps.set_frozen(model, factor, frozen)` and `gaps.factor.frozen`:
+`learn_cpts` keeps a frozen factor's CPT and reports it as
+'fixed (frozen)'; EM conditions on it, and a frozen CPT that rules out
+observed values is an error naming it.  `gaps.drop_factor(model,
+factor)` removes a factor and leaves its attribute and stripes, so a
+replacement can be added after it; with `cascade => true` it also
+removes the attribute (or, for a split attribute, the factor's stripe)
+when nothing else uses it.  `gaps.model.parent` and `gaps.model.note` record a model's
+lineage, set by `create_model(name, parent, note)` or
+`gaps.set_lineage`.  `gaps.factor_parent.parent_stripe` no longer
+cascades on delete (constraint `factor_parent_parent_stripe_fkey`,
+deferred), so a stripe that some factor still uses as a parent cannot be
+removed under it.
 
 ## 0.1.0 (2026-11-22)
 
