@@ -2675,8 +2675,8 @@ BEGIN
 			'variables and as many parent links, and 134217724 table cells, in arrays of at '
 			'most 1 GB.', nvars, natt, nvars / greatest(natt, 1)),
 			HINT = 'Split the model into smaller models (for example one per value of a '
-				'parent), restrict the call with rel and entities, or learn each part with '
-				'its own model.';
+				'parent).  marginals and impute can also be restricted to some entities '
+				'with rel and entities; learn_cpts cannot.';
 END
 $$;
 
