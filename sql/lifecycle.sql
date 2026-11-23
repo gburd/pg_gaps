@@ -89,6 +89,14 @@ SELECT gaps.set_frozen('lt', 'pa', NULL);                       -- fail
 SELECT gaps.add_factor('lt', 'pd0', 'b');
 SELECT gaps.set_frozen('lt', 'pd0', true);                      -- fail: no CPT
 DELETE FROM gaps.factor WHERE name = 'pd0';
+-- A frozen CPT that rules out observed values: EM's add-one start cannot
+-- help, and the error names the frozen factor.
+SELECT cpt AS pb_cpt FROM gaps.factor WHERE name = 'pb' \gset
+SELECT gaps.set_cpt('lt', 'pb', ARRAY[1, 0, 1, 0]);
+SELECT gaps.set_frozen('lt', 'pb', true);
+SELECT * FROM gaps.learn_cpts('lt', 0, 'em');                   -- fail
+SELECT gaps.set_frozen('lt', 'pb', false);
+SELECT gaps.set_cpt('lt', 'pb', :'pb_cpt');
 
 -- Adding a child to a learned model and fitting only it: freeze the rest,
 -- add d, learn.  The frozen factors are unchanged bit for bit.
@@ -106,20 +114,29 @@ FROM gaps.factor f JOIN learned l USING (name) WHERE f.model_id = gaps._model_id
 -- d is y whenever a is s, so P(d = y | a = s) is near 1.
 SELECT cpt[2] > 0.9 AS learned_d FROM gaps.factor WHERE name = 'pd';
 
--- Retiring a feature: dropping pd removes it, and d with it (nothing else
--- covers d), and the model still answers.
-SET client_min_messages = notice;
+-- Replacing a factor: drop_factor removes the factor only, d and its
+-- stripe stay, grounding reports d's values uncovered until a new factor
+-- covers them.
 SELECT gaps.drop_factor('lt', 'pd');
+SELECT count(*) AS d_attribute, (SELECT count(*) FROM gaps.stripe WHERE name = 'd') AS d_stripe
+FROM gaps.attribute WHERE attname = 'd';
+SELECT count(*) FROM gaps.marginals('lt');                      -- fail: uncovered
+SELECT gaps.add_factor('lt', 'pd', 'd', ARRAY['a'], ARRAY[0.5, 0.5, 0.1, 0.9]);
+SELECT count(DISTINCT attname) FROM gaps.marginals('lt');
+-- Retiring a feature: with cascade, d goes too (nothing else covers it),
+-- and the model still answers.
+SELECT gaps.drop_factor('lt', 'pd', cascade => true);
 SELECT count(*) AS d_attribute FROM gaps.attribute WHERE attname = 'd';
 SELECT count(DISTINCT attname) FROM gaps.marginals('lt');
--- A factor whose child is another factor's parent cannot go.
-SELECT gaps.drop_factor('lt', 'pa');                            -- fail
+-- With cascade, a factor whose child is another factor's parent cannot go.
+SELECT gaps.drop_factor('lt', 'pa', cascade => true);           -- fail
 SELECT gaps.drop_factor('lt', 'nosuch');                        -- fail
+SELECT gaps.drop_factor('lt', 'pa', NULL);                      -- fail
 
 -- Replacing a factor over part of an attribute: c splits into two stripes.
 -- Dropping one stripe's factor leaves its values uncovered, which
 -- grounding reports; a new factor over the stripe covers them again.
-SELECT gaps.drop_factor('lt', 'pc');
+SELECT gaps.drop_factor('lt', 'pc', cascade => true);
 SELECT gaps.declare_attribute('lt', 'lt', 'c', ARRAY['1', '2']);
 SELECT gaps.add_stripe('lt', 'c_lo', 'lt', 'c');
 SELECT gaps.add_stripe_qual('lt', 'c_lo', 'id', '<=', '300');
@@ -131,6 +148,17 @@ SELECT gaps.drop_factor('lt', 'pc_hi');
 SELECT count(*) FROM gaps.marginals('lt');                      -- fail: uncovered
 SELECT gaps.add_factor('lt', 'pc_hi2', 'c_hi', ARRAY['a'], ARRAY[0.3, 0.7, 0.6, 0.4]);
 SELECT count(DISTINCT attname) FROM gaps.marginals('lt');
+-- With cascade, a split attribute loses only the dropped factor's
+-- stripe.  drop_factor leaves the caller's constraint mode alone: with
+-- the foreign key IMMEDIATE before it, deleting a stripe still in use as
+-- a parent fails at once after it.
+BEGIN;
+SET CONSTRAINTS ALL IMMEDIATE;
+SELECT gaps.drop_factor('lt', 'pc_hi2', cascade => true);
+SELECT array_agg(s.name ORDER BY s.name) AS c_stripes
+FROM gaps.stripe s JOIN gaps.attribute a USING (attribute_id) WHERE a.attname = 'c';
+DELETE FROM gaps.stripe WHERE name = 'a';                       -- fail
+ROLLBACK;
 
 -- A member's factor that a composite's factor uses as a parent cannot go.
 CREATE TABLE grp (g int PRIMARY KEY, z text);
@@ -143,9 +171,9 @@ SELECT gaps.add_stripe('top', 'z', 'grp', 'z');
 SELECT gaps.add_factor('top', 'pz', 'z', ARRAY['lt.b'], kind => 'noisy_or',
 					   params => ARRAY[0.1, 0.5], aggregate => ARRAY[true]);
 SELECT gaps.map_factor('top', 'pz', 1, 'g', 'g');
-SELECT gaps.drop_factor('lt', 'pb');                            -- fail: composite
+SELECT gaps.drop_factor('lt', 'pb', cascade => true);           -- fail: composite
 SELECT gaps.drop_factor('top', 'pz');
-SELECT gaps.drop_factor('lt', 'pb');
+SELECT gaps.drop_factor('lt', 'pb', cascade => true);
 SELECT count(*) AS b_attribute FROM gaps.attribute WHERE attname = 'b';
 SELECT gaps.drop_model('top');
 
@@ -172,7 +200,7 @@ SELECT gaps.map_factor('theirs', 'pz', 1, 'g', 'g');
 SET ROLE gaps_a;
 SELECT count(*) AS visible_models FROM gaps.model;
 \set VERBOSITY sqlstate
-SELECT gaps.drop_factor('mine', 'pb');                          -- fail: 23503
+SELECT gaps.drop_factor('mine', 'pb', cascade => true);         -- fail: 23503
 \set VERBOSITY terse
 SELECT count(*) AS still_there FROM gaps.factor WHERE name = 'pb';
 SET ROLE gaps_b;

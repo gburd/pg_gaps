@@ -744,31 +744,60 @@ pseudocounts 0.5, 1, 3 and 50.
 
 **When EM stops.**  `tol` is an absolute tolerance on probabilities: EM
 stops when every CPT cell is estimated to be within `tol` of its fixed
-point.  Near a fixed point EM converges linearly, each M-step moving the
-cells by about r times the step before, for a rate r below 1 set by the
-share of missing information; the cells are then within step * r / (1 -
-r) of the fixed point, where step is the last M-step's largest change in
-any cell and r is estimated as step over the step before.  EM stops when
-that bound and step itself are both at most `tol` (with r below 1), or
-when step is 0.  The default, 1e-6, puts the cells within about 1e-6 of
-the fixed point: 78 iterations at 20,000 rows and 72 at 40,000 on
-pg.ddx.io's shape, against 11 and 7 under the earlier rule, which stopped
-3.6e-3 and 2.5e-3 away (`bench/RESULTS_EM_CONVERGENCE_2026-11-22.md`).
-`max_iterations` defaults to 500, since a model with little labelled
-data can need hundreds (`sql/em.sql` has one that needs 777).
+point, and `converged` says whether it got there before
+`max_iterations`.  Near a fixed point EM converges linearly, each M-step
+moving the cells by about r times the step before, for a rate r below 1
+set by the share of missing information; the cells are then within
+step * r / (1 - r) of the fixed point, where step is the last M-step's
+largest change in any cell.  The rule (`gaps._em_settled`) applies that
+per factor, and stops when every unfrozen factor has settled.  It
+estimates r from the factor's three newest steps, as the larger of the
+two ratios plus their difference divided by 1 - r, and asks that step
+and the bound are both at most `tol` (or step is 0).
+
+Each part of that rule answers a case in which a simpler one stopped
+far from the fixed point with `converged` true:
+
+- The run's first M-step is never a rate sample.  It jumps from the
+  complete-data start and says nothing about the rate.  On `sql/em.sql`'s
+  model h (1,000 unlabelled rows), it moves 0.8 and the next 9e-4, so a
+  rate taken from that pair is near 0 and EM stopped after 2 iterations,
+  0.16 from the fixed point, at every tol from 1e-2 to 1e-3; at a million
+  unlabelled rows it stopped after 2 at the default tol.
+- The larger of two ratios, plus their difference scaled by 1 / (1 - r):
+  early in a run the rate is still rising, and the bound's sensitivity
+  to r grows as 1 / (1 - r)^2.  On `sql/em.sql`'s 4,000-row latent-class
+  model, a rate from the last two steps alone stopped at 3.6 times tol at
+  tol 1e-2, and 1.2 times at 3e-3.
+- Per factor: one model can hold parts that converge at very different
+  rates, and a rate from the largest step over the whole model follows
+  whichever part moves most at the moment.  With model h and a fast
+  latent-class model (1,000 labelled rows) in one model, the global rule
+  stopped after 4 iterations, 0.16 from the fixed point.
+
+Measured (`bench/RESULTS_EM_CONVERGENCE_2026-11-22.md`): on model h at
+1,000 and 10,000 unlabelled rows, on the 4,000-row model, and on the
+mixed model, at tols from 1e-2 to 1e-8, EM stops between 0.6 and 1.05
+times `tol` from a run to 1e-12 or tighter.  The estimate
+is still an estimate: a model whose rate keeps rising after the rule
+trusts it can stop somewhat further away than `tol`.  On pg.ddx.io's
+shape the default, 1e-6, takes 78 iterations at 20,000 rows and 70 at
+40,000, against 11 and 7 under the 0.1.0 rule, which stopped 3.6e-3 and
+2.5e-3 away.  `max_iterations` defaults to 500, since a model with
+little labelled data can need hundreds (`sql/em.sql` has one that needs
+777, and at 100,000 unlabelled rows it does not converge in 500 and says
+so).  Every iteration is one exact E-step over the whole network, so at
+a million variables 500 iterations take minutes (5.8 minutes, grounding
+included, at 10^6 rows of model h on floki).
 
 The rule watches the cells rather than the objective because the
 objective cannot resolve a fixed point at this scale.  Its change falls
 as the square of the distance, so cells within 1e-6 mean a change of
 about 1e-8 nats, and at |loglik| 6e4 that is the objective's rounding:
 measured changes below it are as often negative as positive.  An objective rule
-relative to |objective| (the earlier one, tol * max(1, |objective|))
+relative to |objective| (the 0.1.0 one, tol * max(1, |objective|))
 reads 0.05 nats at that scale as converged, and an absolute one tight
-enough to matter fires on rounding noise or never.  The estimate of r is
-unsteady in the first few iterations, so the bound can be low then (on
-`sql/em.sql`'s 4,000-row model at tol 1e-3, EM stopped 1.08e-3 away);
-requiring the last step to be within `tol` too keeps a run that still
-moves from stopping.  `last_change`, in the output, is the objective's
+enough to matter fires on rounding noise or never.  `last_change`, in the output, is the objective's
 change over the last M-step in nats, so a caller can see how flat the
 objective was where EM stopped.  On
 complete data the E-step returns the counts, so 'em' gives the 'counts'
@@ -826,25 +855,32 @@ never learned, so the flag means nothing there.
 **Changing a model.**  `add_factor`, `declare_attribute` and
 `add_stripe` work on a model that has been learned; nothing about
 learning closes it.  `gaps.drop_factor(model, factor)` removes a factor
-with its parents and mappings.  Every value of a declared attribute
-needs exactly one factor, so dropping the last factor whose child is
-over an attribute could leave the model ungroundable; instead
-`drop_factor` then removes the attribute and its stripes too, with a
-NOTICE, which is retiring a feature in one call.  That is refused while
-another factor (of the model, or of a composite holding it) has a parent
-over the attribute, since that factor would lose its parent: the error
+with its parents and mappings, and nothing else: its child attribute,
+domain, edges and stripes stay.  Every value of a declared attribute
+needs exactly one factor, so until another factor covers the dropped
+one's values the next grounding reports them, naming the entity; adding
+a replacement covers them again.  So replacing a factor works in either
+order, drop then add or add then drop, and declared state (bin edges, a
+stripe's quals, a stripe with no factor yet) is never removed as a side
+effect.  Refusing the drop instead would forbid drop-then-add, and a
+check at drop time would have to guess which rows a stripe holds where
+the grounding check is exact.
+
+`drop_factor(model, factor, cascade => true)` retires a feature in one
+call: when no other factor of the model has its child over the same
+attribute, the attribute goes too, with every stripe over it; when one
+does (the attribute is split into stripes), the dropped factor's child
+stripe goes if nothing else uses it.  That is refused while another
+factor (of the model, or of a composite holding it) has a parent over a
+stripe to be removed, since that factor would lose its parent: the error
 names the factor.  A composite's factor the caller cannot see is still
-found, by the foreign key from `gaps.factor_parent.parent_stripe`,
-which no longer cascades (it is deferred, so `drop_model`'s own cascade
-finishes first, and `drop_factor` checks it at once); then the error is
-the foreign key's, naming nothing the caller cannot see.  When another
-factor still has its child over the attribute (the attribute is split
-into stripes), only the factor goes, its stripe stays, and the next
-grounding reports any values left uncovered, naming the entity; adding a
-factor over the stripe covers them again.  Refusing that case outright
-would forbid the replace-in-two-steps order (drop, then add), and the
-grounding check is exact where a check at drop time would have to guess
-which rows a stripe holds.
+found, by the foreign key from `gaps.factor_parent.parent_stripe`
+(constraint `factor_parent_parent_stripe_fkey`), which does not cascade
+and is deferred, so `drop_model`'s own cascade finishes first.
+`drop_factor` checks it at once by setting it IMMEDIATE inside a
+subtransaction that it then rolls back, which restores whatever mode the
+caller had; the error is then the foreign key's, naming nothing the
+caller cannot see.
 
 **Lineage.**  `gaps.model.parent` and `gaps.model.note`, set by
 `create_model(name, parent => ..., note => ...)` or

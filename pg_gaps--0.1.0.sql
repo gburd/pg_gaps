@@ -69,7 +69,10 @@ CREATE TABLE gaps.factor_parent (
 	-- parent would silently drop that parent, even from a composite the
 	-- deleting role cannot see.  Deferred, so drop_model's cascades finish
 	-- before the check.
-	parent_stripe int NOT NULL REFERENCES gaps.stripe DEFERRABLE INITIALLY DEFERRED,
+	-- Named, because gaps.drop_factor sets its mode by name.
+	parent_stripe int NOT NULL
+				CONSTRAINT factor_parent_parent_stripe_fkey REFERENCES gaps.stripe
+				DEFERRABLE INITIALLY DEFERRED,
 	aggregate	boolean NOT NULL DEFAULT false,	-- any number of exchangeable parents
 	PRIMARY KEY (factor_id, ord)
 );
@@ -944,17 +947,21 @@ END
 $$;
 
 -- Remove a factor of model, with its parents and mappings (doc/DESIGN.md,
--- "Changing a model").  Every value of a declared attribute needs a
--- factor, so when no factor of the model is left whose child is over the
--- dropped factor's child attribute, the attribute goes too, with its
--- stripes; that is retiring a feature in one call.  It is refused while
--- another factor, of this model or of a composite holding it, has a parent
--- over that attribute, since those parents would have no CPT.  When the
--- attribute stays (another factor's child is over it), the dropped
--- factor's child stripe stays, and grounding checks that its values are
--- still covered.  To replace a factor, add the new one before dropping
--- the old, so the attribute is never uncovered.
-CREATE FUNCTION gaps.drop_factor(model text, factor text) RETURNS void
+-- "Changing a model").  The factor's child attribute and stripes stay, so
+-- a replacement can be added afterwards; until one is, the next grounding
+-- reports the values the factor covered as uncovered.
+--
+-- With cascade, drop_factor also retires what the factor alone used: when
+-- no other factor of the model has its child over the same attribute, the
+-- attribute goes, with its domain, edges, and every stripe over it;
+-- otherwise the factor's child stripe goes if no other factor uses it.
+-- That is refused while a factor, of this model or of a composite holding
+-- it, has a parent over a stripe to be removed, since that factor would
+-- lose its parent; the error names it when the caller can see it, and the
+-- foreign key on gaps.factor_parent.parent_stripe catches one the caller
+-- cannot see.
+CREATE FUNCTION gaps.drop_factor(model text, factor text, cascade boolean DEFAULT false)
+RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
@@ -962,43 +969,61 @@ DECLARE
 	m int := gaps._model_id(model);
 	f gaps.factor;
 	att int;
+	doomed int[];
 	user_ record;
 BEGIN
+	IF cascade IS NULL THEN
+		RAISE EXCEPTION 'cascade must be true or false, not NULL';
+	END IF;
 	SELECT * INTO f FROM gaps.factor x WHERE x.model_id = m AND x.name = drop_factor.factor;
 	IF f.factor_id IS NULL THEN
 		RAISE EXCEPTION 'factor "%" does not exist in model "%"', factor, model;
 	END IF;
-	SELECT s.attribute_id INTO att FROM gaps.stripe s WHERE s.stripe_id = f.child_stripe;
 	DELETE FROM gaps.factor x WHERE x.factor_id = f.factor_id;
-	IF EXISTS (SELECT 1 FROM gaps.factor x JOIN gaps.stripe s ON s.stripe_id = x.child_stripe
-			   WHERE x.model_id = m AND s.attribute_id = att) THEN
+	IF NOT cascade THEN
 		RETURN;
 	END IF;
 
-	-- Nothing covers the attribute now.  The foreign key on
-	-- gaps.factor_parent.parent_stripe refuses the attribute's removal
-	-- while any factor uses it as a parent, visible to the caller or not;
-	-- this names the factor when the caller can see it.
-	SELECT x.name AS fname, xm.name AS mname INTO user_
-	FROM gaps.factor_parent fp JOIN gaps.stripe s ON s.stripe_id = fp.parent_stripe
-		JOIN gaps.factor x ON x.factor_id = fp.factor_id
-		JOIN gaps.model xm ON xm.model_id = x.model_id
-	WHERE s.attribute_id = att ORDER BY x.factor_id LIMIT 1;
-	IF user_.fname IS NOT NULL THEN
-		RAISE EXCEPTION 'cannot drop factor "%": factor "%" of model "%" has a parent over its '
-			'child, which would have no factor left', factor, user_.fname, user_.mname
-			USING HINT = 'Add another factor over the same attribute first, or drop that '
-				'factor too.';
+	-- The stripes to remove: all of the attribute's when no factor of the
+	-- model is left with its child over it, else the child stripe alone
+	-- when no other factor has it as child or parent.
+	SELECT s.attribute_id INTO att FROM gaps.stripe s WHERE s.stripe_id = f.child_stripe;
+	IF NOT EXISTS (SELECT 1 FROM gaps.factor x JOIN gaps.stripe s ON s.stripe_id = x.child_stripe
+				   WHERE x.model_id = m AND s.attribute_id = att) THEN
+		SELECT array_agg(s.stripe_id) INTO doomed FROM gaps.stripe s WHERE s.attribute_id = att;
+	ELSIF NOT EXISTS (SELECT 1 FROM gaps.factor x WHERE x.child_stripe = f.child_stripe) THEN
+		doomed := ARRAY[f.child_stripe];
+		att := NULL;
+	ELSE
+		RETURN;
 	END IF;
-	RAISE NOTICE 'attribute %.% has no factor left in model "%" and is removed',
-		(SELECT a.relname FROM gaps.attribute a WHERE a.attribute_id = att),
-		(SELECT a.attname FROM gaps.attribute a WHERE a.attribute_id = att), model;
-	DELETE FROM gaps.attribute a WHERE a.attribute_id = att;
+
+	-- A factor the caller can see with a parent over them is named.
+	SELECT x.name AS fname, xm.name AS mname INTO user_
+	FROM gaps.factor_parent fp JOIN gaps.factor x ON x.factor_id = fp.factor_id
+		JOIN gaps.model xm ON xm.model_id = x.model_id
+	WHERE fp.parent_stripe = ANY (doomed) ORDER BY x.factor_id LIMIT 1;
+	IF user_.fname IS NOT NULL THEN
+		RAISE EXCEPTION 'cannot drop factor "%" with cascade: factor "%" of model "%" has a '
+			'parent over its child', factor, user_.fname, user_.mname
+			USING HINT = 'Drop that factor first, or drop this one without cascade.';
+	END IF;
+	IF att IS NOT NULL THEN
+		DELETE FROM gaps.attribute a WHERE a.attribute_id = att;
+	ELSE
+		DELETE FROM gaps.stripe s WHERE s.stripe_id = ANY (doomed);
+	END IF;
+
 	-- A factor the caller cannot see (another role's composite) may still
-	-- have a parent over the attribute; the foreign key sees it.  Check now
-	-- rather than at commit, then restore the deferral drop_model needs.
-	SET CONSTRAINTS gaps.factor_parent_parent_stripe_fkey IMMEDIATE;
-	SET CONSTRAINTS gaps.factor_parent_parent_stripe_fkey DEFERRED;
+	-- have a parent over them, which the deferred foreign key would find
+	-- only at commit.  Check it now inside a subtransaction, whose
+	-- rollback restores whatever constraint mode the caller had.
+	BEGIN
+		SET CONSTRAINTS gaps.factor_parent_parent_stripe_fkey IMMEDIATE;
+		RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'pg_gaps: restore constraint mode';
+	EXCEPTION WHEN raise_exception THEN
+		NULL;
+	END;
 END
 $$;
 
@@ -2915,29 +2940,60 @@ BEGIN
 END
 $$;
 
+-- A step of gaps._em: whether a factor's CPT has settled, that is, is
+-- estimated to be within tol of EM's fixed point in every cell.  steps
+-- holds the factor's largest change in any cell over each of its last
+-- M-steps, newest first, at most four; NULL or empty before the first.
+--
+-- Near a fixed point EM converges linearly: each M-step moves the cells by
+-- about r times the step before, for a rate r below 1 set by the share of
+-- missing information, so they are within step * r / (1 - r) of the fixed
+-- point.  r is estimated from the three newest steps, as the larger of
+-- the two ratios, plus their difference divided by 1 - r: a rate still
+-- rising is overestimated, and more so where an error in it matters more
+-- (the bound's sensitivity to r grows as 1 / (1 - r)^2).  Requiring
+-- four steps keeps the run's first out of the three used: the first
+-- M-step jumps from the start and says nothing about the rate, and taking
+-- it as one stopped runs far from the fixed point (doc/DESIGN.md, "When
+-- EM stops").  The factor has settled when its newest step is 0, or when
+-- that step and the bound are both at most tol with r below 1; requiring
+-- the step itself to be within tol keeps a rate that is low by accident
+-- from stopping a factor still moving by more than tol.
+CREATE FUNCTION gaps._em_settled(steps float8[], tol float8) RETURNS boolean
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+	SELECT CASE
+		WHEN coalesce(cardinality(steps), 0) < 1 THEN false
+		WHEN steps[1] = 0 THEN true
+		WHEN cardinality(steps) < 4 OR steps[1] > tol
+			 OR steps[2] = 0 OR steps[3] = 0 THEN false
+		ELSE (SELECT r < 1 AND steps[1] * r / (1 - r) <= tol
+			  FROM (SELECT CASE WHEN r0 < 1 THEN r0 + d / (1 - r0) ELSE r0 END AS r
+					FROM (SELECT greatest(steps[1] / steps[2], steps[2] / steps[3]) AS r0,
+								 abs(steps[1] / steps[2] - steps[2] / steps[3]) AS d) a) b)
+	END
+$$;
+
 -- The EM loop of gaps.learn_cpts(method => 'em'), over the ground network
 -- in the arrays (gaps._ground) and the factors in pg_gaps_learn, which
 -- holds each factor's pseudocounts, complete-data counts and starting CPT
 -- and receives the learned one.  A frozen factor's row keeps its CPT: the
 -- E-step uses it, the M-step and the objective leave it out.  Each
 -- iteration evaluates the objective (log P(evidence) plus the log prior
--- of the unfrozen factors) at the current CPTs, stops if the last two
--- M-steps put every CPT cell within tol of the fixed point (see below),
+-- of the unfrozen factors) at the current CPTs, stops if every unfrozen
+-- factor has settled within tol of the fixed point (gaps._em_settled),
 -- and otherwise does one M-step; so the returned loglik belongs to the
 -- returned CPTs, iterations counts M-steps, and last_change is the
 -- objective's change over the last M-step, in nats.
 --
--- The stopping rule.  Near a fixed point EM converges linearly: each
--- M-step moves the CPTs by about r times the previous move, for a rate r
--- below 1 set by the share of missing information.  The cells are then
--- within step * r / (1 - r) of the fixed point, where step is the last
--- move's largest change in any cell and r is estimated as step over the
--- move before.  EM stops when both step and that bound are at most tol
--- (with r below 1), or when step is 0; requiring step <= tol too keeps an
--- early, accidentally small ratio from stopping a run still moving.  A
--- rule on the objective cannot reach the same precision: at |loglik|
--- 6e4 the objective's rounding is about 1e-8 nats, about the change at
--- which the cells are within 1e-6 (bench/RESULTS_EM_CONVERGENCE_2026-11-22.md).
+-- The rule is per factor because one model can hold parts that converge
+-- at very different rates: a rate taken from the largest step of the
+-- whole model follows whichever part moves most at the moment, and when
+-- that changes the estimate is wrong.  A rule on the objective cannot
+-- reach the same precision: at |loglik| 6e4 the objective's rounding is
+-- about 1e-8 nats, about the change at which the cells are within 1e-6
+-- (bench/RESULTS_EM_CONVERGENCE_2026-11-22.md).
 --
 -- The start is the complete-data estimate.  With a pseudocount of 0 that
 -- can give probability 0 to a value present only in incomplete rows, and
@@ -2956,8 +3012,6 @@ AS $$
 DECLARE
 	obj float8;
 	prev float8;
-	step float8;
-	prev_step float8;
 	state text;
 BEGIN
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_ec (
@@ -2976,18 +3030,33 @@ BEGIN
 		IF state <> '22000' THEN
 			RAISE;
 		END IF;
-		-- A WARNING, not a NOTICE, and the result says so too: the start
-		-- decides which fixed point EM reaches.
-		RAISE WARNING 'the complete-data estimate gives probability 0 to observed values; '
-			'EM starts from the counts plus max(pseudocount, 1) instead';
 		add_one := true;
 		UPDATE pg_gaps_learn l
 		SET cpt = gaps._normalize((SELECT array_agg(greatest(u.a, 1) + u.n ORDER BY u.i)
 								   FROM unnest(l.pseudo, l.n) WITH ORDINALITY u(a, n, i)),
 								  l.k)
 		WHERE NOT l.frozen;
-		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed,
-							  cpt_lscale);
+		BEGIN
+			loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed,
+								  cpt_lscale);
+		EXCEPTION WHEN SQLSTATE '22000' THEN
+			-- Every learned cell is positive now, so the zero is in a CPT EM
+			-- may not change.  Name the frozen ones that have a zero.
+			SELECT string_agg(format('"%s"', l.name), ', ' ORDER BY l.factor_id) INTO state
+			FROM pg_gaps_learn l
+			WHERE l.frozen AND EXISTS (SELECT 1 FROM unnest(l.cpt) x WHERE x = 0);
+			IF state IS NULL THEN
+				RAISE;
+			END IF;
+			RAISE EXCEPTION 'the observed values have probability zero under the model, whose '
+				'frozen factors % have zero entries', state
+				USING ERRCODE = '22000',
+					  HINT = 'Thaw them with gaps.set_frozen, or set CPTs without zeros.';
+		END;
+		-- A WARNING, not a NOTICE, and the result says so too: the start
+		-- decides which fixed point EM reaches.
+		RAISE WARNING 'the complete-data estimate gives probability 0 to observed values; '
+			'EM starts from the counts plus max(pseudocount, 1) instead';
 	END;
 	-- With every factor frozen there is nothing to learn.
 	IF NOT EXISTS (SELECT 1 FROM pg_gaps_learn l WHERE NOT l.frozen) THEN
@@ -3002,14 +3071,13 @@ BEGIN
 		SELECT loglik + coalesce(sum(a * ln(x)), 0) INTO obj
 		FROM pg_gaps_learn l, unnest(l.pseudo, l.cpt) u(a, x) WHERE a > 0 AND NOT l.frozen;
 		last_change := obj - prev;
-		IF step <= tol AND (step = 0 OR (step < prev_step
-										 AND step * step / (prev_step - step) <= tol)) THEN
+		IF NOT EXISTS (SELECT 1 FROM pg_gaps_learn l
+					   WHERE NOT l.frozen AND NOT gaps._em_settled(l.steps, tol)) THEN
 			converged := true;
 			EXIT;
 		END IF;
 		EXIT WHEN iterations = max_iterations;
 		prev := obj;
-		prev_step := step;
 
 		-- M-step: expected counts plus pseudocounts, normalized per row.
 		-- gaps._expected_counts gives every cell of every factor with
@@ -3031,9 +3099,12 @@ BEGIN
 								   FROM unnest(l.pseudo, x.n) WITH ORDINALITY u(a, n, i)),
 								  l.k)
 		FROM x WHERE x.factor_id = l.factor_id AND NOT l.frozen;
-		SELECT coalesce(max(abs(u.x - u.y)), 0) INTO step
-		FROM pg_gaps_learn l, unnest(l.cpt, l.prev) u(x, y) WHERE NOT l.frozen;
+		-- Each factor's last four steps, newest first (gaps._em_settled).
 		iterations := iterations + 1;
+		UPDATE pg_gaps_learn l
+		SET steps = (SELECT coalesce(max(abs(u.x - u.y)), 0) FROM unnest(l.cpt, l.prev) u(x, y))
+					|| coalesce(l.steps[1:3], '{}')
+		WHERE NOT l.frozen;
 		loglik := gaps._estep(card, evidence, child, parent_off, parents, cpt_off, fixed,
 							  cpt_lscale);
 	END LOOP;
@@ -3110,8 +3181,11 @@ $$;
 -- Dirichlet(pseudocount + 1) prior, so it never decreases the log
 -- posterior, loglik + sum(pseudocount * ln(cell)).  It stops when every
 -- CPT cell is estimated to be within tol of EM's fixed point, an absolute
--- tolerance on probabilities (gaps._em says how it is estimated), or
--- after max_iterations.  When the 'counts' estimate gives
+-- tolerance on probabilities (gaps._em_settled says how it is
+-- estimated), or after max_iterations, with converged false.  Each
+-- iteration is one exact E-step over the whole ground network, so the
+-- default of 500 can mean minutes on a model of a million variables;
+-- lower it for a bounded run and read converged.  When the 'counts' estimate gives
 -- probability 0 to a value present in an incomplete row (possible with a
 -- pseudocount of 0), EM starts from the counts plus max(pseudocount, 1)
 -- instead (gaps._em), warns, and reports method 'em (add-one start)'.
@@ -3190,7 +3264,7 @@ BEGIN
 	-- from it.
 	CREATE TEMP TABLE IF NOT EXISTS pg_gaps_learn (
 		factor_id int, name text, k int, pseudo float8[], n float8[], used bigint,
-		cpt float8[], frozen boolean, prev float8[]) ON COMMIT DROP;
+		cpt float8[], frozen boolean, prev float8[], steps float8[]) ON COMMIT DROP;
 	TRUNCATE pg_gaps_learn;
 	FOR f IN SELECT fa.factor_id, fa.name, fa.child_stripe, fa.prior, fa.cpt, fa.frozen
 			 FROM gaps.factor fa

@@ -114,6 +114,17 @@ WHERE d IS NOT NULL GROUP BY a ORDER BY a;
 SELECT DISTINCT method, converged, iterations > 500 AS slow, iterations < 2000 AS early,
 	   abs(last_change) < 1e-9 AS small_change
 FROM gaps.learn_cpts('h', 1, 'em', 2000);
+-- Its first M-step jumps by 0.8 and the next by 9e-4, so a rate taken
+-- from that pair is near 0: such a rule stopped here after 2 iterations,
+-- 0.16 from the fixed point, at every tol from 1e-2 to 1e-3.  tol 1e-3
+-- has to stop within about 1e-3 of the run above.
+CREATE TEMP TABLE h_fixed AS SELECT name, cpt FROM gaps.factor
+WHERE model_id = gaps._model_id('h');
+SELECT DISTINCT converged, iterations > 100 AS iterated
+FROM gaps.learn_cpts('h', 1, 'em', tol => 1e-3);
+SELECT max(abs(x - y)) BETWEEN 1e-4 AND 1.1e-3 AS near_1e3
+FROM gaps.factor f JOIN h_fixed p USING (name), unnest(f.cpt, p.cpt) u(x, y)
+WHERE f.model_id = gaps._model_id('h');
 
 -- A tiny positive pseudocount keeps its cells positive, and EM's
 -- objective stays finite: P(b = v | a = x) is 1e-20 / (10 + 2e-20), below
@@ -247,11 +258,15 @@ SELECT count(*) AS cells, max(abs(x - y)) < 1e-6 AS at_fixed_point,
 	   max(abs(x - y)) > 0 AS not_identical
 FROM gaps.factor f JOIN fixed_point p USING (name), unnest(f.cpt, p.cpt) u(x, y)
 WHERE f.model_id = gaps._model_id('lk');
--- tol is on probabilities: 1e-3 stops sooner, further from it.  The
--- distance is estimated from the rate of the last two steps, which early
--- in a run is not yet steady, so here it is 1.08e-3, not under 1e-3.
+-- tol is on probabilities: 1e-3 and 1e-2 stop sooner, further from it,
+-- but within tol.  The rate is still rising here, which the estimate
+-- allows for (gaps._em_settled).
+SELECT DISTINCT converged FROM gaps.learn_cpts('lk', 1, 'em', tol => 1e-2);
+SELECT max(abs(x - y)) BETWEEN 1e-3 AND 1e-2 AS near_1e2
+FROM gaps.factor f JOIN fixed_point p USING (name), unnest(f.cpt, p.cpt) u(x, y)
+WHERE f.model_id = gaps._model_id('lk');
 SELECT DISTINCT converged FROM gaps.learn_cpts('lk', 1, 'em', tol => 1e-3);
-SELECT max(abs(x - y)) BETWEEN 1e-4 AND 2e-3 AS near_1e3
+SELECT max(abs(x - y)) BETWEEN 1e-4 AND 1e-3 AS near_1e3
 FROM gaps.factor f JOIN fixed_point p USING (name), unnest(f.cpt, p.cpt) u(x, y)
 WHERE f.model_id = gaps._model_id('lk');
 -- One M-step has no step before it to estimate the rate from.

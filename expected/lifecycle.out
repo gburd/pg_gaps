@@ -228,6 +228,35 @@ SELECT gaps.add_factor('lt', 'pd0', 'b');
 SELECT gaps.set_frozen('lt', 'pd0', true);                      -- fail: no CPT
 ERROR:  factor "pd0" is frozen and has no CPT
 DELETE FROM gaps.factor WHERE name = 'pd0';
+-- A frozen CPT that rules out observed values: EM's add-one start cannot
+-- help, and the error names the frozen factor.
+SELECT cpt AS pb_cpt FROM gaps.factor WHERE name = 'pb' \gset
+SELECT gaps.set_cpt('lt', 'pb', ARRAY[1, 0, 1, 0]);
+ set_cpt 
+---------
+ 
+(1 row)
+
+SELECT gaps.set_frozen('lt', 'pb', true);
+ set_frozen 
+------------
+ 
+(1 row)
+
+SELECT * FROM gaps.learn_cpts('lt', 0, 'em');                   -- fail
+ERROR:  the observed values have probability zero under the model, whose frozen factors "pb" have zero entries
+SELECT gaps.set_frozen('lt', 'pb', false);
+ set_frozen 
+------------
+ 
+(1 row)
+
+SELECT gaps.set_cpt('lt', 'pb', :'pb_cpt');
+ set_cpt 
+---------
+ 
+(1 row)
+
 -- Adding a child to a learned model and fitting only it: freeze the rest,
 -- add d, learn.  The frozen factors are unchanged bit for bit.
 SELECT gaps.learn_cpts('lt', 1, 'em') IS NOT NULL AS relearned;
@@ -290,11 +319,39 @@ SELECT cpt[2] > 0.9 AS learned_d FROM gaps.factor WHERE name = 'pd';
  t
 (1 row)
 
--- Retiring a feature: dropping pd removes it, and d with it (nothing else
--- covers d), and the model still answers.
-SET client_min_messages = notice;
+-- Replacing a factor: drop_factor removes the factor only, d and its
+-- stripe stay, grounding reports d's values uncovered until a new factor
+-- covers them.
 SELECT gaps.drop_factor('lt', 'pd');
-NOTICE:  attribute public.lt.d has no factor left in model "lt" and is removed
+ drop_factor 
+-------------
+ 
+(1 row)
+
+SELECT count(*) AS d_attribute, (SELECT count(*) FROM gaps.stripe WHERE name = 'd') AS d_stripe
+FROM gaps.attribute WHERE attname = 'd';
+ d_attribute | d_stripe 
+-------------+----------
+           1 |        1
+(1 row)
+
+SELECT count(*) FROM gaps.marginals('lt');                      -- fail: uncovered
+ERROR:  public.lt.d of entity {"id": 1} is the child of 0 factors, not exactly one
+SELECT gaps.add_factor('lt', 'pd', 'd', ARRAY['a'], ARRAY[0.5, 0.5, 0.1, 0.9]);
+ add_factor 
+------------
+ 
+(1 row)
+
+SELECT count(DISTINCT attname) FROM gaps.marginals('lt');
+ count 
+-------
+     1
+(1 row)
+
+-- Retiring a feature: with cascade, d goes too (nothing else covers it),
+-- and the model still answers.
+SELECT gaps.drop_factor('lt', 'pd', cascade => true);
  drop_factor 
 -------------
  
@@ -312,16 +369,17 @@ SELECT count(DISTINCT attname) FROM gaps.marginals('lt');
      1
 (1 row)
 
--- A factor whose child is another factor's parent cannot go.
-SELECT gaps.drop_factor('lt', 'pa');                            -- fail
-ERROR:  cannot drop factor "pa": factor "pb" of model "lt" has a parent over its child, which would have no factor left
+-- With cascade, a factor whose child is another factor's parent cannot go.
+SELECT gaps.drop_factor('lt', 'pa', cascade => true);           -- fail
+ERROR:  cannot drop factor "pa" with cascade: factor "pb" of model "lt" has a parent over its child
 SELECT gaps.drop_factor('lt', 'nosuch');                        -- fail
 ERROR:  factor "nosuch" does not exist in model "lt"
+SELECT gaps.drop_factor('lt', 'pa', NULL);                      -- fail
+ERROR:  cascade must be true or false, not NULL
 -- Replacing a factor over part of an attribute: c splits into two stripes.
 -- Dropping one stripe's factor leaves its values uncovered, which
 -- grounding reports; a new factor over the stripe covers them again.
-SELECT gaps.drop_factor('lt', 'pc');
-NOTICE:  attribute public.lt.c has no factor left in model "lt" and is removed
+SELECT gaps.drop_factor('lt', 'pc', cascade => true);
  drop_factor 
 -------------
  
@@ -389,6 +447,28 @@ SELECT count(DISTINCT attname) FROM gaps.marginals('lt');
      1
 (1 row)
 
+-- With cascade, a split attribute loses only the dropped factor's
+-- stripe.  drop_factor leaves the caller's constraint mode alone: with
+-- the foreign key IMMEDIATE before it, deleting a stripe still in use as
+-- a parent fails at once after it.
+BEGIN;
+SET CONSTRAINTS ALL IMMEDIATE;
+SELECT gaps.drop_factor('lt', 'pc_hi2', cascade => true);
+ drop_factor 
+-------------
+ 
+(1 row)
+
+SELECT array_agg(s.name ORDER BY s.name) AS c_stripes
+FROM gaps.stripe s JOIN gaps.attribute a USING (attribute_id) WHERE a.attname = 'c';
+ c_stripes 
+-----------
+ {c_lo}
+(1 row)
+
+DELETE FROM gaps.stripe WHERE name = 'a';                       -- fail
+ERROR:  update or delete on table "stripe" violates foreign key constraint "factor_parent_parent_stripe_fkey" on table "factor_parent"
+ROLLBACK;
 -- A member's factor that a composite's factor uses as a parent cannot go.
 CREATE TABLE grp (g int PRIMARY KEY, z text);
 INSERT INTO grp VALUES (1, NULL);
@@ -430,17 +510,15 @@ SELECT gaps.map_factor('top', 'pz', 1, 'g', 'g');
  
 (1 row)
 
-SELECT gaps.drop_factor('lt', 'pb');                            -- fail: composite
-ERROR:  cannot drop factor "pb": factor "pz" of model "top" has a parent over its child, which would have no factor left
+SELECT gaps.drop_factor('lt', 'pb', cascade => true);           -- fail: composite
+ERROR:  cannot drop factor "pb" with cascade: factor "pz" of model "top" has a parent over its child
 SELECT gaps.drop_factor('top', 'pz');
-NOTICE:  attribute public.grp.z has no factor left in model "top" and is removed
  drop_factor 
 -------------
  
 (1 row)
 
-SELECT gaps.drop_factor('lt', 'pb');
-NOTICE:  attribute public.lt.b has no factor left in model "lt" and is removed
+SELECT gaps.drop_factor('lt', 'pb', cascade => true);
  drop_factor 
 -------------
  
@@ -536,7 +614,7 @@ SELECT count(*) AS visible_models FROM gaps.model;
 (1 row)
 
 \set VERBOSITY sqlstate
-SELECT gaps.drop_factor('mine', 'pb');                          -- fail: 23503
+SELECT gaps.drop_factor('mine', 'pb', cascade => true);         -- fail: 23503
 ERROR:  23503
 \set VERBOSITY terse
 SELECT count(*) AS still_there FROM gaps.factor WHERE name = 'pb';
