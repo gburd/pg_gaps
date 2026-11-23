@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+EM's stopping rule changed meaning.  `learn_cpts(..., 'em', tol)` used to
+stop when an iteration changed the objective by at most tol times
+|objective|, which at pg.ddx.io's scale (|loglik| about 5e4) stopped
+after a few iterations with CPT cells 2e-3 to 4e-3 from EM's fixed point
+and `converged` true.  tol is now an absolute tolerance on probabilities:
+EM stops when every CPT cell is estimated to be within tol of the fixed
+point (per factor, from the rate of its last steps; doc/DESIGN.md "When
+EM stops").  The default tol stays 1e-6 and now means that; `max_iterations`
+defaults to 500 (was 50), since the stricter rule runs 70 to 80
+iterations on that shape and a model with little labelled data can need
+hundreds.  A new output column, `last_change`, is the objective's change
+over the last M-step in nats.
+
+`gaps.set_frozen(model, factor, frozen)` and `gaps.factor.frozen`:
+`learn_cpts` keeps a frozen factor's CPT and reports it as
+'fixed (frozen)'; EM conditions on it, and a frozen CPT that rules out
+observed values is an error naming it.  `gaps.drop_factor(model,
+factor)` removes a factor and leaves its attribute and stripes, so a
+replacement can be added after it; with `cascade => true` it also
+removes the attribute (or, for a split attribute, the factor's stripe)
+when nothing else uses it.  `gaps.model.parent` and `gaps.model.note` record a model's
+lineage, set by `create_model(name, parent, note)` or
+`gaps.set_lineage`.  `gaps.factor_parent.parent_stripe` no longer
+cascades on delete (constraint `factor_parent_parent_stripe_fkey`,
+deferred), so a stripe that some factor still uses as a parent cannot be
+removed under it.
+
 ## 0.1.0 (2026-11-22)
 
 The first release.  pg_gaps declares first-order Bayesian networks over

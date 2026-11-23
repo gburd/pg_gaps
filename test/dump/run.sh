@@ -12,10 +12,10 @@
 # rows with the same probabilities in both.  Then checks that renaming
 # and dropping a column the model uses, and dropping its table, make
 # inference fail with an error naming what changed.  The factors' CPTs,
-# priors, kinds, parameters and aggregating parents, and the attributes'
-# bin edges, must also come back unchanged, and so must a composite model
-# over the first one, its marginals included, and the restriction on
-# dropping its member.
+# priors, kinds, parameters, frozen flags and aggregating parents, the
+# models' lineage, and the attributes' bin edges, must also come back
+# unchanged, and so must a composite model over the first one, its
+# marginals included, and the restriction on dropping its member.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,22 +36,25 @@ marginals_q="SELECT m, entity::text, attname, value, probability FROM
 	(SELECT 'dump' AS m, * FROM gaps.marginals('dump')
 	 UNION ALL SELECT 'site', * FROM gaps.marginals('site')) x ORDER BY 1, 2, 3, 4"
 psql_q -d "$src_db" -At -c "$marginals_q" >"$work/before"
-factors_q="SELECT f.name, f.cpt, f.prior, f.kind, f.params,
+factors_q="SELECT f.name, f.cpt, f.prior, f.kind, f.params, f.frozen,
 	(SELECT array_agg(p.aggregate ORDER BY p.ord) FROM gaps.factor_parent p
 	 WHERE p.factor_id = f.factor_id),
 	(SELECT string_agg(c.name || '>' || m.name, ',' ORDER BY mm.ord)
 	 FROM gaps.model_member mm JOIN gaps.model c ON c.model_id = mm.model_id
 		JOIN gaps.model m ON m.model_id = mm.member_id)
 	FROM gaps.factor f ORDER BY f.name"
+models_q="SELECT name, parent, note FROM gaps.model ORDER BY name"
 edges_q="SELECT relname, attname, domain, edges FROM gaps.attribute ORDER BY 1, 2"
 psql_q -d "$src_db" -At -c "$factors_q" >"$work/factors_before"
 psql_q -d "$src_db" -At -c "$edges_q" >"$work/edges_before"
+psql_q -d "$src_db" -At -c "$models_q" >"$work/models_before"
 
 pg_dump -d "$src_db" -Fc -f "$work/dump"
 pg_restore -d "$dst_db" "$work/dump"
 psql_q -d "$dst_db" -At -c "$marginals_q" >"$work/after"
 psql_q -d "$dst_db" -At -c "$factors_q" >"$work/factors_after"
 psql_q -d "$dst_db" -At -c "$edges_q" >"$work/edges_after"
+psql_q -d "$dst_db" -At -c "$models_q" >"$work/models_after"
 
 if [ ! -s "$work/before" ]; then
 	echo "FAIL: the model returned no marginals before the dump" >&2
@@ -63,11 +66,15 @@ if ! cmp -s "$work/before" "$work/after"; then
 	exit 1
 fi
 echo "dump: $(wc -l <"$work/before") marginals identical after pg_dump and restore"
-if ! grep -q '^light|.*|{2,0.5,0.25,3}|cpt|' "$work/factors_before"; then
+if ! grep -q '^light|.*|{2,0.5,0.25,3}|cpt||f|' "$work/factors_before"; then
 	echo "FAIL: factor light has no prior before the dump" >&2
 	exit 1
 fi
-if ! grep -q '^alarm||.*|noisy_or|{0.05,0.7}|{t}|site>dump$' "$work/factors_before" ||
+if ! grep -q '^occ|.*|cpt||t|' "$work/factors_before"; then
+	echo "FAIL: factor occ is not frozen before the dump" >&2
+	exit 1
+fi
+if ! grep -q '^alarm||.*|noisy_or|{0.05,0.7}|f|{t}|site>dump$' "$work/factors_before" ||
 	! grep -q "^site|" "$work/before"; then
 	echo "FAIL: the composite model is missing before the dump" >&2
 	exit 1
@@ -78,6 +85,16 @@ if ! cmp -s "$work/factors_before" "$work/factors_after"; then
 	exit 1
 fi
 echo "dump: $(wc -l <"$work/factors_before") factors identical after restore, composite included"
+if ! grep -q '^dump|dump0|round 2, refit from dump0$' "$work/models_before"; then
+	echo "FAIL: model dump has no lineage before the dump" >&2
+	exit 1
+fi
+if ! cmp -s "$work/models_before" "$work/models_after"; then
+	echo "FAIL: models' lineage differs after pg_dump and restore" >&2
+	diff "$work/models_before" "$work/models_after" >&2
+	exit 1
+fi
+echo "dump: $(wc -l <"$work/models_before") models' lineage identical after restore"
 if out="$(psql -X -q -d "$dst_db" -c "SELECT gaps.drop_model('dump')" 2>&1)"; then
 	echo "FAIL: a member in use could be dropped after restore" >&2
 	exit 1
