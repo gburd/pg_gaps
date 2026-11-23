@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+Grounding capacity (pg.ddx.io N1).  A model whose ground network passed
+1 GB in total failed after minutes with "tuple is too big", because
+`gaps._ground` returned its nine arrays as one record; it now returns a
+named composite that is never formed into one tuple, so `learn_cpts`,
+`marginals`, `impute` and EM ground pg.ddx.io's 5.25M-row,
+7-attribute model (1.1 GB of arrays).  Parameterised factors' tables
+travel the same way.  The limit that remains, 2^26 variables (auxiliary
+variables included) or parent links per call, 134M table cells, and
+1 GB per array, is checked before any table is built, the parameterised
+factors' tables sized but not built, an `ERROR` naming the model with a
+hint to split the model.  4 noisy-OR factors over 1M rows failed
+after 182 s with an unnamed "array size exceeds the maximum allowed" and
+now get that `ERROR` after 167 s, before any table is built; over 980k
+rows (1.07 GB of cells) they ground (doc/DESIGN.md, "Grounding
+capacity").
+
 EM's stopping rule changed meaning.  `learn_cpts(..., 'em', tol)` used to
 stop when an iteration changed the objective by at most tol times
 |objective|, which at pg.ddx.io's scale (|loglik| about 5e4) stopped

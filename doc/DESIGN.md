@@ -545,6 +545,48 @@ to other sessions.  A real model rarely has more than a handful of key
 types; the limit is a guard against an unbounded failure, not a tuning
 knob, so it is not a GUC.
 
+**Grounding capacity.**  One call grounds the whole network into nine
+arrays (`gaps._ground`, the arrays `gaps._infer` takes), and each array
+is one varlena, at most 1 GB.  `array_agg` builds an array in a buffer of
+8 bytes per element that doubles, so no array it builds may pass 2^26
+(67,108,864) elements; `cpts`, built with `||`, may hold 134,217,724
+float8s.  The statement that builds the structure arrays (child,
+parent_off, cpt_off and parents) returns them as one row, which is held
+to 1 GB as well, and so is the row of the four arrays gathered for one
+parameterised factor's instances.  So one call holds at most 2^26 random
+variables (entities and parameterised factors' auxiliary variables
+together), 2^26 parent links, 134,217,724 table cells, and 4 x (3 x
+variables + parent links) bytes of structure under 1 GB.
+
+`gaps._ground` returns the arrays as a named composite (`gaps._network`)
+assigned field by field, which PL/pgSQL keeps as an expanded record and
+never forms into one tuple, so the nine arrays together may pass 1 GB;
+returned through OUT parameters they could not (the "tuple is too big"
+pg.ddx.io hit at 5.25M rows x 7 attributes, 1.1 GB in total).  The
+parameterised factors' tables travel the same way: `gaps._param_cpts`
+returns an expanded `gaps._param_net`, and `gaps._param_tables` builds
+its result field by field.  The form holds only for a caller that
+assigns: `g := gaps._ground(...)` takes the record over whole, while
+`SELECT * FROM gaps._ground(...)` and `SELECT ... INTO` form one tuple of
+all nine arrays and fail past 1 GB with "tuple is too big", on 17, 18 and
+19 alike.  Tests and tools may select from small models; nothing in the
+extension may.
+
+The bound is checked (`gaps._ground_fits`) when the variables are
+counted, again when the instances are, and again once the parameterised
+factors' tables are sized (`gaps._param_size`, the first pass of
+`gaps._param_cpts`, which builds nothing), all before any table is
+built.  Past it the call is an `ERROR` naming the model, its variables
+and attributes, with a hint to split the model, restrict the call to some
+entities, or learn per part.  The sizes of the parameterised tables
+depend on which of each instance's members are missing, so the last
+check runs only after the instances are grounded: 4 noisy-OR factors over
+1M rows (136M cells) fail after 167 s of grounding, not seconds, but
+before any table is built.  A model of 7 attributes over one table
+reaches 2^26 variables at about 9.6M rows.  Lifting the bound means
+handing the engine the grounding temp tables instead of arrays (Phase
+6).
+
 **CPTs** are dense `float8[]`, indexed from 1, in row-major order over
 (parents..., child), the child varying fastest.  Each variable's values are in
 `gaps.attribute.domain` order, which is the order passed to

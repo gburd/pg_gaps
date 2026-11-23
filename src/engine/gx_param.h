@@ -148,6 +148,13 @@ extern int	gx_param_check(const gx_pfactor *f);
 extern int	gx_param_naux(const gx_pfactor *f, const gx_pinst *in);
 
 /*
+ * The number of parent links of the CPTs gx_param_ground builds for in,
+ * the sum of their nparents, without building them.  in must pass the
+ * checks of gx_param_size.
+ */
+extern int	gx_param_nlinks(const gx_pfactor *f, const gx_pinst *in);
+
+/*
  * The cells of instance in's tables, vals and lscale together, into
  * *cells, and the cells solving them is estimated to hold (GX_PARAM_HOLD)
  * into *hold, without building them.  Applies gx_param_ground's bounds,

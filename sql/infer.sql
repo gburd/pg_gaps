@@ -431,6 +431,22 @@ DROP TABLE par, ch;
 DROP FUNCTION public.later();
 DROP SEQUENCE public.reads;
 
+-- The up-front bound on one grounding (doc/DESIGN.md, "Grounding
+-- capacity"): NULL when the network fits, and otherwise the limit it
+-- passes.  pg.ddx.io's model of 5.25M rows and 7 attributes fits; at 10M
+-- rows it has more variables than one array holds (2^26).  At 2^26
+-- variables and as many parent links each array fits but the row of four
+-- does not.  Table cells (cpts) are held to one float8 array, one
+-- parameterised factor's instance offsets to one array, and the row of
+-- its gathered arrays to 1 GB.  The error names the model.
+SELECT n, p, c, s, gaps._ground_fits(n, p, c, s)
+FROM (VALUES (36750000, 31500000, 61440 * 7, 0), (70000000, 60000000, 0, 0),
+			 (67108864, 0, 0, 0), (67108865, 0, 0, 0), (0, 67108865, 0, 0),
+			 (67108864, 67108864, 0, 0), (0, 0, 134217724, 0), (0, 0, 134217725, 0),
+			 (0, 0, 0, 67108865), (0, 0, 0, 67108866),
+			 (67108776, 67108864, 0, 67108865)) v(n, p, c, s);
+SELECT gaps._ground_bound(gaps._model_id('m'), 70000000, 60000000, 0, 0);   -- fail
+
 -- The internal entry point validates its arrays.
 SELECT * FROM gaps._infer('{2}', '{0}', '{1}', '{1,1}', '{}', '{1}', '{0.5,0.5}');
 SELECT * FROM gaps._infer('{2}', '{3}', '{1}', '{1,1}', '{}', '{1}', '{0.5,0.5}');  -- fail
