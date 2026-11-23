@@ -2,19 +2,47 @@
 
 ## 0.2.0 (unreleased)
 
-**Updating from 0.1.0.**  Install the 0.2.0 package, then run, in every
-database that has the extension:
+**Updating from 0.1.0.**  Install the 0.2.0 package.  Then close every
+existing connection (restart the server, or at least restart connection
+poolers and long-lived clients), because a backend that has loaded the
+0.1.0 library keeps it until it exits: such a backend running 0.2.0's
+SQL can fail with "could not find function gaps_param_size", and an
+`ALTER EXTENSION` run from it fails with "could not find function
+gaps_expected_counts" and changes nothing.  Then run, in every database
+that has the extension, from a new connection:
 
     ALTER EXTENSION pg_gaps UPDATE;
+
+A view or SQL function of yours over `gaps.marginals`, `gaps.impute`,
+`gaps.learn_cpts`, `gaps.create_model`, `gaps.declare_attribute` or
+`gaps.add_factor` stops the update, since 0.2.0 drops and recreates
+those (their arguments or result columns changed).  The update fails
+with, for example:
+
+    ERROR:  cannot drop function marginals(text) because other objects depend on it
+    DETAIL:  view public.scores depends on function marginals(text)
+
+and changes nothing: the extension stays at 0.1.0.  Drop such views
+before the update and create them again after it.  From d35680c,
+`marginals` and `impute` return 8 columns where they returned 6 or 7,
+so a `SELECT *` view gets new columns when you recreate it.
 
 Models, CPTs, priors, parameters and composite members are kept, and
 every model returns the same marginals, bit for bit, as before the update
 (`test/upgrade`).  Existing factors become `kind` 'cpt', not frozen, with
 no prior; attributes have no bin edges; models have no lineage.  Until a
 database is updated, the 0.2.0 library refuses to run under its 0.1.0
-SQL: `marginals`, `impute` and `learn_cpts` fail with "pg_gaps library
+SQL: every call that reaches the C library fails with "pg_gaps library
 0.2.0 is loaded but the extension's SQL is 0.1.0" and a hint to run
-`ALTER EXTENSION pg_gaps UPDATE`.  (Before, the new library called by the
+`ALTER EXTENSION pg_gaps UPDATE`.  Under the released 0.1.0's SQL those
+are `marginals`, `impute`, `learn_cpts` with method 'em', and
+`cpt_rows` or grounding of a logistic or noisy-OR factor; under
+d35680c's, `marginals` and `impute`.  `learn_cpts` with method 'counts'
+(the default) and the functions that edit the model run in SQL alone
+and keep working under the old SQL.  On PostgreSQL 17.0 to 17.7, which
+lack a system cache on `pg_extension`, the library reads `extversion`
+on each such call instead of once per backend; that costs one index
+scan, too little to measure next to inference.  (Before, the new library called by the
 old SQL failed with "gaps._infer arguments must not be NULL", or worse.)
 
 The same update handles both catalogs that were installed as 0.1.0: the

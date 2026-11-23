@@ -51,12 +51,26 @@ PG_MODULE_MAGIC;
 void		_PG_init(void);
 
 /*
+ * pg_extension.oid has a syscache from PostgreSQL 18, and in 17 from 17.8,
+ * where a back-patch added it as ZEXTENSIONOID plus a macro EXTENSIONOID.
+ * In 18 and later EXTENSIONOID is an enum member, not a macro, so neither
+ * test alone covers every release.  Without the cache there is no
+ * invalidation to hear an ALTER EXTENSION by, so the check reads
+ * pg_extension on every call instead of caching its answer.
+ */
+#if PG_VERSION_NUM >= 180000 || defined(EXTENSIONOID)
+#define GAPS_EXTENSION_SYSCACHE 1
+#endif
+
+/*
  * Whether the installed extension's version has been found to equal
  * PG_GAPS_VERSION in this backend.  Cleared whenever pg_extension changes,
- * so an ALTER EXTENSION in this or another session is seen.
+ * so an ALTER EXTENSION in this or another session is seen.  Never set
+ * without GAPS_EXTENSION_SYSCACHE.
  */
 static bool version_checked = false;
 
+#ifdef GAPS_EXTENSION_SYSCACHE
 #if PG_VERSION_NUM >= 190000
 typedef SysCacheIdentifier gaps_cacheid;
 #else
@@ -71,6 +85,7 @@ version_invalidate(Datum arg, gaps_cacheid cacheid, uint32 hashvalue)
 	(void) hashvalue;
 	version_checked = false;
 }
+#endif
 
 /*
  * The extversion of extension pg_gaps in this database, palloc'd, or NULL
@@ -111,10 +126,11 @@ installed_version(void)
  * was not updated would otherwise be called by the old SQL with arguments
  * it does not expect.  With raise, a mismatch is an ERROR naming both
  * versions; without, it returns false, for callers that must never fail
- * (the planner support function).  The answer is cached for the backend
- * until pg_extension changes.  Note that ALTER EXTENSION UPDATE writes the
- * new extversion before it runs the update script, so the script's own
- * calls pass.
+ * (the planner support function).  A match is cached for the backend
+ * until pg_extension changes; without GAPS_EXTENSION_SYSCACHE nothing is
+ * cached and each call costs one index scan of pg_extension.  Note that
+ * ALTER EXTENSION UPDATE writes the new extversion before it runs the
+ * update script, so the script's own calls pass.
  */
 bool
 gaps_check_version(bool raise)
@@ -126,7 +142,9 @@ gaps_check_version(bool raise)
 	installed = installed_version();
 	if (installed != NULL && strcmp(installed, PG_GAPS_VERSION) == 0)
 	{
+#ifdef GAPS_EXTENSION_SYSCACHE
 		version_checked = true;
+#endif
 		pfree(installed);
 		return true;
 	}
@@ -193,5 +211,7 @@ _PG_init(void)
 							PGC_USERSET, 0,
 							NULL, NULL, NULL);
 	MarkGUCPrefixReserved("gaps");
+#ifdef GAPS_EXTENSION_SYSCACHE
 	CacheRegisterSyscacheCallback(EXTENSIONOID, version_invalidate, (Datum) 0);
+#endif
 }

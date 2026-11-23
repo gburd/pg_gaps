@@ -10,8 +10,8 @@
 #
 # Each BINDIR holds pg_config, initdb, pg_ctl, postgres, psql, pg_dump and
 # pg_restore for one major.  Runs the regression suite, test/dump and
-# test/upgrade (whose 0.1.0 starting points test/upgrade/stage.sh builds
-# from this repository's history).
+# test/upgrade/run.sh and test/upgrade/inplace.sh (whose 0.1.0 starting
+# points test/upgrade/stage.sh builds from this repository's history).
 # The extension is installed into a per-run DESTDIR that the server is
 # pointed at, so nothing is written into the server's prefix.  That needs
 # extension_control_path (PostgreSQL 18+); for 17 the script falls back to
@@ -51,17 +51,19 @@ qualify() {
 	mk COPT=-Werror
 	mk check-ascii >/dev/null
 
-	local conf="" extdir stage=(bash "$src/test/upgrade/stage.sh" "$pgc" "$build/upgrade")
+	local conf="" extdir libdir stage=(bash "$src/test/upgrade/stage.sh" "$pgc" "$build/upgrade")
 	if [ "$major" -ge 18 ]; then
 		mk install DESTDIR="$run/inst" >/dev/null
 		extdir="$run/inst$("$pgc" --sharedir)/extension"
-		"${stage[@]}" "$run/inst$("$pgc" --pkglibdir)" "$extdir" >/dev/null
+		libdir="$run/inst$("$pgc" --pkglibdir)"
+		"${stage[@]}" "$libdir" "$extdir" >/dev/null
 		conf="extension_control_path = '$run/inst$("$pgc" --sharedir):\$system'
 dynamic_library_path = '$run/inst$("$pgc" --pkglibdir):\$libdir'"
 	else
 		sudo -n make -s -f "$src/Makefile" VPATH="$src" PG_CONFIG="$pgc" install >/dev/null
 		extdir="$("$pgc" --sharedir)/extension"
-		sudo -n "${stage[@]}" "$("$pgc" --pkglibdir)" "$extdir" >/dev/null
+		libdir="$("$pgc" --pkglibdir)"
+		sudo -n "${stage[@]}" "$libdir" "$extdir" >/dev/null
 	fi
 
 	"$bindir/initdb" -D "$run/data" -U postgres --no-locale -E UTF8 >/dev/null 2>&1
@@ -80,6 +82,10 @@ EOF
 	if [ "$rc" -eq 0 ]; then
 		PATH="$bindir:$PATH" PGHOST="$run" PGUSER=postgres PGDATABASE=postgres \
 			PG_GAPS_EXTDIR="$extdir" bash "$src/test/upgrade/run.sh" >/dev/null || rc=$?
+	fi
+	if [ "$rc" -eq 0 ]; then
+		PATH="$bindir:$PATH" PGHOST="$run" PGUSER=postgres PGDATABASE=postgres \
+			bash "$src/test/upgrade/inplace.sh" "$libdir" "$extdir" >/dev/null || rc=$?
 	fi
 	"$bindir/pg_ctl" -D "$run/data" -w -m fast stop >/dev/null
 	if [ "$rc" -ne 0 ]; then

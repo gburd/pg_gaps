@@ -142,6 +142,24 @@ check_update() {
 	fi
 	[ "$(cat "$work/grants_before")" = "f|t|t" ] || fail "$tag: the REVOKE did not take"
 
+	# A user view over a function the update drops blocks the update.  It
+	# must fail whole, leaving the extension at its old version with
+	# nothing created, and succeed once the view is dropped.
+	if [ "$tag" = d35680c ]; then
+		psql_q -d "$db" -c "CREATE VIEW public.scores AS SELECT * FROM gaps.marginals('given')"
+		if out="$(psql -X -q -d "$db" -c "ALTER EXTENSION pg_gaps UPDATE TO '0.2.0'" 2>&1)"; then
+			fail "$tag: the update dropped gaps.marginals(text) under a dependent view"
+		fi
+		grep -q 'cannot drop function marginals(text) because other objects depend on it' \
+			<<<"$out" || fail "$tag: unexpected error for a dependent view: $out"
+		[ "$(psql_q -d "$db" -At -c "SELECT extversion FROM pg_extension
+			WHERE extname = 'pg_gaps'")|$(psql_q -d "$db" -At -c "SELECT
+			to_regclass('gaps.model_member') IS NULL")" = "0.1.0-$tag|t" ] ||
+			fail "$tag: the failed update left changes behind"
+		echo "upgrade $tag: a dependent view stops the update whole: $(grep -o 'ERROR:.*' <<<"$out")"
+		psql_q -d "$db" -c "DROP VIEW public.scores"
+	fi
+
 	psql_q -d "$db" -c "ALTER EXTENSION pg_gaps UPDATE TO '0.2.0'"
 
 	snapshot "$db" after

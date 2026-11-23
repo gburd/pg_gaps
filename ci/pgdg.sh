@@ -7,7 +7,8 @@
 #
 # Adds the PGDG apt repository, installs the server and its headers, builds
 # with gcc and -Werror, runs the ASCII and META.json checks, installs, and
-# runs the regression suite, the pg_dump test and the upgrade test in a
+# runs the regression suite, the pg_dump test and the upgrade tests (both
+# test/upgrade/run.sh and the in-place update, test/upgrade/inplace.sh) in a
 # throwaway cluster (pg_virtualenv).  The upgrade test builds the 0.1.0
 # starting points from their commits, so the checkout needs its history.
 # Runs as root (a CI container) or as a user with passwordless sudo (a
@@ -52,4 +53,5 @@ fi
 extdir="$("$pgc" --sharedir)/extension"
 $sudo bash test/upgrade/stage.sh "$pgc" "$PWD/upgrade-build" "$("$pgc" --pkglibdir)" "$extdir"
 PG_GAPS_EXTDIR="$extdir" pg_virtualenv -v "$major" bash test/upgrade/run.sh
+pg_virtualenv -v "$major" bash test/upgrade/inplace.sh "$("$pgc" --pkglibdir)" "$extdir"
 echo "ci/pgdg.sh: PostgreSQL $major passed"

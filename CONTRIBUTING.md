@@ -53,8 +53,15 @@ of writing into the server's own prefix.  `nix flake check` covers 17.
   requires the same marginals bit for bit, the same catalog contents, a
   `REVOKE` kept, and the extension's objects equal to a fresh install's
   (`test/upgrade/objects.sql`).  The last check fails when the update
-  script misses anything the install script has.  Run it with
-  `dev/regress.sh -- upgrade`.
+  script misses anything the install script has.  It also requires that
+  a view over a dropped function stops the update whole.
+  `test/upgrade/inplace.sh` then performs the update as a package
+  manager does: version '0.1.0' with the one library `$libdir/pg_gaps`,
+  that file replaced by the new library, a mismatch error from a new
+  session, `ALTER EXTENSION pg_gaps UPDATE`, and the same marginals bit
+  for bit.  It rewrites the library directory, so `ci/pgdg.sh`,
+  `dev/qualify-pgdg.sh` and `dev/regress.sh` run it and the flake does
+  not.  Run both with `dev/regress.sh -- upgrade`.
 
 A change that affects the probabilities returned comes with a test that
 would have failed before it.  A change to the install script comes with

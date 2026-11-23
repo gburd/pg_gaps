@@ -9,7 +9,8 @@
 # With "--", runs the command instead of the regression suite, with PGHOST
 # and PGUSER set for the throwaway cluster (where pg_gaps is installable).
 # `dev/regress.sh -- upgrade` stages the 0.1.0 starting points next to the
-# build's install (test/upgrade/stage.sh) and runs the upgrade test.
+# build's install (test/upgrade/stage.sh) and runs the upgrade tests
+# (test/upgrade/run.sh, then the in-place update, test/upgrade/inplace.sh).
 #
 # Uses whatever pg_config and postgres are on PATH (the dev shell provides
 # PostgreSQL 18).  Needs PostgreSQL 18 or later, because it points the server
@@ -60,11 +61,16 @@ trap 'pg_ctl -D "$run/data" -w -m fast stop >/dev/null' EXIT
 if [ "${1:-}" = "--" ]; then
 	shift
 	if [ "${1:-}" = "upgrade" ]; then
-		"$src/test/upgrade/stage.sh" "$(command -v pg_config)" "$PG_GAPS_BUILD_DIR/upgrade" \
-			"$run/inst$(pg_config --pkglibdir)" "$run/inst$(pg_config --sharedir)/extension"
+		libdir="$run/inst$(pg_config --pkglibdir)"
 		PG_GAPS_EXTDIR="$run/inst$(pg_config --sharedir)/extension"
 		export PG_GAPS_EXTDIR
-		set -- bash "$src/test/upgrade/run.sh"
+		"$src/test/upgrade/stage.sh" "$(command -v pg_config)" "$PG_GAPS_BUILD_DIR/upgrade" \
+			"$libdir" "$PG_GAPS_EXTDIR"
+		upgrade_tests() {
+			bash "$src/test/upgrade/run.sh" &&
+				bash "$src/test/upgrade/inplace.sh" "$libdir" "$PG_GAPS_EXTDIR"
+		}
+		set -- upgrade_tests
 	fi
 	run_test() { PGHOST="$run" PGUSER=postgres PGDATABASE=postgres "$@"; }
 else
